@@ -13,7 +13,7 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
-from .const import PROP_FLOAT, PROP_STRING, SENSOR_MAP
+from .const import PROP_FLOAT, PROP_STRING, SENSOR_ICONS, SENSOR_MAP
 from .coordinator import YahomeDataUpdateCoordinator
 from .entity import YahomeDeviceEntity
 from .helpers import get_property_value, to_float
@@ -59,6 +59,7 @@ class YahomeSensor(YahomeDeviceEntity, SensorEntity):
         self._numeric = prop_type == PROP_FLOAT
         meta = SENSOR_MAP.get(instance, {})
         self._attr_name = meta.get("name") or instance.replace("_", " ").title()
+        self._attr_icon = SENSOR_ICONS.get(instance)
         self._attr_native_unit_of_measurement = meta.get("unit")
         device_class = meta.get("device_class")
         try:

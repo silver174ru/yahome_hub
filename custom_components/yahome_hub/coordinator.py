@@ -11,6 +11,7 @@ from typing import Any
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import ConfigEntryAuthFailed, HomeAssistantError
+from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
@@ -162,6 +163,59 @@ class YahomeDataUpdateCoordinator(DataUpdateCoordinator[YahomeData]):
                 speaker_id = speaker.get("id")
                 if speaker_id:
                     speakers[speaker_id] = speaker
+
+            # Quasar can be rate-limited. Keep speakers that are already known
+            # to the IoT account, so they do not disappear from the panel.
+            for device_id, device in devices.items():
+                quasar_info = device.get("quasar_info") or {}
+                quasar_id = quasar_info.get("device_id")
+                if quasar_id and quasar_id not in speakers:
+                    speakers[quasar_id] = {
+                        "id": quasar_id,
+                        "name": device.get("name") or "Колонка",
+                        "platform": quasar_info.get("platform"),
+                        "iot_id": device_id,
+                    }
+
+            # Reuse the rich media state and equalizer entities from the
+            # Yandex Station integration when it is installed. This keeps the
+            # panel and the media_player entity fully functional even when the
+            # speaker has no IoT device or when Quasar cloud control is stale.
+            registry = er.async_get(self.hass)
+            for entry in registry.entities.values():
+                if entry.platform != "yandex_station":
+                    continue
+                if not entry.entity_id.startswith("media_player."):
+                    continue
+                unique_id = entry.unique_id
+                if not unique_id or unique_id in speakers:
+                    continue
+                state = self.hass.states.get(entry.entity_id)
+                platform = None
+                if state:
+                    icon = state.attributes.get("icon") or ""
+                    if icon.startswith("yandex:"):
+                        platform = icon.split(":", 1)[1]
+                speakers[unique_id] = {
+                    "id": unique_id,
+                    "name": entry.original_name
+                    or (state.attributes.get("friendly_name") if state else None)
+                    or unique_id,
+                    "platform": platform,
+                    "entity_id": entry.entity_id,
+                }
+
+            for speaker_id, speaker in speakers.items():
+                media_entity = registry.async_get_entity_id(
+                    "media_player", "yandex_station", speaker_id
+                )
+                if media_entity:
+                    speaker["entity_id"] = media_entity
+                equalizer_entity = registry.async_get_entity_id(
+                    "select", "yandex_station", f"{speaker_id}_equalizer"
+                )
+                if equalizer_entity:
+                    speaker["equalizer_entity"] = equalizer_entity
 
             if (
                 self._quasar.can_read_configuration

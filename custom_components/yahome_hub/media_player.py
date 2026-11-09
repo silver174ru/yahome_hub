@@ -11,9 +11,11 @@ from homeassistant.components.media_player import (
 )
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
+from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
+from homeassistant.util import dt as dt_util
 
 from .const import CAP_MEDIA_PLAYBACK, CAP_ON_OFF, CAP_VOLUME, DOMAIN
 from .coordinator import YahomeDataUpdateCoordinator
@@ -60,14 +62,6 @@ class YahomeSpeaker(
 
     _attr_has_entity_name = True
     _attr_name = None
-    _attr_supported_features = (
-        MediaPlayerEntityFeature.TURN_ON
-        | MediaPlayerEntityFeature.TURN_OFF
-        | MediaPlayerEntityFeature.VOLUME_SET
-        | MediaPlayerEntityFeature.PLAY
-        | MediaPlayerEntityFeature.PAUSE
-        | MediaPlayerEntityFeature.STOP
-    )
 
     def __init__(
         self,
@@ -78,7 +72,50 @@ class YahomeSpeaker(
         super().__init__(coordinator)
         self._speaker_id = speaker_id
         self._speaker = speaker
+        self._linked_entity_id: str | None = None
         self._attr_unique_id = f"speaker_{speaker_id}_media_player"
+
+    async def async_added_to_hass(self) -> None:
+        """Resolve the matching media_player entity from Yandex Station."""
+        await super().async_added_to_hass()
+        registry = er.async_get(self.hass)
+        self._linked_entity_id = registry.async_get_entity_id(
+            "media_player", "yandex_station", self._speaker_id
+        )
+
+    @property
+    def _linked_state(self):
+        """Return the live state of the Yandex Station media player."""
+        if not self._linked_entity_id:
+            return None
+        return self.hass.states.get(self._linked_entity_id)
+
+    @property
+    def _linked_attrs(self) -> dict[str, Any]:
+        state = self._linked_state
+        return dict(state.attributes) if state else {}
+
+    @property
+    def supported_features(self) -> MediaPlayerEntityFeature:
+        features = (
+            MediaPlayerEntityFeature.TURN_ON
+            | MediaPlayerEntityFeature.TURN_OFF
+            | MediaPlayerEntityFeature.PLAY
+            | MediaPlayerEntityFeature.PAUSE
+            | MediaPlayerEntityFeature.STOP
+        )
+        if self.volume_level is not None:
+            features |= (
+                MediaPlayerEntityFeature.VOLUME_SET
+                | MediaPlayerEntityFeature.VOLUME_MUTE
+            )
+        if self._linked_state:
+            features |= (
+                MediaPlayerEntityFeature.PREVIOUS_TRACK
+                | MediaPlayerEntityFeature.NEXT_TRACK
+                | MediaPlayerEntityFeature.SEEK
+            )
+        return features
 
     @property
     def _iot_device_id(self) -> str | None:
@@ -112,6 +149,12 @@ class YahomeSpeaker(
     @property
     def state(self) -> MediaPlayerState:
         """Return the speaker state."""
+        linked = self._linked_state
+        if linked:
+            try:
+                return MediaPlayerState(linked.state)
+            except ValueError:
+                pass
         iot_device = self._iot_device
         if iot_device and not is_online(iot_device):
             return MediaPlayerState.OFF
@@ -120,6 +163,12 @@ class YahomeSpeaker(
     @property
     def volume_level(self) -> float | None:
         """Return volume 0..1."""
+        linked = self._linked_attrs.get("volume_level")
+        if linked is not None:
+            try:
+                return float(linked)
+            except (TypeError, ValueError):
+                pass
         if not self._iot_device:
             return None
         value = get_capability_state(self._iot_device, CAP_VOLUME, "volume")
@@ -128,8 +177,77 @@ class YahomeSpeaker(
         except (TypeError, ValueError):
             return None
 
+    @property
+    def is_volume_muted(self) -> bool:
+        linked = self._linked_attrs.get("is_volume_muted")
+        return bool(linked) if linked is not None else False
+
+    @property
+    def media_title(self) -> str | None:
+        return self._linked_attrs.get("media_title")
+
+    @property
+    def media_artist(self) -> str | None:
+        return self._linked_attrs.get("media_artist")
+
+    @property
+    def media_album_name(self) -> str | None:
+        return self._linked_attrs.get("media_album_name")
+
+    @property
+    def media_image_url(self) -> str | None:
+        return self._linked_attrs.get("entity_picture")
+
+    @property
+    def media_content_id(self) -> str | None:
+        return self._linked_attrs.get("media_content_id")
+
+    @property
+    def media_content_type(self) -> str | None:
+        return self._linked_attrs.get("media_content_type")
+
+    @property
+    def media_duration(self) -> int | None:
+        value = self._linked_attrs.get("media_duration")
+        try:
+            return int(value) if value is not None else None
+        except (TypeError, ValueError):
+            return None
+
+    @property
+    def media_position(self) -> int | None:
+        value = self._linked_attrs.get("media_position")
+        try:
+            return int(value) if value is not None else None
+        except (TypeError, ValueError):
+            return None
+
+    @property
+    def media_position_updated_at(self):
+        value = self._linked_attrs.get("media_position_updated_at")
+        if isinstance(value, str):
+            return dt_util.parse_datetime(value)
+        return value
+
+    async def _call_linked(self, service: str, **data: Any) -> bool:
+        """Call a media_player service on the linked Station entity."""
+        if not self._linked_entity_id:
+            return False
+        state = self._linked_state
+        if state is None or state.state in ("unavailable", "unknown"):
+            return False
+        await self.hass.services.async_call(
+            "media_player",
+            service,
+            {"entity_id": self._linked_entity_id, **data},
+            blocking=True,
+        )
+        return True
+
     async def async_turn_on(self) -> None:
         """Turn the speaker on."""
+        if await self._call_linked("turn_on"):
+            return
         if self._iot_device and get_capability(self._iot_device, CAP_ON_OFF):
             await self.coordinator.async_device_action(
                 self._iot_device_id, CAP_ON_OFF, "on", True
@@ -139,6 +257,8 @@ class YahomeSpeaker(
 
     async def async_turn_off(self) -> None:
         """Turn the speaker off."""
+        if await self._call_linked("turn_off"):
+            return
         if self._iot_device and get_capability(self._iot_device, CAP_ON_OFF):
             await self.coordinator.async_device_action(
                 self._iot_device_id, CAP_ON_OFF, "on", False
@@ -148,7 +268,10 @@ class YahomeSpeaker(
 
     async def async_set_volume_level(self, volume: float) -> None:
         """Set the speaker volume."""
-        value = round(float(volume) * 100)
+        volume = max(0.0, min(1.0, float(volume)))
+        if await self._call_linked("volume_set", volume_level=volume):
+            return
+        value = round(volume * 100)
         if self._iot_device and get_capability(self._iot_device, CAP_VOLUME):
             await self.coordinator.async_device_action(
                 self._iot_device_id, CAP_VOLUME, "volume", value
@@ -156,17 +279,42 @@ class YahomeSpeaker(
             return
         await self._send_action(CAP_VOLUME, "volume", value)
 
+    async def async_mute_volume(self, mute: bool) -> None:
+        """Mute or unmute the speaker."""
+        if mute:
+            await self.async_set_volume_level(0.0)
+            return
+        await self.async_set_volume_level(self.volume_level or 0.5)
+
     async def async_media_play(self) -> None:
         """Start playback."""
+        if await self._call_linked("media_play"):
+            return
         await self._send_action(CAP_MEDIA_PLAYBACK, "play", True)
 
     async def async_media_pause(self) -> None:
         """Pause playback."""
+        if await self._call_linked("media_pause"):
+            return
         await self._send_action(CAP_MEDIA_PLAYBACK, "pause", True)
 
     async def async_media_stop(self) -> None:
         """Stop playback."""
+        if await self._call_linked("media_stop"):
+            return
         await self._send_action(CAP_MEDIA_PLAYBACK, "stop", True)
+
+    async def async_media_next_track(self) -> None:
+        """Play the next track."""
+        await self._call_linked("media_next_track")
+
+    async def async_media_previous_track(self) -> None:
+        """Play the previous track."""
+        await self._call_linked("media_previous_track")
+
+    async def async_media_seek(self, position: float) -> None:
+        """Seek to a position in the current track."""
+        await self._call_linked("media_seek", seek_position=float(position))
 
     async def _send_action(
         self, capability_type: str, instance: str, value: Any

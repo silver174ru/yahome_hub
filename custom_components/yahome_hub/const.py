@@ -431,6 +431,45 @@ EVENT_MAP: dict[str, dict[str, object]] = {
     "cold": {"name": "Переохлаждение", "device_class": "cold"},
 }
 
+SENSOR_ICONS: dict[str, str] = {
+    "temperature": "mdi:thermometer",
+    "humidity": "mdi:water-percent",
+    "battery_level": "mdi:battery",
+    "pm1": "mdi:blur",
+    "pm2.5": "mdi:blur",
+    "pm10": "mdi:blur",
+    "co2": "mdi:molecule-co2",
+    "co": "mdi:molecule-co",
+    "tvoc": "mdi:air-filter",
+    "illumination": "mdi:brightness-5",
+    "pressure": "mdi:gauge",
+    "water_level": "mdi:water",
+    "power": "mdi:flash",
+    "energy": "mdi:lightning-bolt",
+    "voltage": "mdi:sine-wave",
+    "current": "mdi:current-ac",
+    "frequency": "mdi:sine-wave",
+    "sound_level": "mdi:volume-high",
+}
+
+EVENT_ICONS: dict[str, str] = {
+    "motion": "mdi:motion-sensor",
+    "presence": "mdi:account-check",
+    "open": "mdi:door-open",
+    "water_leak": "mdi:water-alert",
+    "smoke": "mdi:smoke-detector",
+    "gas": "mdi:gas-cylinder",
+    "vibration": "mdi:vibrate",
+    "button": "mdi:gesture-tap-button",
+    "door": "mdi:door",
+    "window": "mdi:window-closed",
+    "tamper": "mdi:shield-alert",
+    "sound": "mdi:volume-high",
+    "light": "mdi:brightness-5",
+    "heat": "mdi:thermometer-alert",
+    "cold": "mdi:snowflake-alert",
+}
+
 ACTIVE_EVENT_VALUES = {
     "detected",
     "present",

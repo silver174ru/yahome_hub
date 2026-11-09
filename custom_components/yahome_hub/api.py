@@ -318,3 +318,40 @@ class YandexQuasarClient:
             json={"actions": actions},
             need_csrf=True,
         )
+
+
+async def async_get_music_track(
+    session: ClientSession, track_id: str
+) -> dict[str, Any] | None:
+    """Return public Yandex Music metadata for one track."""
+    if not track_id or not track_id.isdigit():
+        return None
+    try:
+        async with asyncio.timeout(15):
+            async with session.get(
+                f"https://api.music.yandex.net/tracks/{track_id}",
+                headers={"Accept": "application/json"},
+            ) as response:
+                if response.status != 200:
+                    return None
+                payload = await response.json(content_type=None)
+    except (ClientError, TimeoutError):
+        return None
+
+    tracks = payload.get("result") if isinstance(payload, dict) else None
+    if not tracks:
+        return None
+    track = tracks[0]
+    artists = track.get("artists") or []
+    albums = track.get("albums") or []
+    cover = track.get("coverUri") or ""
+    if cover:
+        cover = "https://" + cover.replace("%%", "400x400")
+    return {
+        "title": track.get("title"),
+        "artist": ", ".join(
+            artist.get("name") for artist in artists if artist.get("name")
+        ),
+        "album": albums[0].get("title") if albums else None,
+        "cover": cover or None,
+    }

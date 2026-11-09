@@ -12,7 +12,7 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
-from .const import EVENT_MAP, PROP_BOOL, PROP_EVENT
+from .const import EVENT_ICONS, EVENT_MAP, PROP_BOOL, PROP_EVENT
 from .coordinator import YahomeDataUpdateCoordinator
 from .entity import YahomeDeviceEntity
 from .helpers import get_property_value, state_to_bool
@@ -54,6 +54,7 @@ class YahomeBinarySensor(YahomeDeviceEntity, BinarySensorEntity):
         self._instance = instance
         meta = EVENT_MAP.get(instance, {})
         self._attr_name = meta.get("name") or instance.replace("_", " ").title()
+        self._attr_icon = EVENT_ICONS.get(instance)
         device_class = meta.get("device_class")
         try:
             self._attr_device_class = (

@@ -7,7 +7,9 @@ from typing import Any
 import voluptuous as vol
 from homeassistant.components import websocket_api
 from homeassistant.core import HomeAssistant
+from homeassistant.helpers.aiohttp_client import async_get_clientsession
 
+from .api import async_get_music_track
 from .const import DOMAIN
 from .coordinator import YahomeDataUpdateCoordinator
 from .views import serialize_data
@@ -147,6 +149,26 @@ async def websocket_export(
     connection.send_result(msg["id"], path)
 
 
+@websocket_api.websocket_command(
+    {
+        vol.Required("type"): f"{DOMAIN}/track_info",
+        vol.Required("track_id"): str,
+    }
+)
+@websocket_api.require_admin
+@websocket_api.async_response
+async def websocket_track_info(
+    hass: HomeAssistant,
+    connection: websocket_api.ActiveConnection,
+    msg: dict[str, Any],
+) -> None:
+    """Return public Yandex Music metadata for a track."""
+    info = await async_get_music_track(
+        async_get_clientsession(hass), msg["track_id"]
+    )
+    connection.send_result(msg["id"], info or {})
+
+
 def async_register_websocket_commands(hass: HomeAssistant) -> None:
     """Register panel WebSocket commands."""
     websocket_api.async_register_command(hass, websocket_devices)
@@ -154,3 +176,4 @@ def async_register_websocket_commands(hass: HomeAssistant) -> None:
     websocket_api.async_register_command(hass, websocket_scenario)
     websocket_api.async_register_command(hass, websocket_refresh)
     websocket_api.async_register_command(hass, websocket_export)
+    websocket_api.async_register_command(hass, websocket_track_info)
