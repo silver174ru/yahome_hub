@@ -21,6 +21,7 @@ from .api import (
     YandexIoTClient,
     YandexQuasarClient,
 )
+from .cookies import async_find_cookies
 from .const import (
     CONF_COOKIES,
     CONF_MUSIC_TOKEN,
@@ -30,6 +31,7 @@ from .const import (
     DEFAULT_ONLY_STATION_DEVICES,
     DEFAULT_SCAN_INTERVAL,
     DOMAIN,
+    EXCLUDED_SPEAKER_PLATFORMS,
 )
 from .store import YahomeDeviceStore, default_export_path
 from .models import YahomeData
@@ -45,7 +47,10 @@ class YahomeDataUpdateCoordinator(DataUpdateCoordinator[YahomeData]):
     def __init__(self, hass: HomeAssistant, entry: ConfigEntry) -> None:
         self.entry = entry
         self._session = async_get_clientsession(hass)
-        self._iot = YandexIoTClient(self._session, entry.data[CONF_TOKEN])
+        token = entry.data.get(CONF_TOKEN)
+        self._iot = (
+            YandexIoTClient(self._session, token) if token else None
+        )
 
         music_token = entry.data.get(CONF_MUSIC_TOKEN)
         cookies = entry.data.get(CONF_COOKIES)
@@ -65,6 +70,7 @@ class YahomeDataUpdateCoordinator(DataUpdateCoordinator[YahomeData]):
         self._station_cache_until = 0.0
         self._speaker_cache: dict[str, dict[str, Any]] = {}
         self._speaker_cache_until = 0.0
+        self._excluded_speaker_ids: set[str] = set()
         self._store = YahomeDeviceStore(hass)
 
         super().__init__(
@@ -74,6 +80,28 @@ class YahomeDataUpdateCoordinator(DataUpdateCoordinator[YahomeData]):
             update_interval=timedelta(seconds=scan_interval),
         )
         self.async_add_listener(self._async_data_updated)
+
+    def _remove_excluded_speaker_entities(self) -> None:
+        """Remove media_player entities for Yandex app pseudo-speakers."""
+        registry = er.async_get(self.hass)
+        slugs = (
+            "ustroistvo_s_alisoi",
+            "prilozhenie_iandeks_360_pochta",
+            "alice_app",
+            "iot_app",
+            "ya360",
+        )
+        for entry in list(registry.entities.values()):
+            if entry.platform != DOMAIN:
+                continue
+            if not entry.entity_id.startswith("media_player."):
+                continue
+            excluded = entry.unique_id in {
+                f"speaker_{speaker_id}_media_player"
+                for speaker_id in self._excluded_speaker_ids
+            }
+            if excluded or any(slug in entry.entity_id for slug in slugs):
+                registry.async_remove(entry.entity_id)
 
     def _async_data_updated(self) -> None:
         """Persist the catalog and notify the panel."""
@@ -89,9 +117,36 @@ class YahomeDataUpdateCoordinator(DataUpdateCoordinator[YahomeData]):
             },
         )
 
+    async def async_live_quasar(self) -> YandexQuasarClient | None:
+        """Return a Quasar client built from the freshest available cookies."""
+        found = await async_find_cookies(self.hass)
+        if found and found.cookies and found.music_token:
+            return YandexQuasarClient(
+                self._session, found.music_token, found.cookies
+            )
+        return self._quasar
+
+    async def _async_refresh_live_credentials(self) -> None:
+        """Prefer fresh cookies/tokens from Yandex.Station when available."""
+        if self._quasar is None:
+            return
+        found = await async_find_cookies(self.hass)
+        if not found:
+            return
+        if found.cookies:
+            self._quasar.update_cookies(found.cookies)
+        if found.music_token:
+            self._quasar.update_music_token(found.music_token)
+
     async def _async_update_data(self) -> YahomeData:
+        await self._async_refresh_live_credentials()
         try:
-            payload = await self._iot.get_user_info()
+            if self._iot:
+                payload = await self._iot.get_user_info()
+            elif self._quasar:
+                payload = await self._quasar.get_user_info()
+            else:
+                raise UpdateFailed("Neither IoT token nor Yandex cookies are set")
         except YahomeAuthError as err:
             raise ConfigEntryAuthFailed(
                 "Yandex IoT token expired or rejected"
@@ -161,8 +216,12 @@ class YahomeDataUpdateCoordinator(DataUpdateCoordinator[YahomeData]):
 
             for speaker in speaker_list:
                 speaker_id = speaker.get("id")
-                if speaker_id:
-                    speakers[speaker_id] = speaker
+                if not speaker_id:
+                    continue
+                if speaker.get("platform") in EXCLUDED_SPEAKER_PLATFORMS:
+                    self._excluded_speaker_ids.add(speaker_id)
+                    continue
+                speakers[speaker_id] = speaker
 
             # Quasar can be rate-limited. Keep speakers that are already known
             # to the IoT account, so they do not disappear from the panel.
@@ -206,6 +265,11 @@ class YahomeDataUpdateCoordinator(DataUpdateCoordinator[YahomeData]):
                 }
 
             for speaker_id, speaker in speakers.items():
+                iot_id = quasar_to_iot.get(speaker_id)
+                if iot_id:
+                    speaker.setdefault(
+                        "type", devices.get(iot_id, {}).get("type")
+                    )
                 media_entity = registry.async_get_entity_id(
                     "media_player", "yandex_station", speaker_id
                 )
@@ -216,6 +280,8 @@ class YahomeDataUpdateCoordinator(DataUpdateCoordinator[YahomeData]):
                 )
                 if equalizer_entity:
                     speaker["equalizer_entity"] = equalizer_entity
+
+            self._remove_excluded_speaker_entities()
 
             if (
                 self._quasar.can_read_configuration
@@ -318,12 +384,19 @@ class YahomeDataUpdateCoordinator(DataUpdateCoordinator[YahomeData]):
             "state": {"instance": instance, "value": value},
         }
         try:
-            await self._iot.send_actions(
-                [{"id": device_id, "actions": [action]}]
-            )
+            if self._iot:
+                await self._iot.send_actions(
+                    [{"id": device_id, "actions": [action]}]
+                )
+            elif self._quasar:
+                await self._quasar.send_device_actions(device_id, [action])
+            else:
+                raise HomeAssistantError(
+                    "Neither IoT token nor Yandex cookies are set"
+                )
         except YahomeAuthError as err:
             raise ConfigEntryAuthFailed(
-                "Yandex IoT token expired or rejected"
+                "Yandex IoT token or cookies expired"
             ) from err
         except YahomeApiError as err:
             raise HomeAssistantError(str(err)) from err
@@ -332,10 +405,17 @@ class YahomeDataUpdateCoordinator(DataUpdateCoordinator[YahomeData]):
     async def async_execute_scenario(self, scenario_id: str) -> None:
         """Execute a Yandex scenario."""
         try:
-            await self._iot.execute_scenario(scenario_id)
+            if self._iot:
+                await self._iot.execute_scenario(scenario_id)
+            elif self._quasar:
+                await self._quasar.execute_scenario(scenario_id)
+            else:
+                raise HomeAssistantError(
+                    "Neither IoT token nor Yandex cookies are set"
+                )
         except YahomeAuthError as err:
             raise ConfigEntryAuthFailed(
-                "Yandex IoT token expired or rejected"
+                "Yandex IoT token or cookies expired"
             ) from err
         except YahomeApiError as err:
             raise HomeAssistantError(str(err)) from err
