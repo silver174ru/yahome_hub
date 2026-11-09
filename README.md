@@ -2,12 +2,23 @@
 
 Самостоятельная интеграция Home Assistant для Яндекс Умного дома.
 
-Версия **0.3.1**.  Вся логика работает внутри Home Assistant.
+Версия **0.4.0**. Проект не требует HomeHub.exe, DreameCamera.exe или других
+наших Windows-программ. Вся логика работает внутри Home Assistant.
 
 ## Возможности
 
-- Чтение всех устройств Яндекс-аккаунта через `api.iot.yandex.net/v1.0`.
-- Все колонки аккаунта через `quasar.yandex.net/glagol/device_list`.
+- Чтение всех устройств Яндекс-аккаунта через `api.iot.yandex.net/v1.0` или
+  через cookie-сессию `iot.quasar.yandex.ru`.
+- Вход в Яндекс по **QR-коду**, по **cookies** или по токену Yandex IoT.
+- Все реальные колонки аккаунта через `quasar.yandex.net/glagol/device_list`.
+  Служебные устройства `alice_app_android`, `iot_app_android` и
+  `ya360_mail_android` не импортируются.
+- Для каждой колонки создаются пять объектов:
+  - `media_player` — воспроизведение, громкость и обложка;
+  - `select` — эквалайзер с пресетами;
+  - `calendar` — будильники Станции;
+  - `camera` — обложка и текст песни;
+  - `conversation` — голосовой диалог с Алисой.
 - Устройства, подключённые к Яндекс Станции, через
   `iot.quasar.yandex.ru/m/v2/user/devices/{id}/configuration` (`child_items`).
 - Управление всеми основными типами устройств:
