@@ -19,6 +19,13 @@
       },
       "reconfigure": {
         "title": "Update YaHome Hub access",
+        "menu_options": {
+          "reconfigure_manual": "Enter token and cookies manually",
+          "reconfigure_auto": "Find cookies automatically"
+        }
+      },
+      "reconfigure_manual": {
+        "title": "Update YaHome Hub access",
         "description": "Update the token and cookies without removing the integration. How to get cookies: [instructions]({cookies_url}).",
         "data": {
           "token": "Yandex IoT token",
@@ -36,7 +43,9 @@
       "already_configured": "The integration is already configured.",
       "reauth_successful": "Reauthentication completed.",
       "reconfigure_successful": "Access updated.",
-      "reconfigure_failed": "Unable to update access."
+      "reconfigure_failed": "Unable to update access.",
+      "cookies_not_found": "No cookies found in Home Assistant. Sign in to the yandex_station integration or enter cookies manually.",
+      "cookies_failed": "The found cookies were rejected. Enter cookies manually."
     }
   },
   "options": {
