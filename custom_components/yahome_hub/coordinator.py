@@ -62,6 +62,8 @@ class YahomeDataUpdateCoordinator(DataUpdateCoordinator[YahomeData]):
         self._station_iot_ids: set[str] = set()
         self._station_cache: dict[str, dict[str, Any]] = {}
         self._station_cache_until = 0.0
+        self._speaker_cache: dict[str, dict[str, Any]] = {}
+        self._speaker_cache_until = 0.0
         self._store = YahomeDeviceStore(hass)
 
         super().__init__(
@@ -124,16 +126,37 @@ class YahomeDataUpdateCoordinator(DataUpdateCoordinator[YahomeData]):
         child_to_station: dict[str, str] = {}
 
         if self._quasar:
-            try:
-                speaker_list = await self._quasar.get_speakers()
-            except YahomeAuthError:
-                _LOGGER.warning(
-                    "Quasar token rejected: speakers are unavailable until reauth"
-                )
-                speaker_list = []
-            except YahomeApiError as err:
-                _LOGGER.warning("Unable to fetch Yandex speakers: %s", err)
-                speaker_list = []
+            if time.time() >= self._speaker_cache_until:
+                try:
+                    speaker_list = await self._quasar.get_speakers()
+                except YahomeAuthError:
+                    _LOGGER.warning(
+                        "Quasar token rejected: speakers are unavailable until reauth"
+                    )
+                    speaker_list = []
+                    self._speaker_cache_until = time.time() + 300
+                except YahomeApiError as err:
+                    message = str(err).lower()
+                    if "429" in message or "limited" in message:
+                        _LOGGER.warning(
+                            "Quasar rate limit; speaker refresh postponed"
+                        )
+                        self._speaker_cache_until = time.time() + 300
+                    else:
+                        _LOGGER.warning(
+                            "Unable to fetch Yandex speakers: %s", err
+                        )
+                        self._speaker_cache_until = time.time() + 120
+                    speaker_list = []
+                else:
+                    self._speaker_cache = {
+                        speaker["id"]: speaker
+                        for speaker in speaker_list
+                        if speaker.get("id")
+                    }
+                    self._speaker_cache_until = time.time() + 600
+            else:
+                speaker_list = list(self._speaker_cache.values())
 
             for speaker in speaker_list:
                 speaker_id = speaker.get("id")
