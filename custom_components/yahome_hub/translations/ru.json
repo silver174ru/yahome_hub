@@ -19,6 +19,13 @@
       },
       "reconfigure": {
         "title": "Обновить доступ YaHome Hub",
+        "menu_options": {
+          "reconfigure_manual": "Ввести токен и cookies вручную",
+          "reconfigure_auto": "Найти cookies автоматически"
+        }
+      },
+      "reconfigure_manual": {
+        "title": "Обновить доступ YaHome Hub",
         "description": "Обновите токен и cookies, не удаляя интеграцию. Где взять cookies: [инструкция]({cookies_url}).",
         "data": {
           "token": "Токен Yandex IoT",
@@ -36,7 +43,9 @@
       "already_configured": "Интеграция уже настроена.",
       "reauth_successful": "Повторная авторизация выполнена.",
       "reconfigure_successful": "Доступ обновлён.",
-      "reconfigure_failed": "Не удалось обновить доступ."
+      "reconfigure_failed": "Не удалось обновить доступ.",
+      "cookies_not_found": "Cookies не найдены в Home Assistant. Войдите в интеграцию yandex_station или введите cookies вручную.",
+      "cookies_failed": "Найденные cookies не подошли. Введите cookies вручную."
     }
   },
   "options": {
