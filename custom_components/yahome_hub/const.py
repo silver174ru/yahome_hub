@@ -28,6 +28,10 @@ CONF_X_TOKEN = "x_token"
 CONF_SCAN_INTERVAL = "scan_interval"
 CONF_ONLY_STATION_DEVICES = "only_station_devices"
 
+COOKIES_URL = (
+    "https://github.com/silver174ru/yahome_hub/blob/main/COOKIES.md"
+)
+
 DEFAULT_SCAN_INTERVAL = 30
 DEFAULT_ONLY_STATION_DEVICES = False
 MIN_SCAN_INTERVAL = 10
