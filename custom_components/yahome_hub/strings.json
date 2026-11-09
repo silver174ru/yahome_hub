@@ -1,0 +1,53 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "YaHome Hub",
+        "description": "Вставьте OAuth-токен Yandex IoT API. Для колонок и устройств, подключённых к Станции, добавьте cookies браузера.",
+        "data": {
+          "token": "Токен Yandex IoT",
+          "cookies": "Cookies Яндекса (необязательно)"
+        }
+      },
+      "reauth_confirm": {
+        "title": "Повторная авторизация YaHome Hub",
+        "description": "Токен или cookies истекли. Вставьте новые значения.",
+        "data": {
+          "token": "Токен Yandex IoT",
+          "cookies": "Cookies Яндекса (необязательно)"
+        }
+      },
+      "reconfigure": {
+        "title": "Обновить доступ YaHome Hub",
+        "description": "Обновите токен и cookies, не удаляя интеграцию.",
+        "data": {
+          "token": "Токен Yandex IoT",
+          "cookies": "Cookies Яндекса (необязательно)"
+        }
+      }
+    },
+    "error": {
+      "invalid_auth": "Токен не принят Яндекском.",
+      "cannot_connect": "Не удалось подключиться к API.",
+      "cookies": "Не удалось обменять cookies на токен колонок.",
+      "no_devices": "В аккаунте не найдено устройств."
+    },
+    "abort": {
+      "already_configured": "Интеграция уже настроена.",
+      "reauth_successful": "Повторная авторизация выполнена.",
+      "reconfigure_successful": "Доступ обновлён.",
+      "reconfigure_failed": "Не удалось обновить доступ."
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Настройки YaHome Hub",
+        "data": {
+          "scan_interval": "Интервал опроса, секунд",
+          "only_station_devices": "Показывать только устройства, подключённые к Станции"
+        }
+      }
+    }
+  }
+}
