@@ -1,0 +1,84 @@
+"""Services for YaHome Hub."""
+
+from __future__ import annotations
+
+from typing import Any
+
+import voluptuous as vol
+from homeassistant.core import HomeAssistant, ServiceCall, SupportsResponse
+
+from .const import DOMAIN
+from .websocket_api import get_coordinator
+
+SERVICE_SEND_ACTION = "send_action"
+SERVICE_EXECUTE_SCENARIO = "execute_scenario"
+SERVICE_REFRESH = "refresh"
+SERVICE_EXPORT = "export"
+
+SEND_ACTION_SCHEMA = vol.Schema(
+    {
+        vol.Required("device_id"): str,
+        vol.Required("capability_type"): str,
+        vol.Optional("instance", default=""): str,
+        vol.Required("value"): vol.Any(bool, int, float, str, None),
+    }
+)
+
+SCENARIO_SCHEMA = vol.Schema({vol.Required("scenario_id"): str})
+EXPORT_SCHEMA = vol.Schema({vol.Optional("path"): str})
+
+
+async def async_setup_services(hass: HomeAssistant) -> None:
+    """Register integration services."""
+    if hass.services.has_service(DOMAIN, SERVICE_SEND_ACTION):
+        return
+
+    async def handle_send_action(call: ServiceCall) -> None:
+        coordinator = get_coordinator(hass)
+        if coordinator is None:
+            raise ValueError("YaHome Hub is not configured")
+        await coordinator.async_device_action(
+            call.data["device_id"],
+            call.data["capability_type"],
+            call.data.get("instance", ""),
+            call.data.get("value"),
+        )
+
+    async def handle_execute_scenario(call: ServiceCall) -> None:
+        coordinator = get_coordinator(hass)
+        if coordinator is None:
+            raise ValueError("YaHome Hub is not configured")
+        await coordinator.async_execute_scenario(call.data["scenario_id"])
+
+    async def handle_refresh(call: ServiceCall) -> None:
+        coordinator = get_coordinator(hass)
+        if coordinator is None:
+            raise ValueError("YaHome Hub is not configured")
+        await coordinator.async_request_refresh()
+
+    async def handle_export(call: ServiceCall) -> dict[str, Any]:
+        coordinator = get_coordinator(hass)
+        if coordinator is None:
+            raise ValueError("YaHome Hub is not configured")
+        path = await coordinator.async_export(call.data.get("path"))
+        return path
+
+    hass.services.async_register(
+        DOMAIN, SERVICE_SEND_ACTION, handle_send_action, schema=SEND_ACTION_SCHEMA
+    )
+    hass.services.async_register(
+        DOMAIN,
+        SERVICE_EXECUTE_SCENARIO,
+        handle_execute_scenario,
+        schema=SCENARIO_SCHEMA,
+    )
+    hass.services.async_register(
+        DOMAIN, SERVICE_REFRESH, handle_refresh, schema=vol.Schema({})
+    )
+    hass.services.async_register(
+        DOMAIN,
+        SERVICE_EXPORT,
+        handle_export,
+        schema=EXPORT_SCHEMA,
+        supports_response=SupportsResponse.OPTIONAL,
+    )
