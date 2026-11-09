@@ -1,0 +1,53 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "YaHome Hub",
+        "description": "Paste a Yandex IoT API OAuth token. Add browser cookies to enable speakers and devices connected to a Yandex Station.",
+        "data": {
+          "token": "Yandex IoT token",
+          "cookies": "Yandex cookies (optional)"
+        }
+      },
+      "reauth_confirm": {
+        "title": "Reauthenticate YaHome Hub",
+        "description": "The token or cookies have expired. Enter new values.",
+        "data": {
+          "token": "Yandex IoT token",
+          "cookies": "Yandex cookies (optional)"
+        }
+      },
+      "reconfigure": {
+        "title": "Update YaHome Hub access",
+        "description": "Update the token and cookies without removing the integration.",
+        "data": {
+          "token": "Yandex IoT token",
+          "cookies": "Yandex cookies (optional)"
+        }
+      }
+    },
+    "error": {
+      "invalid_auth": "Yandex rejected the token.",
+      "cannot_connect": "Unable to connect to the API.",
+      "cookies": "Unable to exchange cookies for a speaker token.",
+      "no_devices": "No devices found in the account."
+    },
+    "abort": {
+      "already_configured": "The integration is already configured.",
+      "reauth_successful": "Reauthentication completed.",
+      "reconfigure_successful": "Access updated.",
+      "reconfigure_failed": "Unable to update access."
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "YaHome Hub options",
+        "data": {
+          "scan_interval": "Polling interval, seconds",
+          "only_station_devices": "Show only devices connected to a Station"
+        }
+      }
+    }
+  }
+}
