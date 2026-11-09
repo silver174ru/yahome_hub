@@ -16,6 +16,7 @@ from .api import (
     YandexIoTClient,
     exchange_cookies_for_tokens,
 )
+from .cookies import async_find_cookies
 from .const import (
     CONF_COOKIES,
     CONF_MUSIC_TOKEN,
@@ -162,6 +163,56 @@ class YahomeHubConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     async def async_step_reconfigure(
         self, user_input: dict[str, Any] | None = None
     ) -> config_entries.ConfigFlowResult:
+        """Choose manual or automatic cookie discovery."""
+        return self.async_show_menu(
+            step_id="reconfigure",
+            menu_options=["reconfigure_manual", "reconfigure_auto"],
+        )
+
+    async def async_step_reconfigure_auto(
+        self, user_input: dict[str, Any] | None = None
+    ) -> config_entries.ConfigFlowResult:
+        """Find cookies in configured Yandex integrations and apply them."""
+        entry = self.hass.config_entries.async_get_entry(
+            self.context.get("entry_id", "")
+        )
+        if entry is None:
+            return self.async_abort(reason="reconfigure_failed")
+
+        found = await async_find_cookies(self.hass)
+        if not found or (not found.cookies and not found.music_token):
+            return self.async_abort(reason="cookies_not_found")
+
+        session = async_get_clientsession(self.hass)
+        x_token = found.x_token
+        music_token = found.music_token
+        if found.cookies:
+            try:
+                x_token, music_token = await exchange_cookies_for_tokens(
+                    session, found.cookies
+                )
+            except YahomeAuthError:
+                if not music_token:
+                    return self.async_abort(reason="cookies_failed")
+            except YahomeApiError:
+                if not music_token:
+                    return self.async_abort(reason="cannot_connect")
+
+        if not music_token:
+            return self.async_abort(reason="cookies_failed")
+
+        data = dict(entry.data)
+        if found.cookies:
+            data[CONF_COOKIES] = found.cookies
+        data[CONF_X_TOKEN] = x_token
+        data[CONF_MUSIC_TOKEN] = music_token
+        self.hass.config_entries.async_update_entry(entry, data=data)
+        await self.hass.config_entries.async_reload(entry.entry_id)
+        return self.async_abort(reason="reconfigure_successful")
+
+    async def async_step_reconfigure_manual(
+        self, user_input: dict[str, Any] | None = None
+    ) -> config_entries.ConfigFlowResult:
         """Update token and cookies without removing the integration."""
         errors: dict[str, str] = {}
         entry = self.hass.config_entries.async_get_entry(
@@ -203,7 +254,7 @@ class YahomeHubConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                     return self.async_abort(reason="reconfigure_successful")
 
         return self.async_show_form(
-            step_id="reconfigure",
+            step_id="reconfigure_manual",
             data_schema=vol.Schema(
                 {
                     vol.Required(CONF_TOKEN): str,
