@@ -19,7 +19,7 @@
       },
       "reconfigure": {
         "title": "Update YaHome Hub access",
-        "description": "Update the token and cookies without removing the integration.",
+        "description": "Update the token and cookies without removing the integration. How to get cookies: [instructions]({cookies_url}).",
         "data": {
           "token": "Yandex IoT token",
           "cookies": "Yandex cookies (optional)"
