@@ -14,9 +14,11 @@ from .api import (
     YahomeApiError,
     YahomeAuthError,
     YandexIoTClient,
+    YandexQuasarClient,
     exchange_cookies_for_tokens,
 )
 from .cookies import async_find_cookies
+from .login import LoginResult, YandexLogin, generate_qr_code
 from .const import (
     CONF_COOKIES,
     CONF_MUSIC_TOKEN,
@@ -38,11 +40,21 @@ class YahomeHubConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     """Handle a config flow for YaHome Hub."""
 
     VERSION = 1
+    _login: YandexLogin | None = None
 
     async def async_step_user(
         self, user_input: dict[str, Any] | None = None
     ) -> config_entries.ConfigFlowResult:
-        """Handle the initial step."""
+        """Choose a Yandex login method."""
+        return self.async_show_menu(
+            step_id="user",
+            menu_options=["login_qr", "login_cookies", "login_token"],
+        )
+
+    async def async_step_login_token(
+        self, user_input: dict[str, Any] | None = None
+    ) -> config_entries.ConfigFlowResult:
+        """Set up with an IoT token and optional cookies."""
         errors: dict[str, str] = {}
 
         if user_input is not None:
@@ -86,7 +98,7 @@ class YahomeHubConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                     return self.async_create_entry(title=NAME, data=data)
 
         return self.async_show_form(
-            step_id="user",
+            step_id="login_token",
             data_schema=vol.Schema(
                 {
                     vol.Required(CONF_TOKEN): str,
@@ -94,7 +106,114 @@ class YahomeHubConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 }
             ),
             errors=errors,
+            description_placeholders={"cookies_url": COOKIES_URL},
         )
+
+    async def async_step_login_cookies(
+        self, user_input: dict[str, Any] | None = None
+    ) -> config_entries.ConfigFlowResult:
+        """Login with Yandex browser cookies."""
+        errors: dict[str, str] = {}
+        if user_input is not None:
+            cookies = user_input.get("cookies", "").strip()
+            if not cookies:
+                found = await async_find_cookies(self.hass)
+                if found and found.cookies:
+                    cookies = found.cookies
+            if not cookies:
+                errors["base"] = "cookies"
+            else:
+                session = async_get_clientsession(self.hass)
+                login = YandexLogin(session)
+                result = await login.login_cookies(cookies)
+                if result.ok:
+                    return await self._async_finish_login(login, result)
+                errors["base"] = result.error or "cookies"
+
+        return self.async_show_form(
+            step_id="login_cookies",
+            data_schema=vol.Schema(
+                {vol.Optional("cookies", default=""): str}
+            ),
+            errors=errors,
+            description_placeholders={"cookies_url": COOKIES_URL},
+        )
+
+    async def async_step_login_qr(
+        self, user_input: dict[str, Any] | None = None
+    ) -> config_entries.ConfigFlowResult:
+        """Login with a Yandex QR code."""
+        errors: dict[str, str] = {}
+        session = async_get_clientsession(self.hass)
+
+        if user_input is not None:
+            if self._login is None:
+                self._login = YandexLogin(session)
+            result = await self._login.login_qr()
+            if result.ok:
+                return await self._async_finish_login(self._login, result)
+            errors["base"] = result.error or "unauthorised"
+        else:
+            self._login = YandexLogin(session)
+            try:
+                qr_url = await self._login.get_qr()
+            except Exception:  # noqa: BLE001
+                errors["base"] = "cannot_connect"
+                qr_url = ""
+            else:
+                return self.async_show_form(
+                    step_id="login_qr",
+                    data_schema=vol.Schema({}),
+                    description_placeholders={
+                        "qr_url": qr_url,
+                        "qr_data": generate_qr_code(qr_url),
+                    },
+                )
+
+        return self.async_show_form(
+            step_id="login_qr",
+            data_schema=vol.Schema({}),
+            errors=errors,
+            description_placeholders={
+                "qr_url": "",
+                "qr_data": "",
+            },
+        )
+
+    async def _async_finish_login(
+        self, login: YandexLogin, result: LoginResult
+    ) -> config_entries.ConfigFlowResult:
+        """Create an entry after a successful Yandex login."""
+        if not result.x_token:
+            return self.async_abort(reason="unauthorised")
+
+        session = async_get_clientsession(self.hass)
+        music_token = await login.get_music_token(result.x_token)
+        if not music_token:
+            return self.async_abort(reason="cookies_failed")
+
+        cookies = login.cookie_header()
+        if not cookies:
+            return self.async_abort(reason="cookies_failed")
+        quasar = YandexQuasarClient(session, music_token, cookies)
+        try:
+            payload = await quasar.get_user_info()
+        except YahomeAuthError:
+            return self.async_abort(reason="cookies_failed")
+        except YahomeApiError:
+            return self.async_abort(reason="cannot_connect")
+
+        if not payload.get("devices"):
+            return self.async_abort(reason="no_devices")
+
+        data = {
+            CONF_COOKIES: cookies,
+            CONF_X_TOKEN: result.x_token,
+            CONF_MUSIC_TOKEN: music_token,
+        }
+        await self.async_set_unique_id(DOMAIN)
+        self._abort_if_unique_id_configured()
+        return self.async_create_entry(title=NAME, data=data)
 
     @staticmethod
     @callback
@@ -166,8 +285,128 @@ class YahomeHubConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         """Choose manual or automatic cookie discovery."""
         return self.async_show_menu(
             step_id="reconfigure",
-            menu_options=["reconfigure_manual", "reconfigure_auto"],
+            menu_options=[
+                "reconfigure_qr",
+                "reconfigure_cookies",
+                "reconfigure_manual",
+                "reconfigure_auto",
+            ],
         )
+
+    async def async_step_reconfigure_qr(
+        self, user_input: dict[str, Any] | None = None
+    ) -> config_entries.ConfigFlowResult:
+        """Refresh cookies after a Yandex QR login."""
+        errors: dict[str, str] = {}
+        entry = self.hass.config_entries.async_get_entry(
+            self.context.get("entry_id", "")
+        )
+        if entry is None:
+            return self.async_abort(reason="reconfigure_failed")
+        session = async_get_clientsession(self.hass)
+
+        if user_input is not None:
+            if self._login is None:
+                self._login = YandexLogin(session)
+            result = await self._login.login_qr()
+            if result.ok:
+                return await self._async_finish_reconfigure(
+                    entry, self._login, result
+                )
+            errors["base"] = result.error or "unauthorised"
+        else:
+            self._login = YandexLogin(session)
+            try:
+                qr_url = await self._login.get_qr()
+            except Exception:  # noqa: BLE001
+                errors["base"] = "cannot_connect"
+            else:
+                return self.async_show_form(
+                    step_id="reconfigure_qr",
+                    data_schema=vol.Schema({}),
+                    description_placeholders={
+                        "qr_url": qr_url,
+                        "qr_data": generate_qr_code(qr_url),
+                    },
+                )
+
+        return self.async_show_form(
+            step_id="reconfigure_qr",
+            data_schema=vol.Schema({}),
+            errors=errors,
+            description_placeholders={"qr_url": "", "qr_data": ""},
+        )
+
+    async def async_step_reconfigure_cookies(
+        self, user_input: dict[str, Any] | None = None
+    ) -> config_entries.ConfigFlowResult:
+        """Refresh cookies from pasted Yandex cookies."""
+        errors: dict[str, str] = {}
+        entry = self.hass.config_entries.async_get_entry(
+            self.context.get("entry_id", "")
+        )
+        if entry is None:
+            return self.async_abort(reason="reconfigure_failed")
+
+        if user_input is not None:
+            cookies = user_input.get("cookies", "").strip()
+            if not cookies:
+                found = await async_find_cookies(self.hass)
+                if found and found.cookies:
+                    cookies = found.cookies
+            if not cookies:
+                errors["base"] = "cookies"
+            else:
+                session = async_get_clientsession(self.hass)
+                login = YandexLogin(session)
+                result = await login.login_cookies(cookies)
+                if result.ok:
+                    return await self._async_finish_reconfigure(
+                        entry, login, result
+                    )
+                errors["base"] = result.error or "cookies"
+
+        return self.async_show_form(
+            step_id="reconfigure_cookies",
+            data_schema=vol.Schema(
+                {vol.Optional("cookies", default=""): str}
+            ),
+            errors=errors,
+            description_placeholders={"cookies_url": COOKIES_URL},
+        )
+
+    async def _async_finish_reconfigure(
+        self,
+        entry: config_entries.ConfigEntry,
+        login: YandexLogin,
+        result: LoginResult,
+    ) -> config_entries.ConfigFlowResult:
+        """Apply fresh Yandex cookies to an existing entry."""
+        if not result.x_token:
+            return self.async_abort(reason="unauthorised")
+        session = async_get_clientsession(self.hass)
+        music_token = await login.get_music_token(result.x_token)
+        cookies = login.cookie_header()
+        if not music_token or not cookies:
+            return self.async_abort(reason="cookies_failed")
+
+        client = YandexQuasarClient(session, music_token, cookies)
+        try:
+            payload = await client.get_user_info()
+        except YahomeAuthError:
+            return self.async_abort(reason="cookies_failed")
+        except YahomeApiError:
+            return self.async_abort(reason="cannot_connect")
+        if not payload.get("devices"):
+            return self.async_abort(reason="no_devices")
+
+        data = dict(entry.data)
+        data[CONF_COOKIES] = cookies
+        data[CONF_X_TOKEN] = result.x_token
+        data[CONF_MUSIC_TOKEN] = music_token
+        self.hass.config_entries.async_update_entry(entry, data=data)
+        await self.hass.config_entries.async_reload(entry.entry_id)
+        return self.async_abort(reason="reconfigure_successful")
 
     async def async_step_reconfigure_auto(
         self, user_input: dict[str, Any] | None = None

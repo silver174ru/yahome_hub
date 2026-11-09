@@ -7,6 +7,8 @@ from homeassistant.const import Platform
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.typing import ConfigType
 
+from .const import CONF_COOKIES, CONF_MUSIC_TOKEN, CONF_X_TOKEN
+from .cookies import async_find_cookies
 from .panel import async_register_panel
 from .services import async_setup_services
 from .websocket_api import async_register_websocket_commands
@@ -26,6 +28,8 @@ PLATFORMS: list[Platform] = [
     Platform.SELECT,
     Platform.SCENE,
     Platform.CAMERA,
+    Platform.CALENDAR,
+    Platform.CONVERSATION,
 ]
 
 
@@ -40,6 +44,16 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Set up YaHome Hub from a config entry."""
     from .coordinator import YahomeDataUpdateCoordinator
+
+    found = await async_find_cookies(hass)
+    if found and found.cookies and found.cookies != entry.data.get(CONF_COOKIES):
+        data = dict(entry.data)
+        data[CONF_COOKIES] = found.cookies
+        if found.music_token:
+            data[CONF_MUSIC_TOKEN] = found.music_token
+        if found.x_token:
+            data[CONF_X_TOKEN] = found.x_token
+        hass.config_entries.async_update_entry(entry, data=data)
 
     coordinator = YahomeDataUpdateCoordinator(hass, entry)
     await coordinator.async_config_entry_first_refresh()

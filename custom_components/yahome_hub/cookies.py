@@ -162,6 +162,33 @@ async def async_find_cookies(
         for entry in hass.config_entries.async_entries(domain):
             entries.append((domain, entry))
 
+    # Prefer the live session of Yandex.Station: config entry cookies can be
+    # stale while its in-memory cookie jar has already been refreshed.
+    live = hass.data.get("yandex_station")
+    if isinstance(live, dict):
+        for value in live.values():
+            session = getattr(value, "session", None)
+            cookie_jar = getattr(
+                getattr(session, "_session", None), "cookie_jar", None
+            )
+            if cookie_jar is None:
+                continue
+            parts = []
+            try:
+                for cookie in cookie_jar:
+                    domain = str(cookie.get("domain") or "")
+                    if domain.endswith(("yandex.ru", "yandex.net")):
+                        parts.append(f"{cookie.key}={cookie.value}")
+            except Exception:  # noqa: BLE001
+                continue
+            if parts:
+                return FoundCookies(
+                    cookies="; ".join(parts),
+                    x_token=getattr(session, "x_token", None),
+                    music_token=getattr(session, "music_token", None),
+                    source="yandex_station",
+                )
+
     # Prefer an integration that actually has cookies.
     for domain, entry in entries:
         data = entry.data or {}

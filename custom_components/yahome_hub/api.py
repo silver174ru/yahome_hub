@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import asyncio
 import re
+from http.cookies import SimpleCookie
 from typing import Any
 
 from aiohttp import ClientError, ClientSession
+from yarl import URL
 
 from .const import (
     API_BASE,
@@ -19,6 +21,13 @@ from .const import (
     QUASAR_BASE,
     QUASAR_IOT_BASE,
 )
+
+ALARM_HEADERS = {
+    "Accept": "application/json",
+    "Origin": "https://yandex.ru",
+    "X-Ya-App-Type": "iot-app",
+    "X-Ya-Application": '{"app_id":"unknown","uuid":"unknown","lang":"ru"}',
+}
 
 
 class YahomeError(Exception):
@@ -184,8 +193,37 @@ class YandexQuasarClient:
     ) -> None:
         self._session = session
         self._music_token = music_token
-        self._cookies = _clean_cookies(cookies)
+        self._cookies = ""
         self._csrf: str | None = None
+        try:
+            session.cookie_jar._quote_cookie = False  # type: ignore[attr-defined]
+        except Exception:  # noqa: BLE001
+            pass
+        self.update_cookies(cookies)
+
+    def update_music_token(self, music_token: str | None) -> None:
+        """Replace the glagol/music token used by this client."""
+        if music_token:
+            self._music_token = music_token
+
+    def update_cookies(self, cookies: str | None) -> None:
+        """Replace browser cookies and keep the aiohttp cookie jar in sync."""
+        value = _clean_cookies(cookies)
+        if not value:
+            return
+        self._cookies = value
+        self._csrf = None
+        try:
+            parsed = SimpleCookie()
+            parsed.load(value)
+            for morsel in parsed.values():
+                morsel["domain"] = ".yandex.ru"
+                morsel["path"] = "/"
+            self._session.cookie_jar.update_cookies(
+                parsed, response_url=URL("https://yandex.ru")
+            )
+        except Exception:  # noqa: BLE001
+            pass
 
     @property
     def can_read_configuration(self) -> bool:
@@ -204,10 +242,8 @@ class YandexQuasarClient:
         if "quasar.yandex.net" in url:
             headers["Authorization"] = f"OAuth {self._music_token}"
         else:
-            if self._cookies:
-                headers["Cookie"] = self._cookies
-            headers["Referer"] = "https://quasar.yandex.ru/"
-            headers["Origin"] = "https://quasar.yandex.ru"
+            headers["Referer"] = "https://yandex.ru/iot"
+            headers["Origin"] = "https://yandex.ru"
         if json_body:
             headers["Content-Type"] = "application/json"
         return headers
@@ -233,7 +269,10 @@ class YandexQuasarClient:
                 ) as response:
                     if response.status in (401, 403):
                         self._csrf = None
-                        raise YahomeAuthError("Quasar request rejected")
+                        body = await response.text()
+                        raise YahomeAuthError(
+                            f"Quasar HTTP {response.status}: {body[:300]}"
+                        )
                     if response.status >= 400:
                         body = await response.text()
                         raise YahomeApiError(
@@ -303,6 +342,171 @@ class YandexQuasarClient:
             f"{QUASAR_IOT_BASE}/m/v2/user/devices/{device_id}/configuration",
         )
         return payload if isinstance(payload, dict) else None
+
+    async def get_user_info(self) -> dict[str, Any]:
+        """Return devices and scenarios through the cookie-based Quasar API."""
+        if not self._cookies:
+            raise YahomeAuthError("Cookies are required for Quasar devices")
+
+        payload = await self._request(
+            "GET", f"{QUASAR_IOT_BASE}/m/v3/user/devices"
+        )
+        households = (
+            payload.get("households") if isinstance(payload, dict) else None
+        ) or []
+        devices: list[dict[str, Any]] = []
+        rooms: dict[str, str] = {}
+        for household in households:
+            household_id = household.get("id")
+            for device in household.get("all") or []:
+                if not isinstance(device, dict):
+                    continue
+                if household_id and not device.get("household_id"):
+                    device["household_id"] = household_id
+                devices.append(device)
+                room_id = device.get("room")
+                room_name = device.get("room_name")
+                if room_id and room_name:
+                    rooms[room_id] = room_name
+
+        scenarios_payload = await self._request(
+            "GET", f"{QUASAR_IOT_BASE}/m/user/scenarios"
+        )
+        scenarios = (
+            scenarios_payload.get("scenarios")
+            if isinstance(scenarios_payload, dict)
+            else None
+        ) or []
+        return {
+            "devices": devices,
+            "rooms": [
+                {"id": room_id, "name": name}
+                for room_id, name in rooms.items()
+            ],
+            "scenarios": scenarios,
+        }
+
+    async def send_device_actions(
+        self, device_id: str, actions: list[dict[str, Any]]
+    ) -> Any:
+        """Send actions to a regular device through the cookie-based API."""
+        if not self._cookies:
+            raise YahomeAuthError("Cookies are required for device actions")
+        return await self._request(
+            "POST",
+            f"{QUASAR_IOT_BASE}/m/user/devices/{device_id}/actions",
+            json={"actions": actions},
+            need_csrf=True,
+        )
+
+    async def get_device_config(
+        self, device_id: str
+    ) -> tuple[dict[str, Any], str | None]:
+        """Return the editable Quasar configuration for a speaker."""
+        payload = await self._request(
+            "GET",
+            f"{QUASAR_IOT_BASE}/m/v2/user/devices/{device_id}/configuration",
+        )
+        if not isinstance(payload, dict):
+            return {}, None
+        config = payload.get("quasar_config") or {}
+        version = payload.get("quasar_config_version")
+        return config if isinstance(config, dict) else {}, version
+
+    async def set_device_config(
+        self,
+        device_id: str,
+        config: dict[str, Any],
+        version: str | None,
+    ) -> Any:
+        """Save the editable Quasar configuration for a speaker."""
+        return await self._request(
+            "POST",
+            f"{QUASAR_IOT_BASE}/m/v3/user/devices/{device_id}/configuration/quasar",
+            json={"config": config, "version": version},
+            need_csrf=True,
+        )
+
+    async def get_alarms(self, device_id: str) -> list[dict[str, Any]]:
+        """Return the speaker alarm list."""
+        payload = await self._alarm_request(
+            "get_alarms", {"device_ids": [device_id]}
+        )
+        alarms = payload.get("alarms") if isinstance(payload, dict) else None
+        return alarms if isinstance(alarms, list) else []
+
+    async def create_alarm(
+        self,
+        device_id: str,
+        device_type: str,
+        alarm: dict[str, Any],
+    ) -> bool:
+        """Create a speaker alarm."""
+        payload = dict(alarm)
+        payload["device_id"] = device_id
+        response = await self._alarm_request(
+            "create_alarm",
+            {"alarm": payload, "device_type": device_type},
+        )
+        return bool(response.get("status") == "ok")
+
+    async def change_alarm(
+        self,
+        device_id: str,
+        device_type: str,
+        alarm: dict[str, Any],
+    ) -> bool:
+        """Update an existing speaker alarm."""
+        payload = dict(alarm)
+        payload["device_id"] = device_id
+        response = await self._alarm_request(
+            "change_alarm",
+            {"alarm": payload, "device_type": device_type},
+        )
+        return bool(response.get("status") == "ok")
+
+    async def cancel_alarms(self, device_id: str, alarm_id: str) -> bool:
+        """Delete a speaker alarm."""
+        response = await self._alarm_request(
+            "cancel_alarms",
+            {
+                "device_alarm_ids": [
+                    {"alarm_id": alarm_id, "device_id": device_id}
+                ]
+            },
+        )
+        return bool(response.get("status") == "ok")
+
+    async def _alarm_request(
+        self, method: str, payload: dict[str, Any]
+    ) -> dict[str, Any]:
+        try:
+            async with asyncio.timeout(20):
+                async with self._session.post(
+                    f"https://rpc.alice.yandex.ru/gproxy/{method}",
+                    json=payload,
+                    headers=ALARM_HEADERS,
+                ) as response:
+                    if response.status >= 400:
+                        body = await response.text()
+                        raise YahomeApiError(
+                            f"Alarm HTTP {response.status}: {body[:200]}"
+                        )
+                    data = await response.json(content_type=None)
+        except ClientError as err:
+            raise YahomeApiError(f"Alarm connection error: {err}") from err
+        return data if isinstance(data, dict) else {}
+
+    async def execute_scenario(self, scenario_id: str) -> Any:
+        """Run a scenario through the cookie-based API."""
+        if not self._cookies:
+            raise YahomeAuthError("Cookies are required for scenarios")
+        return await self._request(
+            "POST",
+            f"{QUASAR_IOT_BASE}/m/user/scenarios/{scenario_id}/actions",
+            json={},
+            need_csrf=True,
+        )
 
     async def send_actions(
         self, device_id: str, actions: list[dict[str, Any]]

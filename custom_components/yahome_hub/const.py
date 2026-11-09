@@ -21,6 +21,12 @@ MOBILE_CLIENT_SECRET = "ad0a908f0aa341a182a37ecd75bc319e"
 MUSIC_CLIENT_ID = "23cabbbdc6cd418abb4b39c32c41195d"
 MUSIC_CLIENT_SECRET = "53bc75238f0c4d08a118e51fe9203300"
 
+EXCLUDED_SPEAKER_PLATFORMS = {
+    "alice_app_android",
+    "iot_app_android",
+    "ya360_mail_android",
+}
+
 CONF_TOKEN = "token"
 CONF_COOKIES = "cookies"
 CONF_MUSIC_TOKEN = "music_token"
