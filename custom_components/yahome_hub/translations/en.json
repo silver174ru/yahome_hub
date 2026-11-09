@@ -3,11 +3,31 @@
     "step": {
       "user": {
         "title": "YaHome Hub",
-        "description": "Paste a Yandex IoT API OAuth token. Add browser cookies to enable speakers and devices connected to a Yandex Station.",
+        "description": "Choose how to sign in to Yandex.",
+        "menu_options": {
+          "login_qr": "Sign in with a QR code",
+          "login_cookies": "Sign in with cookies",
+          "login_token": "Enter a Yandex IoT token"
+        }
+      },
+      "login_token": {
+        "title": "Sign in with a Yandex IoT token",
+        "description": "Paste a Yandex IoT API OAuth token. Add browser cookies to enable speakers and devices connected to a Yandex Station. How to get cookies: [instructions]({cookies_url}).",
         "data": {
           "token": "Yandex IoT token",
           "cookies": "Yandex cookies (optional)"
         }
+      },
+      "login_cookies": {
+        "title": "Sign in with cookies",
+        "description": "Paste Yandex cookies. How to get them: [instructions]({cookies_url}).",
+        "data": {
+          "cookies": "Yandex cookies"
+        }
+      },
+      "login_qr": {
+        "title": "Sign in with a QR code",
+        "description": "Open the [link]({qr_url}) or scan the QR code in the Yandex app. {qr_data}"
       },
       "reauth_confirm": {
         "title": "Reauthenticate YaHome Hub",
@@ -37,7 +57,10 @@
       "invalid_auth": "Yandex rejected the token.",
       "cannot_connect": "Unable to connect to the API.",
       "cookies": "Unable to exchange cookies for a speaker token.",
-      "no_devices": "No devices found in the account."
+      "no_devices": "No devices found in the account.",
+      "unauthorised": "Yandex sign-in was not completed.",
+      "qr_pending": "The QR code is not confirmed yet. Scan it and press Submit.",
+      "qr_not_started": "QR sign-in was not started. Press Submit to get a new QR code."
     },
     "abort": {
       "already_configured": "The integration is already configured.",
@@ -45,7 +68,8 @@
       "reconfigure_successful": "Access updated.",
       "reconfigure_failed": "Unable to update access.",
       "cookies_not_found": "No cookies found in Home Assistant. Sign in to the yandex_station integration or enter cookies manually.",
-      "cookies_failed": "The found cookies were rejected. Enter cookies manually."
+      "cookies_failed": "The found cookies were rejected. Enter cookies manually.",
+      "unauthorised": "Yandex sign-in was not completed."
     }
   },
   "options": {

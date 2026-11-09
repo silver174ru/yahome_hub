@@ -3,11 +3,31 @@
     "step": {
       "user": {
         "title": "YaHome Hub",
-        "description": "Вставьте OAuth-токен Yandex IoT API. Добавьте cookies браузера, чтобы включить колонки и устройства, подключённые к Яндекс Станции.",
+        "description": "Выберите способ входа в Яндекс.",
+        "menu_options": {
+          "login_qr": "Войти по QR-коду",
+          "login_cookies": "Войти по cookies",
+          "login_token": "Ввести токен Yandex IoT"
+        }
+      },
+      "login_token": {
+        "title": "Вход по токену Yandex IoT",
+        "description": "Вставьте OAuth-токен Yandex IoT API. Добавьте cookies браузера, чтобы включить колонки и устройства, подключённые к Яндекс Станции. Где взять cookies: [инструкция]({cookies_url}).",
         "data": {
           "token": "Токен Yandex IoT",
           "cookies": "Cookies Яндекса (необязательно)"
         }
+      },
+      "login_cookies": {
+        "title": "Вход по cookies",
+        "description": "Вставьте cookies Яндекса. Где взять: [инструкция]({cookies_url}).",
+        "data": {
+          "cookies": "Cookies Яндекса"
+        }
+      },
+      "login_qr": {
+        "title": "Вход по QR-коду",
+        "description": "Откройте [ссылку]({qr_url}) или отсканируйте QR-код в приложении Яндекс. {qr_data}"
       },
       "reauth_confirm": {
         "title": "Повторная авторизация YaHome Hub",
@@ -37,7 +57,10 @@
       "invalid_auth": "Яндекс отклонил токен.",
       "cannot_connect": "Не удалось подключиться к API.",
       "cookies": "Не удалось обменять cookies на токен колонок.",
-      "no_devices": "В аккаунте не найдено устройств."
+      "no_devices": "В аккаунте не найдено устройств.",
+      "unauthorised": "Авторизация Яндекса не завершена.",
+      "qr_pending": "QR-код ещё не подтверждён. Отсканируйте его и нажмите «Отправить».",
+      "qr_not_started": "QR-вход не начат. Нажмите «Отправить», чтобы получить новый QR-код."
     },
     "abort": {
       "already_configured": "Интеграция уже настроена.",
@@ -45,7 +68,8 @@
       "reconfigure_successful": "Доступ обновлён.",
       "reconfigure_failed": "Не удалось обновить доступ.",
       "cookies_not_found": "Cookies не найдены в Home Assistant. Войдите в интеграцию yandex_station или введите cookies вручную.",
-      "cookies_failed": "Найденные cookies не подошли. Введите cookies вручную."
+      "cookies_failed": "Найденные cookies не подошли. Введите cookies вручную.",
+      "unauthorised": "Авторизация Яндекса не завершена."
     }
   },
   "options": {
