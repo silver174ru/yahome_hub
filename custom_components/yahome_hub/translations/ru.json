@@ -19,7 +19,7 @@
       },
       "reconfigure": {
         "title": "Обновить доступ YaHome Hub",
-        "description": "Обновите токен и cookies, не удаляя интеграцию.",
+        "description": "Обновите токен и cookies, не удаляя интеграцию. Где взять cookies: [инструкция]({cookies_url}).",
         "data": {
           "token": "Токен Yandex IoT",
           "cookies": "Cookies Яндекса (необязательно)"
