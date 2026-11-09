@@ -1,0 +1,53 @@
+send_action:
+  name: Отправить действие
+  description: Отправить произвольное действие устройству Яндекс Умного дома.
+  fields:
+    device_id:
+      name: ID устройства
+      description: Идентификатор устройства в Яндекс Умном доме.
+      required: true
+      selector:
+        text:
+    capability_type:
+      name: Тип capability
+      description: Например, devices.capabilities.on_off.
+      required: true
+      selector:
+        text:
+    instance:
+      name: Instance
+      description: Например, on, brightness, temperature.
+      required: false
+      selector:
+        text:
+    value:
+      name: Значение
+      description: Новое значение.
+      required: true
+      selector:
+        object:
+
+execute_scenario:
+  name: Запустить сценарий
+  description: Запустить сценарий Яндекс Умного дома.
+  fields:
+    scenario_id:
+      name: ID сценария
+      required: true
+      selector:
+        text:
+
+refresh:
+  name: Обновить данные
+  description: Принудительно обновить все устройства и датчики.
+
+export:
+  name: Экспорт базы устройств
+  description: Сохранить полную базу устройств в JSON.
+  fields:
+    path:
+      name: Путь
+      description: Необязательный путь внутри /config.
+      required: false
+      selector:
+        text:
