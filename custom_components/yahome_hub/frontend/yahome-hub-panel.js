@@ -8,7 +8,19 @@ class YaHomeHubPanel extends HTMLElement {
     this._room = "all";
     this._query = "";
     this._selected = null;
+    this._tab = "devices";
+    this._hubFilter = "zigbee";
+    this._viz = "bars";
+    try {
+      this._viz = localStorage.getItem("yahome-hub-viz") || "bars";
+    } catch (err) {
+      this._viz = "bars";
+    }
     this._unsub = null;
+    this._stateUnsub = null;
+    this._trackCache = {};
+    this._ticker = null;
+    this._stateTimer = null;
     this._hassReady = false;
     this._toast = null;
   }
@@ -41,6 +53,18 @@ class YaHomeHubPanel extends HTMLElement {
       this._unsub.then((unsub) => unsub()).catch(() => {});
       this._unsub = null;
     }
+    if (this._stateUnsub) {
+      this._stateUnsub.then((unsub) => unsub()).catch(() => {});
+      this._stateUnsub = null;
+    }
+    if (this._ticker) {
+      clearInterval(this._ticker);
+      this._ticker = null;
+    }
+    if (this._stateTimer) {
+      clearTimeout(this._stateTimer);
+      this._stateTimer = null;
+    }
   }
 
   async _subscribe() {
@@ -49,6 +73,28 @@ class YaHomeHubPanel extends HTMLElement {
       () => this._load(),
       "yahome_hub_updated"
     );
+    this._stateUnsub = this._hass.connection.subscribeEvents(
+      (event) => this._onStateChanged(event),
+      "state_changed"
+    );
+  }
+
+  _onStateChanged(event) {
+    if (this._tab !== "speakers") return;
+    const entityId = event && event.data ? event.data.entity_id : "";
+    if (
+      !entityId ||
+      (!entityId.startsWith("media_player.yandex_station") &&
+        !entityId.startsWith("select.yandex_station"))
+    ) {
+      return;
+    }
+    if (this.shadowRoot && this.shadowRoot.activeElement) {
+      const tag = this.shadowRoot.activeElement.tagName;
+      if (tag === "SELECT" || tag === "INPUT") return;
+    }
+    clearTimeout(this._stateTimer);
+    this._stateTimer = setTimeout(() => this._render(), 450);
   }
 
   async _load() {
@@ -231,6 +277,33 @@ class YaHomeHubPanel extends HTMLElement {
     return "—";
   }
 
+  _propIcon(instance) {
+    const icons = {
+      temperature: "mdi:thermometer",
+      humidity: "mdi:water-percent",
+      battery_level: "mdi:battery",
+      motion: "mdi:motion-sensor",
+      presence: "mdi:account-check",
+      open: "mdi:door-open",
+      water_leak: "mdi:water-alert",
+      smoke: "mdi:smoke-detector",
+      gas: "mdi:gas-cylinder",
+      vibration: "mdi:vibrate",
+      button: "mdi:gesture-tap-button",
+      illumination: "mdi:brightness-5",
+      pressure: "mdi:gauge",
+      co2: "mdi:molecule-co2",
+      pm25: "mdi:blur",
+      power: "mdi:flash",
+      energy: "mdi:lightning-bolt",
+      voltage: "mdi:sine-wave",
+      current: "mdi:current-ac",
+      water_level: "mdi:water",
+      sound_level: "mdi:volume-high",
+    };
+    return icons[instance] || "mdi:eye-outline";
+  }
+
   _deviceColor(device) {
     const domain = device.primary_domain;
     if (domain === "light") return "#f6b73c";
@@ -276,21 +349,123 @@ class YaHomeHubPanel extends HTMLElement {
       <style>${this._styles()}</style>
       <div class="shell">
         ${this._renderHeader(counts)}
+        ${data ? this._renderTabs(data) : ""}
         ${this._error ? `<div class="error">${this._esc(this._error)}</div>` : ""}
         ${this._loading && !data ? this._renderLoading() : ""}
         ${
           data
             ? selected
               ? this._renderDetail(selected)
-              : this._renderDashboard(devices)
+              : this._renderTabContent(data, devices)
             : ""
         }
-        ${data ? this._renderScenarios(data.scenarios) : ""}
-        ${data && !selected ? this._renderSpeakers(data.speakers) : ""}
+        ${
+          data && !selected && this._tab === "devices"
+            ? this._renderScenarios(data.scenarios)
+            : ""
+        }
         ${this._toast ? `<div class="toast">${this._esc(this._toast)}</div>` : ""}
       </div>
     `;
     this._attachEvents();
+    this._startTicker();
+  }
+
+  _renderTabs(data) {
+    const tabs = [
+      ["devices", "Устройства", "mdi:home-automation", data.counts.devices],
+      ["speakers", "Колонки", "mdi:speaker", data.counts.speakers],
+      ["hub", "Яндекс хаб", "mdi:home-assistant", null],
+    ];
+    return `<nav class="tabs">${tabs
+      .map(
+        ([id, label, icon, count]) => `
+        <button class="tab ${this._tab === id ? "active" : ""}" data-tab="${id}">
+          <ha-icon icon="${icon}"></ha-icon>
+          <span>${label}</span>
+          ${count !== null ? `<b>${count}</b>` : ""}
+        </button>`
+      )
+      .join("")}</nav>`;
+  }
+
+  _renderTabContent(data, devices) {
+    if (this._tab === "speakers") {
+      return this._renderSpeakerPlayers(data.speakers || []);
+    }
+    if (this._tab === "hub") {
+      return this._renderHub(data);
+    }
+    return this._renderDashboard(devices);
+  }
+
+  _renderHub(data) {
+    const filters = [
+      ["zigbee", "Zigbee", "mdi:zigbee"],
+      ["meters", "Счётчики", "mdi:meter-electric"],
+      ["ir", "ИК-пульты", "mdi:remote"],
+    ];
+    const devices = this._hubDevices(data.devices || [], this._hubFilter);
+    return `
+      <div class="section hub-intro">
+        <div class="hub-title">
+          <div class="device-icon" style="--accent:#5b6cff"><ha-icon icon="mdi:home-assistant"></ha-icon></div>
+          <div>
+            <h3>Яндекс хаб</h3>
+            <p class="muted">Zigbee-датчики, счётчики и ИК-пульты, которые Яндекс отдаёт в аккаунт. Управление использует все доступные возможности IoT API.</p>
+          </div>
+        </div>
+        <div class="chips hub-chips">
+          ${filters
+            .map(
+              ([id, label, icon]) =>
+                `<button class="chip ${this._hubFilter === id ? "active" : ""}" data-hub-filter="${id}">
+                  <ha-icon icon="${icon}"></ha-icon> ${label}
+                </button>`
+            )
+            .join("")}
+        </div>
+      </div>
+      <div class="grid">
+        ${devices.map((device) => this._renderCard(device)).join("")}
+      </div>
+      ${
+        devices.length === 0
+          ? `<div class="empty">В этой категории пока нет устройств. Добавьте их в приложении «Дом с Алисой» — они появятся здесь автоматически.</div>`
+          : ""
+      }
+      <div class="section hub-note">
+        <ha-icon icon="mdi:information-outline"></ha-icon>
+        <p class="muted">Сопряжение новых Zigbee-устройств и обучение ИК-пультов выполняется в приложении «Дом с Алисой». Здесь доступны их состояние и все команды, которые Яндекс разрешает через API.</p>
+      </div>
+    `;
+  }
+
+  _isMeter(device) {
+    return (device.properties || []).some((prop) =>
+      ["energy", "power", "voltage", "current", "frequency", "water_level"].includes(
+        prop.instance
+      )
+    );
+  }
+
+  _hubDevices(devices, kind) {
+    if (kind === "meters") {
+      return devices.filter((device) => this._isMeter(device));
+    }
+    if (kind === "ir") {
+      return devices.filter(
+        (device) =>
+          /(^|\.)hub|remote/i.test(device.type || "") ||
+          /пульт|remote/i.test(device.name || "")
+      );
+    }
+    return devices.filter(
+      (device) =>
+        /sensor|hub/i.test(device.type || "") &&
+        !this._isMeter(device) &&
+        !/remote/i.test(device.type || "")
+    );
   }
 
   _renderHeader(counts) {
@@ -298,7 +473,7 @@ class YaHomeHubPanel extends HTMLElement {
       <header class="top">
         <div class="brand">
           <div class="logo">
-            <ha-icon icon="mdi:home-automation"></ha-icon>
+            <img src="/yahome_hub/icon.png" alt="YaHome Hub" />
           </div>
           <div>
             <h1>YaHome Hub</h1>
@@ -590,7 +765,9 @@ class YaHomeHubPanel extends HTMLElement {
       .map(
         (prop) => `
         <div class="prop">
-          <span>${this._esc(prop.name)}</span>
+          <span><ha-icon icon="${this._propIcon(prop.instance)}"></ha-icon>${this._esc(
+          prop.name
+        )}</span>
           <b>${this._esc(String(prop.value ?? "—"))}${
             prop.unit ? " " + this._esc(prop.unit) : ""
           }</b>
@@ -612,48 +789,411 @@ class YaHomeHubPanel extends HTMLElement {
       .join("")}</div></div>`;
   }
 
-  _renderSpeakers(speakers) {
-    if (!speakers || !speakers.length) return "";
-    return `<div class="section"><h3>Колонки</h3><div class="speakers">${speakers
-      .map((speaker) => {
-        const iotId = speaker.iot_id || "";
-        const volume =
-          speaker.volume !== null && speaker.volume !== undefined
-            ? speaker.volume
-            : 0;
-        const on = speaker.on === true;
-        return `
-          <div class="speaker">
-            <div class="speaker-head">
-              <div class="device-icon" style="--accent:#ff6b6b"><ha-icon icon="mdi:speaker"></ha-icon></div>
-              <div>
-                <strong>${this._esc(speaker.name)}</strong>
-                <small>${this._esc(speaker.platform || "Яндекс Станция")}</small>
-              </div>
+  _renderSpeakerPlayers(speakers) {
+    const withEntity = speakers.filter(
+      (speaker) => speaker.entity_id && this._hass.states[speaker.entity_id]
+    );
+    const others = speakers.filter(
+      (speaker) => !speaker.entity_id || !this._hass.states[speaker.entity_id]
+    );
+    const viz = [
+      ["bars", "Спектр", "mdi:equalizer"],
+      ["wave", "Волна", "mdi:sine-wave"],
+      ["orbit", "Орбита", "mdi:orbit"],
+    ];
+    if (!speakers.length) {
+      return `<div class="empty">Колонки не найдены. Проверьте cookies и токен в настройках интеграции.</div>`;
+    }
+    return `
+      <div class="speakers-section">
+        <div class="speaker-toolbar">
+          <div>
+            <h3>Колонки</h3>
+            <p class="muted">Обложка, трек, перемотка, громкость и эквалайзер — прямо здесь.</p>
+          </div>
+          <div class="viz-switch" title="Визуализация">
+            ${viz
+              .map(
+                ([id, label, icon]) =>
+                  `<button class="${this._viz === id ? "active" : ""}" data-viz="${id}">
+                    <ha-icon icon="${icon}"></ha-icon><span>${label}</span>
+                  </button>`
+              )
+              .join("")}
+          </div>
+        </div>
+        <div class="players">
+          ${withEntity
+            .map((speaker) => this._renderSpeakerPlayer(speaker))
+            .join("")}
+        </div>
+        ${
+          others.length
+            ? `<div class="section compact-speakers">
+                <h3>Другие устройства с Алисой</h3>
+                <p class="muted">Для них Яндекс не отдаёт медиасессию. Управление доступно в приложении «Дом с Алисой».</p>
+                <div class="players">${others
+                  .map((speaker) => this._renderSpeakerFallback(speaker))
+                  .join("")}</div>
+              </div>`
+            : ""
+        }
+      </div>
+    `;
+  }
+
+  _renderSpeakerFallback(speaker) {
+    return `
+      <article class="player compact">
+        <div class="player-cover"><ha-icon icon="mdi:speaker-wireless"></ha-icon></div>
+        <div class="player-meta">
+          <span class="player-kicker">${this._esc(
+            speaker.platform || "Устройство с Алисой"
+          )}</span>
+          <h3>${this._esc(speaker.name)}</h3>
+          <p class="muted">Нет доступной медиасессии</p>
+        </div>
+      </article>`;
+  }
+
+  _renderSpeakerPlayer(speaker) {
+    const entityId = speaker.entity_id;
+    const entity = this._hass.states[entityId];
+    const attrs = entity.attributes || {};
+    const playing = entity.state === "playing";
+    const paused = entity.state === "paused";
+    const trackId = String(attrs.media_content_id || "");
+    const trackInfo = /^\d+$/.test(trackId) ? this._trackInfo(trackId) : null;
+    const cover =
+      attrs.entity_picture || (trackInfo && trackInfo.cover) || "";
+    const title = attrs.media_title || "Готов к воспроизведению";
+    const artist = attrs.media_artist || speaker.name;
+    const album =
+      attrs.media_album_name ||
+      attrs.media_playlist ||
+      (trackInfo && trackInfo.album) ||
+      "";
+    const duration = Number(attrs.media_duration) || 0;
+    const position = this._currentPosition(entity);
+    const volume =
+      attrs.volume_level !== undefined && attrs.volume_level !== null
+        ? Math.round(Number(attrs.volume_level) * 100)
+        : speaker.volume !== null && speaker.volume !== undefined
+        ? Number(speaker.volume)
+        : 0;
+    const eqEntity = speaker.equalizer_entity
+      ? this._hass.states[speaker.equalizer_entity]
+      : null;
+    const eqOptions = eqEntity ? eqEntity.attributes.options || [] : [];
+    const eqValue = eqEntity ? eqEntity.state : "";
+    return `
+      <article class="player ${playing ? "playing" : ""} ${
+      paused ? "paused" : ""
+    }" data-player="${this._esc(speaker.id)}" ${
+      cover ? `style="--cover:url('${this._esc(cover)}')"` : ""
+    }>
+        <div class="player-bg"></div>
+        <div class="player-glow"></div>
+        <div class="player-content">
+          <div class="player-head">
+            <div class="player-cover">
               ${
-                iotId
-                  ? `<button class="power ${on ? "on" : ""}" data-speaker-power="${this._esc(
-                      iotId
-                    )}" title="Вкл/выкл"><ha-icon icon="mdi:power"></ha-icon></button>`
-                  : ""
+                cover
+                  ? `<img src="${this._esc(cover)}" alt="" loading="lazy" />`
+                  : `<ha-icon icon="mdi:speaker"></ha-icon>`
               }
             </div>
+            <div class="player-meta">
+              <span class="player-kicker">${
+                playing
+                  ? "Сейчас играет"
+                  : paused
+                  ? "Пауза"
+                  : entity.state === "off"
+                  ? "Выключена"
+                  : "Колонка"
+              }</span>
+              <h3>${this._esc(title)}</h3>
+              <p>${this._esc(artist)}${
+      album ? ` <span class="dot">·</span> ${this._esc(album)}` : ""
+    }</p>
+            </div>
+            <button class="power player-power ${
+              entity.state !== "off" ? "on" : ""
+            }" data-player-power="${this._esc(
+      entityId
+    )}" title="Вкл/выкл"><ha-icon icon="mdi:power"></ha-icon></button>
+          </div>
+          ${this._renderViz(playing)}
+          <div class="player-seek">
+            <input type="range" min="0" max="${duration}" step="1" value="${position}"
+              data-seek-entity="${this._esc(entityId)}"
+              data-duration="${duration}" ${duration ? "" : "disabled"} />
+            <div class="times">
+              <span data-current-for="${this._esc(entityId)}">${this._formatTime(
+      position
+    )}</span>
+              <span>${this._formatTime(duration)}</span>
+            </div>
+          </div>
+          <div class="player-controls">
+            <div class="transport">
+              <button class="icon-btn" data-player-action="previous" data-player-entity="${this._esc(
+                entityId
+              )}" title="Предыдущий трек"><ha-icon icon="mdi:skip-previous"></ha-icon></button>
+              <button class="icon-btn play" data-player-action="playpause" data-player-entity="${this._esc(
+                entityId
+              )}" title="${playing ? "Пауза" : "Играть"}">
+                <ha-icon icon="${playing ? "mdi:pause" : "mdi:play"}"></ha-icon>
+              </button>
+              <button class="icon-btn" data-player-action="next" data-player-entity="${this._esc(
+                entityId
+              )}" title="Следующий трек"><ha-icon icon="mdi:skip-next"></ha-icon></button>
+            </div>
+            <div class="volume-control">
+              <ha-icon icon="mdi:volume-high"></ha-icon>
+              <input type="range" min="0" max="100" step="1" value="${volume}"
+                data-volume-entity="${this._esc(entityId)}" />
+              <span data-volume-for="${this._esc(entityId)}">${volume}%</span>
+            </div>
             ${
-              iotId
-                ? `<div class="control-label sub"><span>Громкость</span><span>${volume}%</span></div>
-                   <input type="range" min="0" max="100" step="1" value="${volume}" data-speaker-volume="${this._esc(
-                     iotId
-                   )}" />`
-                : `<p class="muted">Нет связанного IoT-устройства для управления громкостью.</p>`
+              eqOptions.length
+                ? `<select class="eq-select" data-eq-entity="${this._esc(
+                    speaker.equalizer_entity
+                  )}" title="Эквалайзер">
+                    ${eqOptions
+                      .map(
+                        (option) =>
+                          `<option value="${this._esc(option)}" ${
+                            option === eqValue ? "selected" : ""
+                          }>${this._esc(this._eqLabel(option))}</option>`
+                      )
+                      .join("")}
+                  </select>`
+                : ""
             }
-          </div>`;
+          </div>
+        </div>
+      </article>`;
+  }
+
+  _renderViz(playing) {
+    if (this._viz === "wave") {
+      return `<div class="viz viz-wave">${Array.from(
+        { length: 24 },
+        (_, i) =>
+          `<span style="--i:${i};--h:${18 + ((i * 29) % 70)}%"></span>`
+      ).join("")}</div>`;
+    }
+    if (this._viz === "orbit") {
+      return `<div class="viz viz-orbit"><i></i><i></i><i></i><b></b></div>`;
+    }
+    return `<div class="viz viz-bars">${Array.from(
+      { length: 42 },
+      (_, i) =>
+        `<span style="--i:${i};--h:${16 + ((i * 37) % 78)}%"></span>`
+    ).join("")}</div>`;
+  }
+
+  _currentPosition(entity) {
+    if (!entity) return 0;
+    const attrs = entity.attributes || {};
+    const duration = Number(attrs.media_duration) || 0;
+    const base = Number(attrs.media_position) || 0;
+    if (entity.state !== "playing") {
+      return Math.min(base, duration || base);
+    }
+    const updated = attrs.media_position_updated_at;
+    const ts = updated ? new Date(updated).getTime() : 0;
+    const elapsed = ts ? Math.max(0, (Date.now() - ts) / 1000) : 0;
+    return Math.min(duration || base + elapsed, base + elapsed);
+  }
+
+  _formatTime(value) {
+    const seconds = Math.max(0, Math.round(Number(value) || 0));
+    const minutes = Math.floor(seconds / 60);
+    const rest = seconds % 60;
+    return `${minutes}:${String(rest).padStart(2, "0")}`;
+  }
+
+  _trackInfo(trackId) {
+    const cached = this._trackCache[trackId];
+    if (cached) return cached;
+    this._trackCache[trackId] = { loading: true };
+    this._hass
+      .callWS({ type: "yahome_hub/track_info", track_id: trackId })
+      .then((info) => {
+        this._trackCache[trackId] = info || {};
+        if (this._tab === "speakers") this._renderSoon();
       })
-      .join("")}</div></div>`;
+      .catch(() => {
+        this._trackCache[trackId] = {};
+      });
+    return this._trackCache[trackId];
+  }
+
+  _eqLabel(value) {
+    const labels = {
+      off: "Выкл",
+      lessbass: "Меньше баса",
+      movie: "Кино",
+      voice: "Голос",
+      custom: "Свой",
+      pop: "Поп",
+      hiphop: "Хип-хоп",
+      dance: "Танцы",
+      rock: "Рок",
+      electro: "Электро",
+      metal: "Металл",
+      rnb: "R&B",
+      classic: "Классика",
+      acoustics: "Акустика",
+      jazz: "Джаз",
+      concert: "Концерт",
+      party: "Вечеринка",
+      morebass: "Больше баса",
+      morehigh: "Больше высоких",
+      morebasshigh: "Басы + верх",
+      lesshigh: "Меньше высоких",
+    };
+    return labels[value] || value;
+  }
+
+  _startTicker() {
+    if (this._ticker) {
+      clearInterval(this._ticker);
+      this._ticker = null;
+    }
+    if (this._tab !== "speakers" || !this._data) return;
+    this._ticker = setInterval(() => this._tick(), 1000);
+  }
+
+  _tick() {
+    const root = this.shadowRoot;
+    if (!root || !this._hass) return;
+    root.querySelectorAll("[data-seek-entity]").forEach((input) => {
+      const entityId = input.getAttribute("data-seek-entity");
+      const entity = this._hass.states[entityId];
+      if (!entity) return;
+      const duration = Number(entity.attributes.media_duration) || 0;
+      const position = this._currentPosition(entity);
+      input.max = duration;
+      input.disabled = !duration;
+      if (root.activeElement !== input) input.value = position;
+      const label = root.querySelector(
+        `[data-current-for="${entityId}"]`
+      );
+      if (label) label.textContent = this._formatTime(position);
+    });
+  }
+
+  async _callService(domain, service, data) {
+    if (!this._hass) return;
+    try {
+      await this._hass.callService(domain, service, data);
+      this._renderSoon();
+    } catch (err) {
+      this._showToast("Ошибка команды: " + this._message(err));
+    }
+  }
+
+  _renderSoon() {
+    clearTimeout(this._stateTimer);
+    this._stateTimer = setTimeout(() => this._render(), 350);
   }
 
   _attachEvents() {
     const root = this.shadowRoot;
     if (!root) return;
+    root.querySelectorAll("[data-tab]").forEach((el) => {
+      el.addEventListener("click", () => {
+        this._tab = el.getAttribute("data-tab");
+        this._selected = null;
+        this._render();
+      });
+    });
+    root.querySelectorAll("[data-hub-filter]").forEach((el) => {
+      el.addEventListener("click", () => {
+        this._hubFilter = el.getAttribute("data-hub-filter");
+        this._render();
+      });
+    });
+    root.querySelectorAll("[data-viz]").forEach((el) => {
+      el.addEventListener("click", () => {
+        this._viz = el.getAttribute("data-viz");
+        try {
+          localStorage.setItem("yahome-hub-viz", this._viz);
+        } catch (err) {
+          /* ignore */
+        }
+        this._render();
+      });
+    });
+    root.querySelectorAll("[data-player-action]").forEach((el) => {
+      el.addEventListener("click", () => {
+        const entityId = el.getAttribute("data-player-entity");
+        const action = el.getAttribute("data-player-action");
+        const state = this._hass.states[entityId];
+        if (action === "playpause") {
+          const service =
+            state && state.state === "playing" ? "media_pause" : "media_play";
+          this._callService("media_player", service, { entity_id: entityId });
+        } else if (action === "previous") {
+          this._callService("media_player", "media_previous_track", {
+            entity_id: entityId,
+          });
+        } else if (action === "next") {
+          this._callService("media_player", "media_next_track", {
+            entity_id: entityId,
+          });
+        }
+      });
+    });
+    root.querySelectorAll("[data-player-power]").forEach((el) => {
+      el.addEventListener("click", () => {
+        const entityId = el.getAttribute("data-player-power");
+        const state = this._hass.states[entityId];
+        const service =
+          state && state.state === "off" ? "turn_on" : "turn_off";
+        this._callService("media_player", service, { entity_id: entityId });
+      });
+    });
+    root.querySelectorAll("[data-seek-entity]").forEach((el) => {
+      el.addEventListener("input", () => {
+        const label = root.querySelector(
+          `[data-current-for="${el.getAttribute("data-seek-entity")}"]`
+        );
+        if (label) label.textContent = this._formatTime(el.value);
+      });
+      el.addEventListener("change", () => {
+        this._callService("media_player", "media_seek", {
+          entity_id: el.getAttribute("data-seek-entity"),
+          seek_position: Number(el.value),
+        });
+      });
+    });
+    root.querySelectorAll("[data-volume-entity]").forEach((el) => {
+      el.addEventListener("input", () => {
+        const label = root.querySelector(
+          `[data-volume-for="${el.getAttribute("data-volume-entity")}"]`
+        );
+        if (label) label.textContent = `${el.value}%`;
+      });
+      el.addEventListener("change", () => {
+        this._callService("media_player", "volume_set", {
+          entity_id: el.getAttribute("data-volume-entity"),
+          volume_level: Number(el.value) / 100,
+        });
+      });
+    });
+    root.querySelectorAll("[data-eq-entity]").forEach((el) => {
+      el.addEventListener("change", () => {
+        this._callService("select", "select_option", {
+          entity_id: el.getAttribute("data-eq-entity"),
+          option: el.value,
+        });
+      });
+    });
     root.querySelectorAll("[data-action]").forEach((el) => {
       el.addEventListener("click", (event) => {
         event.stopPropagation();
@@ -802,32 +1342,6 @@ class YaHomeHubPanel extends HTMLElement {
         );
       });
     });
-    root.querySelectorAll("[data-speaker-volume]").forEach((el) => {
-      el.addEventListener("change", () => {
-        const device = this._data.devices.find(
-          (item) => item.id === el.getAttribute("data-speaker-volume")
-        );
-        if (!device) return;
-        this._action(
-          device,
-          { type: "devices.capabilities.volume", instance: "volume" },
-          Number(el.value)
-        );
-      });
-    });
-    root.querySelectorAll("[data-speaker-power]").forEach((el) => {
-      el.addEventListener("click", () => {
-        const device = this._data.devices.find(
-          (item) => item.id === el.getAttribute("data-speaker-power")
-        );
-        if (!device) return;
-        this._action(
-          device,
-          { type: "devices.capabilities.on_off", instance: "on" },
-          !this._isOn(device)
-        );
-      });
-    });
     root.querySelectorAll("[data-scenario]").forEach((el) => {
       el.addEventListener("click", () => {
         this._scenario(el.getAttribute("data-scenario"));
@@ -884,11 +1398,12 @@ class YaHomeHubPanel extends HTMLElement {
       .top { display: flex; justify-content: space-between; align-items: center; gap: 18px; margin-bottom: 18px; }
       .brand { display: flex; align-items: center; gap: 16px; }
       .logo {
-        width: 56px; height: 56px; border-radius: 18px; display: grid; place-items: center;
+        width: 56px; height: 56px; border-radius: 18px; overflow: hidden; display: grid; place-items: center;
         color: white; font-size: 28px;
         background: linear-gradient(135deg, #5b6cff 0%, #8f43ff 55%, #ff4f9a 100%);
         box-shadow: 0 12px 30px rgba(91, 108, 255, .28);
       }
+      .logo img { width: 100%; height: 100%; object-fit: cover; display: block; }
       h1 { margin: 0; font-size: 26px; letter-spacing: -.4px; }
       .brand p { margin: 3px 0 0; color: var(--secondary-text-color, #667085); font-size: 13px; }
       .top-actions { display: flex; gap: 10px; }
@@ -999,6 +1514,158 @@ class YaHomeHubPanel extends HTMLElement {
       .speaker-head strong { display: block; font-size: 14px; }
       .speaker-head small { display: block; color: var(--secondary-text-color, #667085); font-size: 11px; margin-top: 2px; }
       .speaker-head .power { margin-left: auto; }
+      .tabs {
+        display: flex; gap: 6px; margin: 4px 0 18px; padding: 5px;
+        background: var(--card-background-color, #fff); border: 1px solid var(--divider-color, #e4e7ec);
+        border-radius: 16px; overflow-x: auto;
+      }
+      .tab {
+        display: inline-flex; align-items: center; gap: 8px; border: 0; background: transparent;
+        color: var(--secondary-text-color, #667085); border-radius: 12px; padding: 10px 14px;
+        font: inherit; font-size: 13px; cursor: pointer; white-space: nowrap;
+      }
+      .tab ha-icon { --mdc-icon-size: 18px; }
+      .tab b { font-size: 11px; opacity: .65; }
+      .tab.active {
+        color: #fff; background: linear-gradient(135deg, #5b6cff 0%, #8f43ff 60%, #ff4f9a 100%);
+        box-shadow: 0 8px 18px rgba(91, 108, 255, .25);
+      }
+      .speakers-section { display: flex; flex-direction: column; gap: 16px; }
+      .speaker-toolbar { display: flex; justify-content: space-between; align-items: flex-end; gap: 16px; }
+      .speaker-toolbar h3 { margin: 0 0 4px; font-size: 17px; }
+      .viz-switch {
+        display: flex; gap: 3px; padding: 4px; border: 1px solid var(--divider-color, #e4e7ec);
+        background: var(--card-background-color, #fff); border-radius: 14px; flex: none;
+      }
+      .viz-switch button {
+        display: inline-flex; align-items: center; gap: 5px; border: 0; background: transparent;
+        color: var(--secondary-text-color, #667085); border-radius: 10px; padding: 7px 9px;
+        font: inherit; font-size: 11px; cursor: pointer;
+      }
+      .viz-switch button ha-icon { --mdc-icon-size: 15px; }
+      .viz-switch button.active { background: var(--primary-color, #5b6cff); color: #fff; }
+      .players { display: grid; grid-template-columns: repeat(auto-fill, minmax(340px, 1fr)); gap: 16px; }
+      .player {
+        position: relative; overflow: hidden; border-radius: 24px; padding: 18px;
+        border: 1px solid var(--divider-color, #e4e7ec); background: var(--card-background-color, #fff);
+        isolation: isolate;
+      }
+      .player-bg {
+        position: absolute; inset: -25%; z-index: -2; background-image: var(--cover);
+        background-size: cover; background-position: center; filter: blur(38px) saturate(1.4);
+        opacity: .22; transform: scale(1.15);
+      }
+      .player-glow {
+        position: absolute; inset: 0; z-index: -1; pointer-events: none;
+        background: linear-gradient(135deg, rgba(91, 108, 255, .16), rgba(255, 79, 154, .12));
+      }
+      .player-content { position: relative; display: flex; flex-direction: column; gap: 12px; }
+      .player-head { display: flex; align-items: center; gap: 14px; }
+      .player-cover {
+        width: 84px; height: 84px; flex: none; border-radius: 20px; overflow: hidden;
+        display: grid; place-items: center; color: #fff; font-size: 34px;
+        background: linear-gradient(135deg, #5b6cff, #8f43ff 55%, #ff4f9a);
+        box-shadow: 0 14px 28px rgba(16, 24, 40, .18);
+      }
+      .player-cover img { width: 100%; height: 100%; object-fit: cover; display: block; }
+      .player.playing .player-cover img { animation: coverFloat 5s ease-in-out infinite; }
+      @keyframes coverFloat {
+        0%, 100% { transform: scale(1) rotate(0deg); }
+        50% { transform: scale(1.05) rotate(.6deg); }
+      }
+      .player-meta { min-width: 0; flex: 1; }
+      .player-kicker {
+        display: block; font-size: 9px; letter-spacing: .14em; text-transform: uppercase;
+        color: var(--secondary-text-color, #667085); font-weight: 700;
+      }
+      .player-meta h3 {
+        margin: 4px 0; font-size: 17px; line-height: 1.25;
+        white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+      }
+      .player-meta p {
+        margin: 0; font-size: 12px; color: var(--secondary-text-color, #667085);
+        white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+      }
+      .player-meta .dot { opacity: .45; }
+      .player-power { margin-left: auto; }
+      .viz {
+        height: 58px; display: flex; align-items: flex-end; justify-content: center; gap: 3px;
+        padding: 8px 10px; border-radius: 14px; overflow: hidden;
+        background: color-mix(in srgb, var(--primary-color, #5b6cff) 7%, transparent);
+      }
+      .viz-bars span {
+        flex: 1; height: var(--h); border-radius: 4px 4px 2px 2px;
+        background: linear-gradient(to top, #5b6cff, #ff4f9a);
+        transform-origin: bottom; animation: barDance 1.15s ease-in-out infinite alternate;
+        animation-delay: calc(var(--i) * -0.07s); opacity: .85;
+      }
+      @keyframes barDance { from { transform: scaleY(.28); } to { transform: scaleY(1); } }
+      .viz-wave span {
+        width: 4px; height: var(--h); border-radius: 99px;
+        background: linear-gradient(to top, #5b6cff, #22b8a7);
+        transform-origin: bottom; animation: waveDance 1.6s ease-in-out infinite;
+        animation-delay: calc(var(--i) * -0.09s); opacity: .8;
+      }
+      @keyframes waveDance {
+        0%, 100% { transform: scaleY(.3); }
+        50% { transform: scaleY(1); }
+      }
+      .viz-orbit { position: relative; display: grid; place-items: center; }
+      .viz-orbit i {
+        position: absolute; width: 38px; height: 38px; border-radius: 50%;
+        border: 2px solid rgba(91, 108, 255, .25); border-top-color: #ff4f9a;
+        animation: orbitSpin 3s linear infinite;
+      }
+      .viz-orbit i:nth-child(2) {
+        width: 52px; height: 52px; animation-duration: 4.6s; border-top-color: #5b6cff;
+        animation-direction: reverse;
+      }
+      .viz-orbit i:nth-child(3) {
+        width: 66px; height: 66px; animation-duration: 6.2s; border-top-color: #22b8a7;
+      }
+      .viz-orbit b {
+        width: 10px; height: 10px; border-radius: 50%; background: #ff4f9a;
+        box-shadow: 0 0 18px #ff4f9a;
+      }
+      @keyframes orbitSpin { to { transform: rotate(360deg); } }
+      .player:not(.playing) .viz span,
+      .player:not(.playing) .viz i,
+      .player:not(.playing) .viz b {
+        animation-play-state: paused; opacity: .35;
+      }
+      .player-seek input[type="range"] { width: 100%; accent-color: var(--primary-color, #5b6cff); }
+      .times {
+        display: flex; justify-content: space-between; margin-top: 2px;
+        font-size: 10px; color: var(--secondary-text-color, #667085);
+      }
+      .player-controls { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+      .transport { display: flex; align-items: center; gap: 6px; }
+      .player-controls .icon-btn { width: 38px; height: 38px; border-radius: 12px; }
+      .player-controls .icon-btn.play {
+        width: 46px; height: 46px; border-radius: 15px; border-color: transparent;
+        background: linear-gradient(135deg, #5b6cff, #ff4f9a); color: #fff;
+        box-shadow: 0 8px 18px rgba(91, 108, 255, .3);
+      }
+      .volume-control {
+        display: flex; align-items: center; gap: 6px; flex: 1; min-width: 130px;
+        color: var(--secondary-text-color, #667085);
+      }
+      .volume-control input { flex: 1; accent-color: var(--primary-color, #5b6cff); }
+      .volume-control span { width: 34px; text-align: right; font-size: 11px; }
+      .eq-select { height: 36px; max-width: 165px; font-size: 12px; }
+      .compact-speakers { margin-top: 2px; }
+      .player.compact { display: flex; align-items: center; gap: 14px; padding: 14px; }
+      .player.compact .player-cover { width: 56px; height: 56px; border-radius: 15px; font-size: 24px; }
+      .player.compact .player-meta h3 { font-size: 14px; }
+      .hub-intro { margin-bottom: 14px; }
+      .hub-title { display: flex; align-items: center; gap: 14px; }
+      .hub-title h3 { margin: 0 0 4px; font-size: 17px; }
+      .hub-chips { margin-top: 14px; }
+      .chip ha-icon { --mdc-icon-size: 16px; vertical-align: -3px; margin-right: 4px; }
+      .hub-note { display: flex; gap: 10px; align-items: flex-start; margin-top: 14px; }
+      .hub-note ha-icon { color: var(--primary-color, #5b6cff); flex: none; }
+      .prop span { display: flex; align-items: center; gap: 6px; }
+      .prop ha-icon { --mdc-icon-size: 16px; color: var(--secondary-text-color, #667085); }
       .loading { display: grid; place-items: center; padding: 70px 0; color: var(--secondary-text-color, #667085); }
       .spinner { width: 34px; height: 34px; border-radius: 50%; border: 3px solid var(--divider-color, #e4e7ec); border-top-color: var(--primary-color, #5b6cff); animation: spin .8s linear infinite; margin-bottom: 12px; }
       @keyframes spin { to { transform: rotate(360deg); } }
@@ -1013,6 +1680,12 @@ class YaHomeHubPanel extends HTMLElement {
         .stats { grid-template-columns: repeat(2, minmax(0, 1fr)); }
         .brand p { display: none; }
         h1 { font-size: 21px; }
+        .speaker-toolbar { flex-direction: column; align-items: stretch; }
+        .viz-switch { align-self: flex-start; }
+        .players { grid-template-columns: 1fr; }
+        .player-head { align-items: flex-start; }
+        .player-cover { width: 68px; height: 68px; border-radius: 16px; }
+        .eq-select { max-width: none; width: 100%; }
       }
     `;
   }
