@@ -23,6 +23,7 @@ from .const import (
     CONF_SCAN_INTERVAL,
     CONF_TOKEN,
     CONF_X_TOKEN,
+    COOKIES_URL,
     DEFAULT_ONLY_STATION_DEVICES,
     DEFAULT_SCAN_INTERVAL,
     DOMAIN,
@@ -210,6 +211,7 @@ class YahomeHubConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 }
             ),
             errors=errors,
+            description_placeholders={"cookies_url": COOKIES_URL},
         )
 
 
