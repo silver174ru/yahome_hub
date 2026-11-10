@@ -30,6 +30,8 @@ PLATFORMS: list[Platform] = [
     Platform.CAMERA,
     Platform.CALENDAR,
     Platform.CONVERSATION,
+    Platform.TEXT,
+    Platform.BUTTON,
 ]
 
 

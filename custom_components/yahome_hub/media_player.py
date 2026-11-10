@@ -5,13 +5,18 @@ from __future__ import annotations
 from typing import Any
 
 from homeassistant.components.media_player import (
+    BrowseMedia,
+    MediaClass,
     MediaPlayerEntity,
     MediaPlayerEntityFeature,
     MediaPlayerState,
     RepeatMode,
+    SearchMedia,
+    SearchMediaQuery,
 )
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
+from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
@@ -20,6 +25,7 @@ from .const import (
     CAP_MEDIA_PLAYBACK,
     CAP_ON_OFF,
     CAP_VOLUME,
+    CONF_MUSIC_TOKEN,
     DOMAIN,
     MUSIC_SPEAKER_PLATFORMS,
 )
@@ -30,6 +36,12 @@ from .helpers import (
     get_capability_state,
     is_online,
     primary_domain,
+)
+from .music import (
+    async_get_liked_tracks,
+    async_get_playlist_tracks,
+    async_get_playlists,
+    async_search_tracks,
 )
 
 
@@ -146,6 +158,8 @@ class YahomeSpeaker(
                 | MediaPlayerEntityFeature.PLAY_MEDIA
                 | MediaPlayerEntityFeature.SHUFFLE_SET
                 | MediaPlayerEntityFeature.REPEAT_SET
+                | MediaPlayerEntityFeature.BROWSE_MEDIA
+                | MediaPlayerEntityFeature.SEARCH_MEDIA
             )
         return features
 
@@ -384,6 +398,142 @@ class YahomeSpeaker(
         """Play a Yandex Music track, YouTube link or search query."""
         await self.coordinator.async_play_speaker_media(
             self.entity_id, media_id, media_type
+        )
+
+    def _music_token(self) -> str | None:
+        return self.coordinator.entry.data.get(CONF_MUSIC_TOKEN)
+
+    def _browse_dir(
+        self, title: str, content_id: str, media_class: MediaClass
+    ) -> BrowseMedia:
+        return BrowseMedia(
+            title=title,
+            media_class=media_class,
+            media_content_id=content_id,
+            media_content_type="directory",
+            can_play=False,
+            can_expand=True,
+        )
+
+    def _browse_track(self, track: dict[str, Any]) -> BrowseMedia:
+        title = track.get("title") or "Трек"
+        artist = track.get("artist") or ""
+        return BrowseMedia(
+            title=f"{title} — {artist}".strip(" —"),
+            media_class=MediaClass.TRACK,
+            media_content_id=str(track.get("id")),
+            media_content_type="music",
+            can_play=True,
+            can_expand=False,
+            thumbnail=track.get("cover"),
+        )
+
+    def _browse_tracks(
+        self, title: str, content_id: str, tracks: list[dict[str, Any]]
+    ) -> BrowseMedia:
+        children = [
+            self._browse_track(track)
+            for track in tracks
+            if track.get("id")
+        ]
+        return BrowseMedia(
+            title=title,
+            media_class=MediaClass.PLAYLIST,
+            media_content_id=content_id,
+            media_content_type="playlist",
+            can_play=False,
+            can_expand=True,
+            children=children,
+            children_media_class=MediaClass.TRACK,
+        )
+
+    async def async_browse_media(
+        self,
+        media_content_type: str | None = None,
+        media_content_id: str | None = None,
+    ) -> BrowseMedia:
+        """Browse Yandex Music likes, playlists and the local queue."""
+        session = async_get_clientsession(self.hass)
+        token = self._music_token()
+        if media_content_id in (None, "", "root"):
+            return BrowseMedia(
+                title=self.name or "Яндекс Музыка",
+                media_class=MediaClass.DIRECTORY,
+                media_content_id="root",
+                media_content_type="root",
+                can_play=False,
+                can_expand=True,
+                children_media_class=MediaClass.DIRECTORY,
+                children=[
+                    self._browse_dir(
+                        "Лайки", "likes", MediaClass.PLAYLIST
+                    ),
+                    self._browse_dir(
+                        "Плейлисты", "playlists", MediaClass.DIRECTORY
+                    ),
+                    self._browse_dir(
+                        "Очередь", "queue", MediaClass.PLAYLIST
+                    ),
+                ],
+                can_search=True,
+                search_media_classes=[MediaClass.TRACK],
+            )
+        if media_content_id == "likes":
+            tracks = await async_get_liked_tracks(session, token)
+            return self._browse_tracks("Лайки", "likes", tracks)
+        if media_content_id == "playlists":
+            playlists = await async_get_playlists(session, token)
+            children = [
+                BrowseMedia(
+                    title=playlist.get("title") or "Плейлист",
+                    media_class=MediaClass.PLAYLIST,
+                    media_content_id=f"playlist:{playlist.get('kind')}",
+                    media_content_type="playlist",
+                    can_play=False,
+                    can_expand=True,
+                    thumbnail=playlist.get("cover"),
+                )
+                for playlist in playlists
+            ]
+            return BrowseMedia(
+                title="Плейлисты",
+                media_class=MediaClass.DIRECTORY,
+                media_content_id="playlists",
+                media_content_type="directory",
+                can_play=False,
+                can_expand=True,
+                children=children,
+                children_media_class=MediaClass.PLAYLIST,
+            )
+        if media_content_id.startswith("playlist:"):
+            kind = media_content_id.split(":", 1)[1]
+            tracks = await async_get_playlist_tracks(session, token, kind)
+            return self._browse_tracks(
+                "Плейлист", media_content_id, tracks
+            )
+        if media_content_id == "queue":
+            queue = self.coordinator.music_queue(self._speaker_id)
+            return self._browse_tracks(
+                "Очередь", "queue", queue.get("tracks") or []
+            )
+        return self._browse_tracks("Яндекс Музыка", "root", [])
+
+    async def async_search_media(
+        self, query: SearchMediaQuery
+    ) -> SearchMedia:
+        """Search Yandex Music for the HA media browser."""
+        tracks = await async_search_tracks(
+            async_get_clientsession(self.hass),
+            query.search_query,
+            self._music_token(),
+            25,
+        )
+        return SearchMedia(
+            result=[
+                self._browse_track(track)
+                for track in tracks
+                if track.get("id")
+            ]
         )
 
     async def _send_action(

@@ -13,6 +13,7 @@ from .const import (
     CAPABILITY_NAMES,
     CAP_MODE,
     CAP_WORK_SPEED,
+    LED_SPEAKER_PLATFORMS,
     MUSIC_SPEAKER_PLATFORMS,
 )
 from .coordinator import YahomeDataUpdateCoordinator
@@ -53,6 +54,11 @@ async def async_setup_entry(
         if speaker.get("entity_id")
         and speaker.get("platform") in MUSIC_SPEAKER_PLATFORMS
     ]
+    entities.extend(
+        YahomeScreenSelect(coordinator, speaker_id)
+        for speaker_id, speaker in coordinator.data.speakers.items()
+        if speaker.get("platform") in LED_SPEAKER_PLATFORMS
+    )
     for device_id, device in coordinator.data.devices.items():
         if not coordinator.is_device_visible(device_id):
             continue
@@ -273,4 +279,35 @@ class YahomeEqualizerSelect(YahomeSpeakerEntity, SelectEntity):
             return
 
         self._attr_current_option = option
+        self.async_write_ha_state()
+
+
+class YahomeScreenSelect(YahomeSpeakerEntity, SelectEntity):
+    """Screen mode of a Yandex Station with a display."""
+
+    _attr_name = "Экран"
+    _attr_icon = "mdi:monitor"
+    _attr_options = ["Часы", "Эквалайзер"]
+
+    def __init__(
+        self, coordinator: YahomeDataUpdateCoordinator, speaker_id: str
+    ) -> None:
+        super().__init__(coordinator, speaker_id, "screen")
+
+    @property
+    def current_option(self) -> str:
+        """Return the current screen mode."""
+        return (
+            "Эквалайзер"
+            if self.coordinator.led_visualization(self._speaker_id)
+            == "equalizer"
+            else "Часы"
+        )
+
+    async def async_select_option(self, option: str) -> None:
+        """Set the screen mode."""
+        visualization = "equalizer" if option == "Эквалайзер" else "clock"
+        await self.coordinator.async_set_speaker_led_by_id(
+            self._speaker_id, visualization=visualization
+        )
         self.async_write_ha_state()

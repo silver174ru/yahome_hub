@@ -41,6 +41,15 @@ MUSIC_SPEAKER_PLATFORMS = {
     "orion",
 }
 
+LED_SPEAKER_PLATFORMS = {
+    "yandexstation_2",
+    "yandexmini_2",
+    "orion",
+    "cucumber",
+    "plum",
+    "bergamot",
+}
+
 CONF_TOKEN = "token"
 CONF_COOKIES = "cookies"
 CONF_MUSIC_TOKEN = "music_token"

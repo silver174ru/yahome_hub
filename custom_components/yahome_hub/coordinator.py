@@ -86,6 +86,9 @@ class YahomeDataUpdateCoordinator(DataUpdateCoordinator[YahomeData]):
         self._suppress_panel_event = False
         self._music_queues: dict[str, dict[str, Any]] = {}
         self._music_queue_tasks: dict[str, asyncio.Task] = {}
+        self._led_brightness: dict[str, float] = {}
+        self._led_visualization: dict[str, str] = {}
+        self._tts_messages: dict[str, str] = {}
         self._discovery = YahomeLocalDiscovery(hass, self._async_local_found)
         self._store = YahomeDeviceStore(hass)
 
@@ -184,6 +187,11 @@ class YahomeDataUpdateCoordinator(DataUpdateCoordinator[YahomeData]):
         self._glagols.clear()
         self._glagol_states.clear()
         self._glagol_state_ts.clear()
+        for task in list(self._music_queue_tasks.values()):
+            if not task.done():
+                task.cancel()
+        self._music_queue_tasks.clear()
+        self._music_queues.clear()
 
     @callback
     def _async_local_found(self, info: dict[str, Any]) -> None:
@@ -686,6 +694,17 @@ class YahomeDataUpdateCoordinator(DataUpdateCoordinator[YahomeData]):
         speaker_id = self.speaker_id_for_entity(entity_id)
         if not speaker_id:
             raise HomeAssistantError("Speaker not found")
+        await self.async_set_speaker_led_by_id(
+            speaker_id, brightness, visualization
+        )
+
+    async def async_set_speaker_led_by_id(
+        self,
+        speaker_id: str,
+        brightness: float | None = None,
+        visualization: str | None = None,
+    ) -> None:
+        """Set the LED brightness or screen visualization by speaker ID."""
         quasar = await self.async_live_quasar()
         if quasar is None:
             raise HomeAssistantError("Yandex cookies are not available")
@@ -697,13 +716,31 @@ class YahomeDataUpdateCoordinator(DataUpdateCoordinator[YahomeData]):
             item = led.setdefault("brightness", {"auto": True, "value": 0.5})
             item["auto"] = False
             item["value"] = value
+            self._led_brightness[speaker_id] = value
         if visualization is not None:
             item = led.setdefault(
                 "music_equalizer_visualization",
                 {"style": "showClock", "auto": False},
             )
             item["auto"] = visualization != "clock"
+            self._led_visualization[speaker_id] = visualization
         await quasar.set_device_config(device_id, config, version)
+
+    def led_brightness(self, speaker_id: str) -> float:
+        """Return the last known LED brightness (0..1)."""
+        return self._led_brightness.get(speaker_id, 0.5)
+
+    def led_visualization(self, speaker_id: str) -> str:
+        """Return the last known screen mode."""
+        return self._led_visualization.get(speaker_id, "clock")
+
+    def set_tts_message(self, speaker_id: str, message: str) -> None:
+        """Store the pending TTS message for a speaker."""
+        self._tts_messages[speaker_id] = str(message)
+
+    def tts_message(self, speaker_id: str) -> str:
+        """Return the pending TTS message for a speaker."""
+        return self._tts_messages.get(speaker_id, "")
 
     async def async_play_speaker_media(
         self,

@@ -15,9 +15,15 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
-from .const import CAP_COLOR_SETTING, CAP_ON_OFF, CAP_RANGE
+from .const import (
+    CAP_COLOR_SETTING,
+    CAP_ON_OFF,
+    CAP_RANGE,
+    LED_SPEAKER_PLATFORMS,
+)
 from .coordinator import YahomeDataUpdateCoordinator
 from .entity import YahomeDeviceEntity
+from .speaker_entity import YahomeSpeakerEntity
 from .helpers import (
     get_capability,
     get_capability_parameters,
@@ -43,6 +49,11 @@ async def async_setup_entry(
         ):
             continue
         entities.append(YahomeLight(coordinator, device_id))
+    entities.extend(
+        YahomeSpeakerLedLight(coordinator, speaker_id)
+        for speaker_id, speaker in coordinator.data.speakers.items()
+        if speaker.get("platform") in LED_SPEAKER_PLATFORMS
+    )
     async_add_entities(entities)
 
 
@@ -177,4 +188,43 @@ class YahomeLight(YahomeDeviceEntity, LightEntity):
         """Turn the light off."""
         await self.coordinator.async_device_action(
             self._device_id, CAP_ON_OFF, "on", False
+        )
+
+
+class YahomeSpeakerLedLight(YahomeSpeakerEntity, LightEntity):
+    """LED brightness of a Yandex Station."""
+
+    _attr_name = "Подсветка"
+    _attr_supported_color_modes = {ColorMode.BRIGHTNESS}
+    _attr_color_mode = ColorMode.BRIGHTNESS
+
+    def __init__(
+        self, coordinator: YahomeDataUpdateCoordinator, speaker_id: str
+    ) -> None:
+        super().__init__(coordinator, speaker_id, "led")
+
+    @property
+    def is_on(self) -> bool:
+        """Return True while the LED is lit."""
+        return (self.brightness or 0) > 0
+
+    @property
+    def brightness(self) -> int:
+        """Return LED brightness 0..255."""
+        return round(self.coordinator.led_brightness(self._speaker_id) * 255)
+
+    async def async_turn_on(self, **kwargs: Any) -> None:
+        """Turn the LED on or set its brightness."""
+        brightness = kwargs.get(ATTR_BRIGHTNESS)
+        value = (
+            int(brightness) / 255 if brightness is not None else 1.0
+        )
+        await self.coordinator.async_set_speaker_led_by_id(
+            self._speaker_id, brightness=value
+        )
+
+    async def async_turn_off(self, **kwargs: Any) -> None:
+        """Turn the LED off."""
+        await self.coordinator.async_set_speaker_led_by_id(
+            self._speaker_id, brightness=0.0
         )
