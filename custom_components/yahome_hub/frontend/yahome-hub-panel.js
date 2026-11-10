@@ -10,6 +10,13 @@ class YaHomeHubPanel extends HTMLElement {
     this._selected = null;
     this._tab = "devices";
     this._hubFilter = "zigbee";
+    this._speakerTab = "music";
+    try {
+      this._speakerTab =
+        localStorage.getItem("yahome-hub-speaker-tab") || "music";
+    } catch (err) {
+      this._speakerTab = "music";
+    }
     this._viz = "bars";
     try {
       this._viz = localStorage.getItem("yahome-hub-viz") || "bars";
@@ -20,8 +27,10 @@ class YaHomeHubPanel extends HTMLElement {
     this._stateUnsub = null;
     this._trackCache = {};
     this._lyricsCache = {};
+    this._musicResults = {};
     this._fullPlayer = null;
     this._showLyrics = true;
+    this._tickCount = 0;
     this._lyricsOffset = 0;
     try {
       const stored = Number(localStorage.getItem("yahome-hub-lyrics-offset"));
@@ -108,12 +117,8 @@ class YaHomeHubPanel extends HTMLElement {
     ) {
       return;
     }
-    if (this.shadowRoot && this.shadowRoot.activeElement) {
-      const tag = this.shadowRoot.activeElement.tagName;
-      if (tag === "SELECT" || tag === "INPUT") return;
-    }
     clearTimeout(this._stateTimer);
-    this._stateTimer = setTimeout(() => this._updatePlayerDom(), 220);
+    this._stateTimer = setTimeout(() => this._updatePlayerDom(), 180);
   }
 
   async _load(silent = false) {
@@ -244,6 +249,13 @@ class YaHomeHubPanel extends HTMLElement {
       down: "Вниз",
     };
     return labels[String(value).toLowerCase()] || value;
+  }
+
+  _setControlStatus(speakerId, text) {
+    const el = this.shadowRoot
+      ? this.shadowRoot.querySelector(`[data-control-status="${speakerId}"]`)
+      : null;
+    if (el) el.textContent = text;
   }
 
   _showToast(text) {
@@ -447,7 +459,11 @@ class YaHomeHubPanel extends HTMLElement {
 
   _renderTabContent(data, devices) {
     if (this._tab === "speakers") {
-      return this._renderSpeakerPlayers(data.speakers || []);
+      return `${this._renderSpeakerTabs()}${
+        this._speakerTab === "speaker"
+          ? this._renderSpeakerControls(data.speakers || [])
+          : this._renderSpeakerPlayers(data.speakers || [])
+      }`;
     }
     if (this._tab === "hub") {
       return this._renderHub(data);
@@ -864,8 +880,8 @@ class YaHomeHubPanel extends HTMLElement {
       <div class="speakers-section">
         <div class="speaker-toolbar">
           <div>
-            <h3>Колонки</h3>
-            <p class="muted">Обложка, трек, перемотка, громкость и эквалайзер — прямо здесь.</p>
+            <h3>Музыка</h3>
+            <p class="muted">Обложка, трек, перемотка, громкость, поиск музыки и режимы — прямо здесь. Настройки самой колонки — на вкладке «Колонка».</p>
           </div>
           <div class="viz-switch" title="Визуализация">
             ${viz
@@ -885,6 +901,195 @@ class YaHomeHubPanel extends HTMLElement {
         </div>
       </div>
     `;
+  }
+
+  _renderSpeakerTabs() {
+    const tabs = [
+      ["music", "Музыка", "mdi:music-note"],
+      ["speaker", "Колонка", "mdi:speaker"],
+    ];
+    return `<div class="subtabs">${tabs
+      .map(
+        ([id, label, icon]) =>
+          `<button class="${this._speakerTab === id ? "active" : ""}" data-speaker-tab="${id}">
+            <ha-icon icon="${icon}"></ha-icon><span>${label}</span>
+          </button>`
+      )
+      .join("")}</div>`;
+  }
+
+  _renderSpeakerControls(speakers) {
+    const withEntity = speakers.filter(
+      (speaker) => speaker.entity_id && this._hass.states[speaker.entity_id]
+    );
+    if (!withEntity.length) {
+      return `<div class="empty">Колонки не найдены. Проверьте cookies и токен в настройках интеграции.</div>`;
+    }
+    return `
+      <div class="speaker-controls">
+        ${withEntity
+          .map((speaker) => this._renderSpeakerControlsCard(speaker))
+          .join("")}
+      </div>
+      <div class="section speaker-note">
+        <ha-icon icon="mdi:home-assistant"></ha-icon>
+        <p class="muted">Yandex Smart Home — отдельная интеграция для показа устройств Home Assistant в Алисе. Установите и настройте её в
+          <a href="/config/integrations" target="_blank">Настройки → Устройства и службы</a>.
+          YaHome Hub не включает её автоматически.</p>
+      </div>`;
+  }
+
+  _renderSpeakerControlsCard(speaker) {
+    const entityId = speaker.entity_id;
+    const entity = this._hass.states[entityId];
+    const eqEntity = speaker.equalizer_entity
+      ? this._hass.states[speaker.equalizer_entity]
+      : null;
+    const eqOptions = eqEntity ? eqEntity.attributes.options || [] : [];
+    const eqValue = eqEntity ? eqEntity.state : "";
+    const calendar = speaker.calendar_entity
+      ? this._hass.states[speaker.calendar_entity]
+      : null;
+    const token = this._hass.auth?.data?.access_token || "";
+    const sensors = speaker.sensors || [];
+    return `<article class="speaker-control">
+      <div class="speaker-control-head">
+        <div class="device-icon" style="--accent:#5b6cff"><ha-icon icon="mdi:speaker-wireless"></ha-icon></div>
+        <div>
+          <h3>${this._esc(speaker.name)}</h3>
+          <p class="muted">${this._esc(speaker.platform || "")} · ${
+      entity.state === "off" ? "выключена" : "онлайн"
+    }</p>
+        </div>
+      </div>
+      <div class="speaker-grid">
+        <div class="control-block">
+          <h4>Озвучить текст</h4>
+          <textarea data-tts-text="${this._esc(speaker.id)}" placeholder="Что сказать?"></textarea>
+          <div class="control-line">
+            <input type="range" min="0" max="100" value="70" data-tts-volume="${this._esc(
+              speaker.id
+            )}">
+            <button class="action-btn" data-tts-send="${this._esc(
+              speaker.id
+            )}" data-entity="${this._esc(entityId)}">Озвучить</button>
+          </div>
+        </div>
+        ${
+          speaker.led_supported
+            ? `<div class="control-block">
+                <h4>Подсветка</h4>
+                <label>Яркость <input type="range" min="0" max="100" value="60" data-led-brightness="${this._esc(
+                  speaker.id
+                )}"></label>
+                <label>Экран <select data-led-visualization="${this._esc(
+                  speaker.id
+                )}"><option value="clock">Часы</option><option value="equalizer">Эквалайзер</option></select></label>
+                <button class="action-btn" data-led-apply="${this._esc(
+                  speaker.id
+                )}" data-entity="${this._esc(entityId)}">Применить</button>
+              </div>`
+            : ""
+        }
+        ${
+          eqOptions.length
+            ? `<div class="control-block">
+                <h4>Эквалайзер</h4>
+                <select class="eq-select" data-eq-entity="${this._esc(
+                  speaker.equalizer_entity
+                )}">${eqOptions
+                .map(
+                  (option) =>
+                    `<option value="${this._esc(option)}" ${
+                      option === eqValue ? "selected" : ""
+                    }>${this._esc(this._eqLabel(option))}</option>`
+                )
+                .join("")}</select>
+              </div>`
+            : ""
+        }
+        <div class="control-block">
+          <h4>Будильники</h4>
+          <p class="muted">${calendar ? this._esc(calendar.state) : "Нет календаря"}</p>
+          ${
+            speaker.calendar_entity
+              ? `<button class="ghost-btn" data-more-info="${this._esc(
+                  speaker.calendar_entity
+                )}">Открыть</button>`
+              : ""
+          }
+        </div>
+        <div class="control-block">
+          <h4>Текст песни</h4>
+          ${
+            speaker.lyrics_entity && token
+              ? `<img class="lyrics-preview" src="/api/camera_proxy_stream/${this._esc(
+                  speaker.lyrics_entity
+                )}?token=${this._esc(token)}" alt="">`
+              : `<p class="muted">Камера недоступна</p>`
+          }
+          ${
+            speaker.lyrics_entity
+              ? `<button class="ghost-btn" data-more-info="${this._esc(
+                  speaker.lyrics_entity
+                )}">Открыть камеру</button>`
+              : ""
+          }
+        </div>
+        <div class="control-block">
+          <h4>Алиса</h4>
+          <div class="chat-line">
+            <input data-chat-input="${this._esc(
+              speaker.id
+            )}" placeholder="Спросить Алису...">
+            <button class="action-btn" data-chat-send="${this._esc(
+              speaker.id
+            )}" data-entity="${this._esc(speaker.conversation_entity || "")}">→</button>
+          </div>
+          <div class="chat-response" data-chat-response="${this._esc(
+            speaker.id
+          )}"></div>
+        </div>
+        <div class="control-block">
+          <h4>Датчики</h4>
+          ${
+            sensors.length
+              ? `<div class="sensor-grid">${sensors
+                  .map(
+                    (sensor) =>
+                      `<div class="sensor-tile"><span>${this._esc(
+                        this._sensorLabel(sensor.instance)
+                      )}</span><b>${this._esc(
+                        String(sensor.value ?? "—")
+                      )}</b></div>`
+                  )
+                  .join("")}</div>`
+              : `<p class="muted">Эта модель не отдаёт датчики температуры, влажности и освещённости.</p>`
+          }
+        </div>
+      </div>
+      <div class="control-status" data-control-status="${this._esc(
+        speaker.id
+      )}"></div>
+    </article>`;
+  }
+
+  _sensorLabel(instance) {
+    const labels = {
+      temperature: "Температура",
+      humidity: "Влажность",
+      illumination: "Освещённость",
+      motion: "Движение",
+      battery_level: "Батарея",
+      pressure: "Давление",
+      co2: "CO₂",
+      pm25: "PM2.5",
+      water_leak: "Протечка",
+      smoke: "Дым",
+      gas: "Газ",
+      open: "Открыто",
+    };
+    return labels[instance] || instance || "Датчик";
   }
 
   _renderSpeakerFallback(speaker) {
@@ -1000,11 +1205,6 @@ class YaHomeHubPanel extends HTMLElement {
         ? Number(speaker.volume)
         : 0;
     const muted = Boolean(attrs.is_volume_muted) || volume === 0;
-    const eqEntity = speaker.equalizer_entity
-      ? this._hass.states[speaker.equalizer_entity]
-      : null;
-    const eqOptions = eqEntity ? eqEntity.attributes.options || [] : [];
-    const eqValue = eqEntity ? eqEntity.state : "";
     const lyrics = full ? this._lyricsFor(speaker) : "";
     const lyric = full
       ? this._lyricLines(lyrics, position + this._lyricsOffset)
@@ -1115,22 +1315,6 @@ class YaHomeHubPanel extends HTMLElement {
                 entityId
               )}" data-player-volume-label>${volume}%</span>
             </div>
-            ${
-              eqOptions.length
-                ? `<select class="eq-select" data-eq-entity="${this._esc(
-                    speaker.equalizer_entity
-                  )}" title="Эквалайзер">
-                    ${eqOptions
-                      .map(
-                        (option) =>
-                          `<option value="${this._esc(option)}" ${
-                            option === eqValue ? "selected" : ""
-                          }>${this._esc(this._eqLabel(option))}</option>`
-                      )
-                      .join("")}
-                  </select>`
-                : ""
-            }
           </div>
           ${
             full && this._showLyrics
@@ -1144,11 +1328,46 @@ class YaHomeHubPanel extends HTMLElement {
                 </div>`
               : ""
           }
+          ${
+            full
+              ? `<div class="music-search">
+                  <div class="search-row">
+                    <input data-music-query="${this._esc(
+                      speaker.id
+                    )}" placeholder="Трек, исполнитель или ссылка">
+                    <button class="action-btn" data-music-search="${this._esc(
+                      speaker.id
+                    )}" data-entity="${this._esc(entityId)}">Найти</button>
+                  </div>
+                  <div class="music-results" data-music-results="${this._esc(
+                    speaker.id
+                  )}"></div>
+                  <div class="mode-row">
+                    <button class="mode-btn ${
+                      attrs.shuffle ? "active" : ""
+                    }" data-shuffle="${this._esc(
+                    entityId
+                  )}"><ha-icon icon="mdi:shuffle"></ha-icon> Перемешать</button>
+                    <select data-repeat="${this._esc(entityId)}">
+                      <option value="off" ${
+                        attrs.repeat === "off" ? "selected" : ""
+                      }>Без повтора</option>
+                      <option value="all" ${
+                        attrs.repeat === "all" ? "selected" : ""
+                      }>Повторять всё</option>
+                      <option value="one" ${
+                        attrs.repeat === "one" ? "selected" : ""
+                      }>Повторять трек</option>
+                    </select>
+                  </div>
+                </div>`
+              : ""
+          }
         </div>
       </article>`;
   }
 
-  _updatePlayerDom() {
+  _updatePlayerDom(restartTicker = true) {
     const root = this.shadowRoot;
     if (!root || !this._data) return;
     root.querySelectorAll(".player[data-player-entity]").forEach((el) => {
@@ -1287,6 +1506,14 @@ class YaHomeHubPanel extends HTMLElement {
           eq.value = eqState.state;
         }
       }
+      const shuffleBtn = el.querySelector("[data-shuffle]");
+      if (shuffleBtn) {
+        shuffleBtn.classList.toggle("active", Boolean(attrs.shuffle));
+      }
+      const repeatSelect = el.querySelector("[data-repeat]");
+      if (repeatSelect && attrs.repeat && repeatSelect.value !== attrs.repeat) {
+        repeatSelect.value = attrs.repeat;
+      }
       if (el.classList.contains("full") && this._showLyrics) {
         const lyrics = this._lyricsFor(speaker);
         const line = this._lyricLines(lyrics, position + this._lyricsOffset);
@@ -1300,7 +1527,7 @@ class YaHomeHubPanel extends HTMLElement {
         }
       }
     });
-    this._startTicker();
+    if (restartTicker) this._startTicker();
   }
 
   _renderViz(playing) {
@@ -1397,6 +1624,8 @@ class YaHomeHubPanel extends HTMLElement {
   _tick() {
     const root = this.shadowRoot;
     if (!root || !this._hass) return;
+    this._tickCount += 1;
+    if (this._tickCount % 8 === 0) this._updatePlayerDom(false);
     root.querySelectorAll("[data-seek-entity]").forEach((input) => {
       const entityId = input.getAttribute("data-seek-entity");
       const entity = this._hass.states[entityId];
@@ -1441,6 +1670,67 @@ class YaHomeHubPanel extends HTMLElement {
     }
     if (next && next.textContent !== line.next) {
       next.textContent = line.next;
+    }
+  }
+
+  async _searchMusic(speakerId, entityId, query) {
+    const resultsEl = this.shadowRoot
+      ? this.shadowRoot.querySelector(
+          `[data-music-results="${speakerId}"]`
+        )
+      : null;
+    if (resultsEl) resultsEl.innerHTML = `<div class="music-hint">Ищу...</div>`;
+    if (/^https?:\/\//i.test(query)) {
+      if (resultsEl) resultsEl.innerHTML = "";
+      this._callService("media_player", "play_media", {
+        entity_id: entityId,
+        media_content_id: query,
+        media_content_type: "music",
+      });
+      return;
+    }
+    try {
+      const result = await this._hass.callWS({
+        type: "yahome_hub/music_search",
+        query,
+      });
+      const tracks = result?.tracks || [];
+      if (!resultsEl) return;
+      if (!tracks.length) {
+        resultsEl.innerHTML = `<div class="music-hint">Ничего не найдено</div>`;
+        return;
+      }
+      resultsEl.innerHTML = tracks
+        .map(
+          (track) =>
+            `<button class="music-result" data-play-track="${this._esc(
+              track.id
+            )}" data-play-entity="${this._esc(entityId)}">
+              <img src="${this._esc(track.cover || "")}" alt="">
+              <span><b>${this._esc(track.title)}</b><small>${this._esc(
+              track.artist
+            )}${
+              track.album ? ` · ${this._esc(track.album)}` : ""
+            }</small></span>
+              <ha-icon icon="mdi:play-circle"></ha-icon>
+            </button>`
+        )
+        .join("");
+      resultsEl.querySelectorAll("[data-play-track]").forEach((button) => {
+        button.addEventListener("click", () => {
+          this._callService("media_player", "play_media", {
+            entity_id: button.getAttribute("data-play-entity"),
+            media_content_id: button.getAttribute("data-play-track"),
+            media_content_type: "music",
+          });
+        });
+      });
+    } catch (err) {
+      if (resultsEl) {
+        resultsEl.innerHTML = `<div class="music-hint">Ошибка: ${this._esc(
+          this._message(err)
+        )}</div>`;
+      }
     }
   }
 
@@ -1490,6 +1780,105 @@ class YaHomeHubPanel extends HTMLElement {
         this._fullPlayer = el.getAttribute("data-open-player");
         this._showLyrics = true;
         this._render();
+      });
+    });
+    root.querySelectorAll("[data-speaker-tab]").forEach((el) => {
+      el.addEventListener("click", () => {
+        this._speakerTab = el.getAttribute("data-speaker-tab");
+        try {
+          localStorage.setItem("yahome-hub-speaker-tab", this._speakerTab);
+        } catch (err) {
+          /* ignore */
+        }
+        this._render();
+      });
+    });
+    root.querySelectorAll("[data-tts-send]").forEach((el) => {
+      el.addEventListener("click", async () => {
+        const speakerId = el.getAttribute("data-tts-send");
+        const entityId = el.getAttribute("data-entity");
+        const textEl = root.querySelector(`[data-tts-text="${speakerId}"]`);
+        const volumeEl = root.querySelector(`[data-tts-volume="${speakerId}"]`);
+        const message = textEl ? textEl.value.trim() : "";
+        if (!message) return this._setControlStatus(speakerId, "Введите текст");
+        this._setControlStatus(speakerId, "Отправляю...");
+        try {
+          await this._hass.callService("yahome_hub", "say", {
+            entity_id: entityId,
+            message,
+            volume_level: Number(volumeEl?.value || 70) / 100,
+          });
+          this._setControlStatus(speakerId, "Текст отправлен на колонку");
+        } catch (err) {
+          this._setControlStatus(speakerId, "Ошибка: " + this._message(err));
+        }
+      });
+    });
+    root.querySelectorAll("[data-led-apply]").forEach((el) => {
+      el.addEventListener("click", async () => {
+        const speakerId = el.getAttribute("data-led-apply");
+        const entityId = el.getAttribute("data-entity");
+        const brightnessEl = root.querySelector(
+          `[data-led-brightness="${speakerId}"]`
+        );
+        const visEl = root.querySelector(
+          `[data-led-visualization="${speakerId}"]`
+        );
+        this._setControlStatus(speakerId, "Применяю...");
+        try {
+          await this._hass.callService("yahome_hub", "set_led", {
+            entity_id: entityId,
+            brightness: Number(brightnessEl?.value || 60) / 100,
+            visualization: visEl?.value || "clock",
+          });
+          this._setControlStatus(speakerId, "Подсветка обновлена");
+        } catch (err) {
+          this._setControlStatus(speakerId, "Ошибка: " + this._message(err));
+        }
+      });
+    });
+    root.querySelectorAll("[data-more-info]").forEach((el) => {
+      el.addEventListener("click", () => {
+        this.dispatchEvent(
+          new CustomEvent("hass-more-info", {
+            detail: { entityId: el.getAttribute("data-more-info") },
+            bubbles: true,
+            composed: true,
+          })
+        );
+      });
+    });
+    root.querySelectorAll("[data-chat-send]").forEach((el) => {
+      el.addEventListener("click", async () => {
+        const speakerId = el.getAttribute("data-chat-send");
+        const agentId = el.getAttribute("data-entity");
+        const input = root.querySelector(`[data-chat-input="${speakerId}"]`);
+        const responseEl = root.querySelector(
+          `[data-chat-response="${speakerId}"]`
+        );
+        const text = input ? input.value.trim() : "";
+        if (!text || !agentId) return;
+        if (responseEl) responseEl.textContent = "Думаю...";
+        try {
+          const result = await this._hass.callService(
+            "conversation",
+            "process",
+            { text, agent_id: agentId },
+            undefined,
+            false,
+            true
+          );
+          const speech =
+            result?.response?.speech?.plain?.speech ||
+            result?.response?.speech?.plain?.text ||
+            "Готово";
+          if (responseEl) responseEl.textContent = speech;
+          if (input) input.value = "";
+        } catch (err) {
+          if (responseEl) {
+            responseEl.textContent = "Ошибка: " + this._message(err);
+          }
+        }
       });
     });
     root.querySelectorAll("[data-close-player]").forEach((el) => {
@@ -1588,6 +1977,34 @@ class YaHomeHubPanel extends HTMLElement {
       el.addEventListener("click", () => {
         const delta = Number(el.getAttribute("data-lyrics-offset")) || 0;
         this._setLyricsOffset(this._lyricsOffset + delta);
+      });
+    });
+    root.querySelectorAll("[data-music-search]").forEach((el) => {
+      el.addEventListener("click", () => {
+        const speakerId = el.getAttribute("data-music-search");
+        const entityId = el.getAttribute("data-entity");
+        const input = root.querySelector(`[data-music-query="${speakerId}"]`);
+        const query = input ? input.value.trim() : "";
+        if (query) this._searchMusic(speakerId, entityId, query);
+      });
+    });
+    root.querySelectorAll("[data-shuffle]").forEach((el) => {
+      el.addEventListener("click", () => {
+        const entityId = el.getAttribute("data-shuffle");
+        const state = this._hass.states[entityId];
+        const shuffle = !(state && state.attributes && state.attributes.shuffle);
+        this._callService("media_player", "shuffle_set", {
+          entity_id: entityId,
+          shuffle,
+        });
+      });
+    });
+    root.querySelectorAll("[data-repeat]").forEach((el) => {
+      el.addEventListener("change", () => {
+        this._callService("media_player", "repeat_set", {
+          entity_id: el.getAttribute("data-repeat"),
+          repeat: el.value,
+        });
       });
     });
     root.querySelectorAll("[data-volume-entity]").forEach((el) => {
@@ -2166,6 +2583,121 @@ class YaHomeHubPanel extends HTMLElement {
       .toast {
         position: fixed; right: 24px; bottom: 24px; z-index: 10; background: #111827; color: #fff;
         border-radius: 12px; padding: 12px 16px; font-size: 13px; box-shadow: 0 18px 40px rgba(0,0,0,.24);
+      }
+      .subtabs {
+        display: flex; gap: 8px; margin: 0 0 16px; flex-wrap: wrap;
+      }
+      .subtabs button {
+        display: inline-flex; align-items: center; gap: 7px;
+        padding: 9px 14px; border-radius: 12px; cursor: pointer;
+        border: 1px solid var(--divider-color, #e4e7ec);
+        background: var(--card-background-color, #fff);
+        color: var(--secondary-text-color, #667085);
+        font-size: 12px; font-weight: 600;
+      }
+      .subtabs button.active {
+        color: #fff; border-color: transparent;
+        background: linear-gradient(135deg, #5b6cff, #ff4f9a);
+      }
+      .subtabs button ha-icon { --mdc-icon-size: 17px; }
+      .speaker-controls { display: flex; flex-direction: column; gap: 16px; }
+      .speaker-control {
+        border: 1px solid var(--divider-color, #e4e7ec); border-radius: 22px;
+        background: var(--card-background-color, #fff); padding: 18px;
+      }
+      .speaker-control-head { display: flex; align-items: center; gap: 12px; }
+      .speaker-control-head h3 { margin: 0 0 3px; font-size: 17px; }
+      .speaker-control-head p { margin: 0; font-size: 11px; }
+      .speaker-grid {
+        display: grid; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+        gap: 12px; margin-top: 16px;
+      }
+      .control-block {
+        display: flex; flex-direction: column; gap: 8px;
+        border: 1px solid var(--divider-color, #e4e7ec);
+        border-radius: 16px; padding: 12px;
+        background: var(--secondary-background-color, #f7f8fc);
+      }
+      .control-block h4 { margin: 0; font-size: 12px; }
+      .control-block p { margin: 0; font-size: 11px; }
+      .control-block label { display: flex; flex-direction: column; gap: 5px; font-size: 11px; color: var(--secondary-text-color, #667085); }
+      .control-block textarea {
+        min-height: 58px; resize: vertical; border-radius: 10px;
+        border: 1px solid var(--divider-color, #e4e7ec);
+        background: var(--card-background-color, #fff); color: inherit;
+        padding: 8px 10px; font: inherit; font-size: 12px;
+      }
+      .control-line { display: flex; align-items: center; gap: 8px; }
+      .control-line input[type="range"] { flex: 1; accent-color: var(--primary-color, #5b6cff); }
+      .action-btn {
+        border: 0; border-radius: 10px; padding: 8px 12px; cursor: pointer;
+        background: linear-gradient(135deg, #5b6cff, #ff4f9a); color: #fff;
+        font-size: 11px; font-weight: 700;
+      }
+      .action-btn:hover { filter: brightness(1.08); }
+      .ghost-btn {
+        align-self: flex-start; border: 1px solid var(--divider-color, #e4e7ec);
+        border-radius: 9px; padding: 6px 10px; background: transparent;
+        color: inherit; font-size: 11px; cursor: pointer;
+      }
+      .ghost-btn:hover { border-color: var(--primary-color, #5b6cff); }
+      .lyrics-preview {
+        width: 100%; aspect-ratio: 16 / 9; object-fit: cover;
+        border-radius: 12px; background: #101018;
+      }
+      .chat-line { display: flex; gap: 6px; }
+      .chat-line input {
+        flex: 1; min-width: 0; border: 1px solid var(--divider-color, #e4e7ec);
+        border-radius: 9px; padding: 7px 9px; background: var(--card-background-color, #fff);
+        color: inherit; font: inherit; font-size: 11px;
+      }
+      .chat-response { min-height: 16px; font-size: 11px; color: var(--secondary-text-color, #667085); }
+      .control-status { min-height: 16px; margin-top: 8px; font-size: 11px; color: var(--secondary-text-color, #667085); }
+      .sensor-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 7px; }
+      .sensor-tile {
+        display: flex; flex-direction: column; gap: 2px;
+        border-radius: 10px; padding: 8px;
+        background: var(--card-background-color, #fff);
+        border: 1px solid var(--divider-color, #e4e7ec);
+      }
+      .sensor-tile span { font-size: 9px; color: var(--secondary-text-color, #667085); }
+      .sensor-tile b { font-size: 13px; }
+      .speaker-note { display: flex; gap: 10px; align-items: flex-start; margin-top: 16px; }
+      .speaker-note ha-icon { color: var(--primary-color, #5b6cff); flex: none; }
+      .speaker-note a { color: var(--primary-color, #5b6cff); }
+      .music-search { margin-top: 14px; display: flex; flex-direction: column; gap: 8px; }
+      .search-row { display: flex; gap: 8px; }
+      .search-row input {
+        flex: 1; min-width: 0; border: 1px solid var(--divider-color, #e4e7ec);
+        border-radius: 10px; padding: 9px 11px; background: rgba(255,255,255,.7);
+        color: inherit; font: inherit; font-size: 12px;
+      }
+      .music-results { display: flex; flex-direction: column; gap: 6px; max-height: 240px; overflow: auto; }
+      .music-result {
+        display: flex; align-items: center; gap: 9px; width: 100%;
+        border: 1px solid var(--divider-color, #e4e7ec); border-radius: 11px;
+        background: rgba(255,255,255,.65); padding: 7px 9px; text-align: left;
+        color: inherit; cursor: pointer;
+      }
+      .music-result:hover { border-color: var(--primary-color, #5b6cff); }
+      .music-result img { width: 36px; height: 36px; border-radius: 8px; object-fit: cover; flex: none; background: #101018; }
+      .music-result span { display: flex; flex-direction: column; gap: 1px; flex: 1; min-width: 0; }
+      .music-result b { font-size: 11px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+      .music-result small { font-size: 10px; color: var(--secondary-text-color, #667085); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+      .music-result ha-icon { color: var(--primary-color, #5b6cff); }
+      .music-hint { font-size: 11px; color: var(--secondary-text-color, #667085); padding: 6px 2px; }
+      .mode-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+      .mode-btn {
+        display: inline-flex; align-items: center; gap: 6px;
+        border: 1px solid var(--divider-color, #e4e7ec); border-radius: 9px;
+        background: transparent; color: inherit; padding: 7px 10px;
+        font-size: 11px; cursor: pointer;
+      }
+      .mode-btn.active { border-color: var(--primary-color, #5b6cff); color: var(--primary-color, #5b6cff); background: rgba(91,108,255,.08); }
+      .mode-row select {
+        border: 1px solid var(--divider-color, #e4e7ec); border-radius: 9px;
+        padding: 7px 9px; background: var(--card-background-color, #fff);
+        color: inherit; font-size: 11px;
       }
       @media (max-width: 720px) {
         .shell { padding: 18px 14px 50px; }
