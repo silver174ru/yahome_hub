@@ -192,6 +192,7 @@ def _speaker_view(
         "iot_id": iot_id,
         "entity_id": speaker.get("entity_id"),
         "equalizer_entity": speaker.get("equalizer_entity"),
+        "lyrics_entity": speaker.get("lyrics_entity"),
         "volume": (
             get_capability_state(iot_device, CAP_VOLUME, "volume")
             if iot_device

@@ -15,7 +15,13 @@ from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
-from .const import CAP_MEDIA_PLAYBACK, CAP_ON_OFF, CAP_VOLUME, DOMAIN
+from .const import (
+    CAP_MEDIA_PLAYBACK,
+    CAP_ON_OFF,
+    CAP_VOLUME,
+    DOMAIN,
+    MUSIC_SPEAKER_PLATFORMS,
+)
 from .coordinator import YahomeDataUpdateCoordinator
 from .entity import YahomeDeviceEntity
 from .helpers import (
@@ -35,6 +41,8 @@ async def async_setup_entry(
     coordinator: YahomeDataUpdateCoordinator = entry.runtime_data
     entities: list[MediaPlayerEntity] = []
     for speaker_id, speaker in coordinator.data.speakers.items():
+        if speaker.get("platform") not in MUSIC_SPEAKER_PLATFORMS:
+            continue
         entities.append(YahomeSpeaker(coordinator, speaker_id, speaker))
 
     for device_id, device in coordinator.data.devices.items():

@@ -12,6 +12,7 @@ from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from .api import async_get_music_track
 from .const import DOMAIN
 from .coordinator import YahomeDataUpdateCoordinator
+from .music import async_get_lyrics
 from .views import serialize_data
 
 NOT_CONFIGURED = "YaHome Hub is not configured"
@@ -169,8 +170,35 @@ async def websocket_track_info(
     connection.send_result(msg["id"], info or {})
 
 
+@websocket_api.websocket_command(
+    {
+        vol.Required("type"): f"{DOMAIN}/lyrics",
+        vol.Required("track_id"): str,
+    }
+)
+@websocket_api.require_admin
+@websocket_api.async_response
+async def websocket_lyrics(
+    hass: HomeAssistant,
+    connection: websocket_api.ActiveConnection,
+    msg: dict[str, Any],
+) -> None:
+    """Return synchronized lyrics for a track."""
+    coordinator = get_coordinator(hass)
+    token = (
+        coordinator.entry.data.get("music_token")
+        if coordinator is not None
+        else None
+    )
+    lyrics = await async_get_lyrics(
+        async_get_clientsession(hass), msg["track_id"], token
+    )
+    connection.send_result(msg["id"], {"lyrics": lyrics or ""})
+
+
 def async_register_websocket_commands(hass: HomeAssistant) -> None:
     """Register panel WebSocket commands."""
+    websocket_api.async_register_command(hass, websocket_lyrics)
     websocket_api.async_register_command(hass, websocket_devices)
     websocket_api.async_register_command(hass, websocket_action)
     websocket_api.async_register_command(hass, websocket_scenario)

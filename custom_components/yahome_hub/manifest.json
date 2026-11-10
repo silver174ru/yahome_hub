@@ -9,8 +9,9 @@
   "iot_class": "cloud_polling",
   "issue_tracker": "https://github.com/silver174ru/yahome_hub/issues",
   "requirements": [],
-  "version": "0.5.0"
+  "version": "0.5.1"
 }
+
 
 
 

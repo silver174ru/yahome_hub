@@ -31,13 +31,14 @@ async def async_register_panel(hass: HomeAssistant) -> None:
             frontend_url_path="yahome-hub",
             sidebar_title="YaHome Hub",
             sidebar_icon="mdi:home-automation",
-            module_url=f"{FRONTEND_URL}/yahome-hub-panel.js?v=0.5.0",
+            module_url=f"{FRONTEND_URL}/yahome-hub-panel.js?v=0.5.1",
             embed_iframe=False,
             require_admin=True,
         )
         hass.data[PANEL_KEY] = True
     except Exception:  # noqa: BLE001
         _LOGGER.exception("Unable to register the YaHome Hub panel")
+
 
 
 

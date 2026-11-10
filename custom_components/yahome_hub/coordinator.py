@@ -35,6 +35,7 @@ from .const import (
     DEFAULT_SCAN_INTERVAL,
     DOMAIN,
     EXCLUDED_SPEAKER_PLATFORMS,
+    MUSIC_SPEAKER_PLATFORMS,
 )
 from .store import YahomeDeviceStore, default_export_path
 from .models import YahomeData
@@ -116,20 +117,34 @@ class YahomeDataUpdateCoordinator(DataUpdateCoordinator[YahomeData]):
         self, speakers: dict[str, dict[str, Any]]
     ) -> None:
         """Remove music-only entities from speakers that do not support music."""
-        from .const import MUSIC_SPEAKER_PLATFORMS
-
         registry = er.async_get(self.hass)
+        valid_media = {
+            f"speaker_{speaker_id}_media_player"
+            for speaker_id, speaker in speakers.items()
+            if speaker.get("platform") in MUSIC_SPEAKER_PLATFORMS
+        }
+        for entry in list(registry.entities.values()):
+            if entry.platform != DOMAIN:
+                continue
+            if not entry.entity_id.startswith("media_player."):
+                continue
+            if not entry.unique_id.startswith("speaker_"):
+                continue
+            if entry.unique_id not in valid_media:
+                registry.async_remove(entry.entity_id)
+
         for speaker_id, speaker in speakers.items():
             if speaker.get("platform") in MUSIC_SPEAKER_PLATFORMS:
                 continue
-            for domain, key in (
-                ("calendar", "calendar"),
-                ("camera", "lyrics"),
-                ("conversation", "conversation"),
-                ("select", "equalizer"),
+            for domain, unique_id in (
+                ("media_player", f"speaker_{speaker_id}_media_player"),
+                ("calendar", f"{speaker_id}_calendar"),
+                ("camera", f"{speaker_id}_lyrics"),
+                ("conversation", f"{speaker_id}_conversation"),
+                ("select", f"{speaker_id}_equalizer"),
             ):
                 entity_id = registry.async_get_entity_id(
-                    domain, DOMAIN, f"{speaker_id}_{key}"
+                    domain, DOMAIN, unique_id
                 )
                 if entity_id:
                     registry.async_remove(entity_id)
@@ -384,6 +399,10 @@ class YahomeDataUpdateCoordinator(DataUpdateCoordinator[YahomeData]):
                     speaker.setdefault(
                         "type", devices.get(iot_id, {}).get("type")
                     )
+                if speaker.get("platform") not in MUSIC_SPEAKER_PLATFORMS:
+                    speaker.pop("entity_id", None)
+                    speaker.pop("equalizer_entity", None)
+                    continue
                 media_entity = registry.async_get_entity_id(
                     "media_player", DOMAIN, f"speaker_{speaker_id}_media_player"
                 ) or registry.async_get_entity_id(
@@ -398,6 +417,11 @@ class YahomeDataUpdateCoordinator(DataUpdateCoordinator[YahomeData]):
                 )
                 if equalizer_entity:
                     speaker["equalizer_entity"] = equalizer_entity
+                lyrics_entity = registry.async_get_entity_id(
+                    "camera", DOMAIN, f"{speaker_id}_lyrics"
+                )
+                if lyrics_entity:
+                    speaker["lyrics_entity"] = lyrics_entity
 
             self._remove_excluded_speaker_entities()
             self._remove_non_music_speaker_entities(speakers)
