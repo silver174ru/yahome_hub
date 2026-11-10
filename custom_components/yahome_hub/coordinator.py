@@ -803,8 +803,6 @@ class YahomeDataUpdateCoordinator(DataUpdateCoordinator[YahomeData]):
             {"command": "playMusic", "id": str(track_id), "type": "track"},
             wait=False,
         )
-        await asyncio.sleep(0.5)
-        await glagol.send({"command": "play"}, wait=False)
 
     async def async_play_track(
         self,
