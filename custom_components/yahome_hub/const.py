@@ -4,7 +4,7 @@ from __future__ import annotations
 
 DOMAIN = "yahome_hub"
 NAME = "YaHome Hub"
-VERSION = "0.2.0"
+VERSION = "0.5.1"
 
 API_BASE = "https://api.iot.yandex.net/v1.0"
 QUASAR_BASE = "https://quasar.yandex.net"
