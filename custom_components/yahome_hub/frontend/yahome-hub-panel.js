@@ -19,6 +19,9 @@ class YaHomeHubPanel extends HTMLElement {
     this._unsub = null;
     this._stateUnsub = null;
     this._trackCache = {};
+    this._lyricsCache = {};
+    this._fullPlayer = null;
+    this._showLyrics = true;
     this._ticker = null;
     this._stateTimer = null;
     this._hassReady = false;
@@ -80,12 +83,13 @@ class YaHomeHubPanel extends HTMLElement {
   }
 
   _onStateChanged(event) {
-    if (this._tab !== "speakers") return;
+    if (this._tab !== "speakers" && !this._fullPlayer) return;
     const entityId = event && event.data ? event.data.entity_id : "";
     if (
       !entityId ||
-      (!entityId.startsWith("media_player.yandex_station") &&
-        !entityId.startsWith("select.yandex_station"))
+      (!entityId.startsWith("media_player.") &&
+        !entityId.startsWith("select.") &&
+        !entityId.startsWith("camera."))
     ) {
       return;
     }
@@ -94,7 +98,7 @@ class YaHomeHubPanel extends HTMLElement {
       if (tag === "SELECT" || tag === "INPUT") return;
     }
     clearTimeout(this._stateTimer);
-    this._stateTimer = setTimeout(() => this._render(), 450);
+    this._stateTimer = setTimeout(() => this._updatePlayerDom(), 220);
   }
 
   async _load() {
@@ -366,9 +370,23 @@ class YaHomeHubPanel extends HTMLElement {
         }
         ${this._toast ? `<div class="toast">${this._esc(this._toast)}</div>` : ""}
       </div>
+      ${data && this._fullPlayer ? this._renderFullPlayer(data) : ""}
     `;
     this._attachEvents();
     this._startTicker();
+  }
+
+  _renderFullPlayer(data) {
+    const speaker = (data.speakers || []).find(
+      (item) => item.id === this._fullPlayer
+    );
+    if (!speaker || !speaker.entity_id) return "";
+    return `<div class="player-modal" data-player-modal>
+      <div class="player-modal-backdrop" data-close-player></div>
+      <div class="player-modal-body">
+        ${this._renderSpeakerPlayer(speaker, true)}
+      </div>
+    </div>`;
   }
 
   _renderTabs(data) {
@@ -793,9 +811,6 @@ class YaHomeHubPanel extends HTMLElement {
     const withEntity = speakers.filter(
       (speaker) => speaker.entity_id && this._hass.states[speaker.entity_id]
     );
-    const others = speakers.filter(
-      (speaker) => !speaker.entity_id || !this._hass.states[speaker.entity_id]
-    );
     const viz = [
       ["bars", "Спектр", "mdi:equalizer"],
       ["wave", "Волна", "mdi:sine-wave"],
@@ -827,17 +842,6 @@ class YaHomeHubPanel extends HTMLElement {
             .map((speaker) => this._renderSpeakerPlayer(speaker))
             .join("")}
         </div>
-        ${
-          others.length
-            ? `<div class="section compact-speakers">
-                <h3>Другие устройства с Алисой</h3>
-                <p class="muted">Для них Яндекс не отдаёт медиасессию. Управление доступно в приложении «Дом с Алисой».</p>
-                <div class="players">${others
-                  .map((speaker) => this._renderSpeakerFallback(speaker))
-                  .join("")}</div>
-              </div>`
-            : ""
-        }
       </div>
     `;
   }
@@ -856,7 +860,79 @@ class YaHomeHubPanel extends HTMLElement {
       </article>`;
   }
 
-  _renderSpeakerPlayer(speaker) {
+  _speakerImage(speaker) {
+    if (
+      String(speaker.platform || "").includes("yandexstation_2") ||
+      String(speaker.name || "").includes("Станция Макс")
+    ) {
+      return "/yahome_hub/station-max.svg";
+    }
+    return "/yahome_hub/station-max.svg";
+  }
+
+  _lyricLines(lyrics, position) {
+    if (!lyrics) return { current: "", next: "" };
+    const timed = [];
+    const plain = [];
+    for (const raw of String(lyrics).split(/\r?\n/)) {
+      const line = raw.trim();
+      if (!line) continue;
+      const match = line.match(/^\[(\d{2}):(\d{2})(?:\.(\d{2,3}))?\]\s*(.*)$/);
+      if (match) {
+        const seconds =
+          Number(match[1]) * 60 +
+          Number(match[2]) +
+          (match[3] ? Number(match[3]) / (match[3].length === 2 ? 100 : 1000) : 0);
+        timed.push({ seconds, text: match[4].trim() });
+      } else if (!line.startsWith("[")) {
+        plain.push(line);
+      }
+    }
+    if (timed.length) {
+      let index = 0;
+      for (let i = 0; i < timed.length; i += 1) {
+        if (timed[i].seconds <= position) index = i;
+      }
+      return {
+        current: timed[index]?.text || "",
+        next: timed[index + 1]?.text || "",
+      };
+    }
+    if (plain.length) {
+      const index = Math.floor((Number(position) || 0) / 4) % plain.length;
+      return { current: plain[index], next: plain[index + 1] || "" };
+    }
+    return { current: "", next: "" };
+  }
+
+  _lyricsFor(speaker) {
+    const trackId = String(
+      this._hass.states[speaker.entity_id]?.attributes?.media_content_id || ""
+    );
+    if (!trackId) return "";
+    const camera = speaker.lyrics_entity
+      ? this._hass.states[speaker.lyrics_entity]
+      : null;
+    const fromCamera = camera?.attributes?.lyrics;
+    if (fromCamera) return fromCamera;
+    const cached = this._lyricsCache[trackId];
+    if (cached && cached !== true) return cached;
+    if (!cached) {
+      this._lyricsCache[trackId] = true;
+      this._hass
+        .callWS({ type: "yahome_hub/lyrics", track_id: trackId })
+        .then((result) => {
+          this._lyricsCache[trackId] = result?.lyrics || "";
+          this._updatePlayerDom();
+        })
+        .catch(() => {
+          this._lyricsCache[trackId] = "";
+        });
+    }
+    return "";
+  }
+
+  _renderSpeakerPlayer(speaker, full = false) {
     const entityId = speaker.entity_id;
     const entity = this._hass.states[entityId];
     const attrs = entity.attributes || {};
@@ -864,8 +940,9 @@ class YaHomeHubPanel extends HTMLElement {
     const paused = entity.state === "paused";
     const trackId = String(attrs.media_content_id || "");
     const trackInfo = /^\d+$/.test(trackId) ? this._trackInfo(trackId) : null;
+    const image = this._speakerImage(speaker);
     const cover =
-      attrs.entity_picture || (trackInfo && trackInfo.cover) || "";
+      attrs.entity_picture || (trackInfo && trackInfo.cover) || image;
     const title = attrs.media_title || "Готов к воспроизведению";
     const artist = attrs.media_artist || speaker.name;
     const album =
@@ -886,25 +963,41 @@ class YaHomeHubPanel extends HTMLElement {
       : null;
     const eqOptions = eqEntity ? eqEntity.attributes.options || [] : [];
     const eqValue = eqEntity ? eqEntity.state : "";
+    const lyrics = full ? this._lyricsFor(speaker) : "";
+    const lyric = full
+      ? this._lyricLines(lyrics, position)
+      : { current: "", next: "" };
     return `
-      <article class="player ${playing ? "playing" : ""} ${
+      <article class="player ${full ? "full" : ""} ${playing ? "playing" : ""} ${
       paused ? "paused" : ""
-    }" data-player="${this._esc(speaker.id)}" ${
+    }" data-player="${this._esc(speaker.id)}" data-player-entity="${this._esc(
+      entityId
+    )}" ${
       cover ? `style="--cover:url('${this._esc(cover)}')"` : ""
     }>
         <div class="player-bg"></div>
         <div class="player-glow"></div>
         <div class="player-content">
           <div class="player-head">
-            <div class="player-cover">
-              ${
+            <div class="player-cover ${full ? "big" : ""}">
+              <img data-player-cover src="${this._esc(
                 cover
-                  ? `<img src="${this._esc(cover)}" alt="" loading="lazy" />`
-                  : `<ha-icon icon="mdi:speaker"></ha-icon>`
+              )}" alt="" loading="lazy" />
+              ${
+                full && this._showLyrics
+                  ? `<div class="lyrics-overlay">
+                      <div class="lyrics-current" data-lyrics-current>${this._esc(
+                        lyric.current
+                      )}</div>
+                      <div class="lyrics-next" data-lyrics-next>${this._esc(
+                        lyric.next
+                      )}</div>
+                    </div>`
+                  : ""
               }
             </div>
             <div class="player-meta">
-              <span class="player-kicker">${
+              <span class="player-kicker" data-player-kicker>${
                 playing
                   ? "Сейчас играет"
                   : paused
@@ -913,27 +1006,42 @@ class YaHomeHubPanel extends HTMLElement {
                   ? "Выключена"
                   : "Колонка"
               }</span>
-              <h3>${this._esc(title)}</h3>
-              <p>${this._esc(artist)}${
+              <h3 data-player-title>${this._esc(title)}</h3>
+              <p data-player-meta>${this._esc(artist)}${
       album ? ` <span class="dot">·</span> ${this._esc(album)}` : ""
     }</p>
             </div>
-            <button class="power player-power ${
-              entity.state !== "off" ? "on" : ""
-            }" data-player-power="${this._esc(
+            <div class="player-actions">
+              ${
+                full
+                  ? `<button class="power" data-toggle-lyrics title="Текст песни"><ha-icon icon="mdi:text-box-music"></ha-icon></button>
+                     <button class="power" data-close-player title="Закрыть"><ha-icon icon="mdi:close"></ha-icon></button>`
+                  : `<button class="power" data-expand-player="${this._esc(
+                      speaker.id
+                    )}" title="Открыть плеер"><ha-icon icon="mdi:dots-vertical"></ha-icon></button>
+                     <button class="power" data-expand-player="${this._esc(
+                       speaker.id
+                     )}" title="Развернуть"><ha-icon icon="mdi:arrow-expand-all"></ha-icon></button>`
+              }
+              <button class="power player-power ${
+                entity.state !== "off" ? "on" : ""
+              }" data-player-power="${this._esc(
       entityId
     )}" title="Вкл/выкл"><ha-icon icon="mdi:power"></ha-icon></button>
+            </div>
           </div>
           ${this._renderViz(playing)}
           <div class="player-seek">
             <input type="range" min="0" max="${duration}" step="1" value="${position}"
               data-seek-entity="${this._esc(entityId)}"
-              data-duration="${duration}" ${duration ? "" : "disabled"} />
+              data-player-seek data-duration="${duration}" ${
+      duration ? "" : "disabled"
+    } />
             <div class="times">
-              <span data-current-for="${this._esc(entityId)}">${this._formatTime(
-      position
-    )}</span>
-              <span>${this._formatTime(duration)}</span>
+              <span data-current-for="${this._esc(
+                entityId
+              )}" data-player-current>${this._formatTime(position)}</span>
+              <span data-player-duration>${this._formatTime(duration)}</span>
             </div>
           </div>
           <div class="player-controls">
@@ -943,7 +1051,7 @@ class YaHomeHubPanel extends HTMLElement {
               )}" title="Предыдущий трек"><ha-icon icon="mdi:skip-previous"></ha-icon></button>
               <button class="icon-btn play" data-player-action="playpause" data-player-entity="${this._esc(
                 entityId
-              )}" title="${playing ? "Пауза" : "Играть"}">
+              )}" data-player-play title="${playing ? "Пауза" : "Играть"}">
                 <ha-icon icon="${playing ? "mdi:pause" : "mdi:play"}"></ha-icon>
               </button>
               <button class="icon-btn" data-player-action="next" data-player-entity="${this._esc(
@@ -953,8 +1061,12 @@ class YaHomeHubPanel extends HTMLElement {
             <div class="volume-control">
               <ha-icon icon="mdi:volume-high"></ha-icon>
               <input type="range" min="0" max="100" step="1" value="${volume}"
-                data-volume-entity="${this._esc(entityId)}" />
-              <span data-volume-for="${this._esc(entityId)}">${volume}%</span>
+                data-volume-entity="${this._esc(
+                  entityId
+                )}" data-player-volume />
+              <span data-volume-for="${this._esc(
+                entityId
+              )}" data-player-volume-label>${volume}%</span>
             </div>
             ${
               eqOptions.length
@@ -975,6 +1087,89 @@ class YaHomeHubPanel extends HTMLElement {
           </div>
         </div>
       </article>`;
+  }
+
+  _updatePlayerDom() {
+    const root = this.shadowRoot;
+    if (!root || !this._data) return;
+    root.querySelectorAll(".player[data-player-entity]").forEach((el) => {
+      const entityId = el.getAttribute("data-player-entity");
+      const entity = this._hass.states[entityId];
+      const speaker = (this._data.speakers || []).find(
+        (item) => item.id === el.getAttribute("data-player")
+      );
+      if (!entity || !speaker) return;
+      const attrs = entity.attributes || {};
+      const playing = entity.state === "playing";
+      const paused = entity.state === "paused";
+      el.classList.toggle("playing", playing);
+      el.classList.toggle("paused", paused);
+      const cover =
+        attrs.entity_picture ||
+        this._speakerImage(speaker) ||
+        "";
+      const image = el.querySelector("[data-player-cover]");
+      if (image && cover && image.getAttribute("src") !== cover) {
+        image.setAttribute("src", cover);
+        el.style.setProperty("--cover", `url('${cover}')`);
+      }
+      const title = attrs.media_title || "Готов к воспроизведению";
+      const artist = attrs.media_artist || speaker.name;
+      const album =
+        attrs.media_album_name || attrs.media_playlist || "";
+      const titleEl = el.querySelector("[data-player-title]");
+      if (titleEl) titleEl.textContent = title;
+      const metaEl = el.querySelector("[data-player-meta]");
+      if (metaEl) metaEl.textContent = album ? `${artist} · ${album}` : artist;
+      const kicker = el.querySelector("[data-player-kicker]");
+      if (kicker) {
+        kicker.textContent = playing
+          ? "Сейчас играет"
+          : paused
+          ? "Пауза"
+          : entity.state === "off"
+          ? "Выключена"
+          : "Колонка";
+      }
+      const playIcon = el.querySelector("[data-player-play] ha-icon");
+      if (playIcon) playIcon.setAttribute("icon", playing ? "mdi:pause" : "mdi:play");
+      const duration = Number(attrs.media_duration) || 0;
+      const position = this._currentPosition(entity);
+      const seek = el.querySelector("[data-player-seek]");
+      if (seek) {
+        seek.max = duration;
+        seek.disabled = !duration;
+        if (root.activeElement !== seek) seek.value = position;
+      }
+      const current = el.querySelector("[data-player-current]");
+      if (current) current.textContent = this._formatTime(position);
+      const total = el.querySelector("[data-player-duration]");
+      if (total) total.textContent = this._formatTime(duration);
+      const volume =
+        attrs.volume_level !== undefined && attrs.volume_level !== null
+          ? Math.round(Number(attrs.volume_level) * 100)
+          : 0;
+      const volumeInput = el.querySelector("[data-player-volume]");
+      if (volumeInput && root.activeElement !== volumeInput) {
+        volumeInput.value = volume;
+      }
+      const volumeLabel = el.querySelector("[data-player-volume-label]");
+      if (volumeLabel) volumeLabel.textContent = `${volume}%`;
+      const eq = el.querySelector("[data-eq-entity]");
+      if (eq && speaker.equalizer_entity) {
+        const eqState = this._hass.states[speaker.equalizer_entity];
+        if (eqState && root.activeElement !== eq) eq.value = eqState.state;
+      }
+      if (el.classList.contains("full") && this._showLyrics) {
+        const lyrics = this._lyricsFor(speaker);
+        const line = this._lyricLines(lyrics, position);
+        const currentLine = el.querySelector("[data-lyrics-current]");
+        const nextLine = el.querySelector("[data-lyrics-next]");
+        if (currentLine) currentLine.textContent = line.current;
+        if (nextLine) nextLine.textContent = line.next;
+      }
+    });
+    this._startTicker();
   }
 
   _renderViz(playing) {
@@ -1085,6 +1280,26 @@ class YaHomeHubPanel extends HTMLElement {
       );
       if (label) label.textContent = this._formatTime(position);
     });
+    this._updateLyricsOnly();
+  }
+
+  _updateLyricsOnly() {
+    const root = this.shadowRoot;
+    if (!root || !this._fullPlayer || !this._data) return;
+    const player = root.querySelector(".player.full");
+    if (!player || !this._showLyrics) return;
+    const speaker = (this._data.speakers || []).find(
+      (item) => item.id === this._fullPlayer
+    );
+    if (!speaker || !speaker.entity_id) return;
+    const entity = this._hass.states[speaker.entity_id];
+    if (!entity) return;
+    const lyrics = this._lyricsFor(speaker);
+    const line = this._lyricLines(lyrics, this._currentPosition(entity));
+    const current = player.querySelector("[data-lyrics-current]");
+    const next = player.querySelector("[data-lyrics-next]");
+    if (current) current.textContent = line.current;
+    if (next) next.textContent = line.next;
   }
 
   async _callService(domain, service, data) {
@@ -1105,6 +1320,26 @@ class YaHomeHubPanel extends HTMLElement {
   _attachEvents() {
     const root = this.shadowRoot;
     if (!root) return;
+    root.querySelectorAll("[data-expand-player]").forEach((el) => {
+      el.addEventListener("click", (event) => {
+        event.stopPropagation();
+        this._fullPlayer = el.getAttribute("data-expand-player");
+        this._showLyrics = true;
+        this._render();
+      });
+    });
+    root.querySelectorAll("[data-close-player]").forEach((el) => {
+      el.addEventListener("click", () => {
+        this._fullPlayer = null;
+        this._render();
+      });
+    });
+    root.querySelectorAll("[data-toggle-lyrics]").forEach((el) => {
+      el.addEventListener("click", () => {
+        this._showLyrics = !this._showLyrics;
+        this._render();
+      });
+    });
     root.querySelectorAll("[data-tab]").forEach((el) => {
       el.addEventListener("click", () => {
         this._tab = el.getAttribute("data-tab");
@@ -1562,7 +1797,7 @@ class YaHomeHubPanel extends HTMLElement {
       .player-content { position: relative; display: flex; flex-direction: column; gap: 12px; }
       .player-head { display: flex; align-items: center; gap: 14px; }
       .player-cover {
-        width: 84px; height: 84px; flex: none; border-radius: 20px; overflow: hidden;
+        position: relative; width: 84px; height: 84px; flex: none; border-radius: 20px; overflow: hidden;
         display: grid; place-items: center; color: #fff; font-size: 34px;
         background: linear-gradient(135deg, #5b6cff, #8f43ff 55%, #ff4f9a);
         box-shadow: 0 14px 28px rgba(16, 24, 40, .18);
@@ -1587,7 +1822,55 @@ class YaHomeHubPanel extends HTMLElement {
         white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
       }
       .player-meta .dot { opacity: .45; }
-      .player-power { margin-left: auto; }
+      .player-actions { display: flex; align-items: center; gap: 6px; margin-left: auto; }
+      .player-actions .power { margin-left: 0; }
+      .player-power { margin-left: 0; }
+      .player-modal {
+        position: fixed; inset: 0; z-index: 100; display: grid; place-items: center;
+        padding: 18px;
+      }
+      .player-modal-backdrop {
+        position: absolute; inset: 0; background: rgba(5, 6, 15, .72);
+        backdrop-filter: blur(10px);
+      }
+      .player-modal-body {
+        position: relative; width: min(1120px, 96vw); max-height: 94vh; overflow: auto;
+        border-radius: 32px; scrollbar-width: thin;
+      }
+      .player.full {
+        padding: 28px; border-radius: 32px; border-color: rgba(255,255,255,.18);
+        box-shadow: 0 40px 100px rgba(0,0,0,.45);
+      }
+      .player.full .player-head { align-items: flex-start; }
+      .player.full .player-cover.big {
+        width: min(380px, 38vw); height: min(380px, 38vw);
+        border-radius: 30px; font-size: 80px;
+      }
+      .player.full .player-cover.big img { border-radius: 30px; }
+      .player.full .player-meta { padding-top: 10px; }
+      .player.full .player-meta h3 { font-size: 30px; line-height: 1.2; white-space: normal; }
+      .player.full .player-meta p { font-size: 15px; white-space: normal; }
+      .player.full .player-kicker { font-size: 11px; }
+      .player.full .viz { height: 86px; }
+      .player.full .player-seek input { height: 28px; }
+      .player.full .times { font-size: 12px; }
+      .player.full .player-controls { gap: 14px; }
+      .player.full .player-controls .icon-btn { width: 46px; height: 46px; border-radius: 15px; }
+      .player.full .player-controls .icon-btn.play { width: 58px; height: 58px; border-radius: 18px; }
+      .player.full .volume-control { min-width: 220px; }
+      .lyrics-overlay {
+        position: absolute; left: 0; right: 0; bottom: 0; padding: 26px 24px 22px;
+        background: linear-gradient(to top, rgba(5,6,15,.92), rgba(5,6,15,.1) 80%, transparent);
+        text-align: center; pointer-events: none;
+      }
+      .lyrics-current {
+        color: #fff; font-size: 25px; line-height: 1.25; font-weight: 700;
+        text-shadow: 0 2px 16px rgba(0,0,0,.85);
+      }
+      .lyrics-next {
+        color: rgba(255,255,255,.68); font-size: 15px; line-height: 1.3;
+        margin-top: 7px; text-shadow: 0 2px 12px rgba(0,0,0,.8);
+      }
       .viz {
         height: 58px; display: flex; align-items: flex-end; justify-content: center; gap: 3px;
         padding: 8px 10px; border-radius: 14px; overflow: hidden;
@@ -1686,6 +1969,12 @@ class YaHomeHubPanel extends HTMLElement {
         .player-head { align-items: flex-start; }
         .player-cover { width: 68px; height: 68px; border-radius: 16px; }
         .eq-select { max-width: none; width: 100%; }
+        .player.full { padding: 18px; }
+        .player.full .player-head { flex-direction: column; }
+        .player.full .player-cover.big { width: 100%; height: auto; aspect-ratio: 1; }
+        .player.full .player-meta h3 { font-size: 22px; }
+        .lyrics-current { font-size: 19px; }
+        .lyrics-next { font-size: 13px; }
       }
     `;
   }
