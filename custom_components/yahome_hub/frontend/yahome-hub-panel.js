@@ -27,7 +27,26 @@ class YaHomeHubPanel extends HTMLElement {
     this._stateUnsub = null;
     this._trackCache = {};
     this._lyricsCache = {};
-    this._musicResults = {};
+    this._musicResults = [];
+    this._musicLikes = [];
+    this._musicPlaylists = [];
+    this._musicPlaylist = null;
+    this._musicPlaylistTracks = [];
+    this._musicQueues = {};
+    this._musicTracks = {};
+    this._musicTab = "search";
+    this._musicTarget = null;
+    this._musicQuery = "";
+    this._musicLoading = false;
+    this._musicError = null;
+    this._musicNotice = null;
+    this._playerSkin = 2;
+    try {
+      const skin = Number(localStorage.getItem("yahome-hub-player-skin"));
+      if (skin >= 1 && skin <= 8) this._playerSkin = skin;
+    } catch (err) {
+      this._playerSkin = 2;
+    }
     this._fullPlayer = null;
     this._showLyrics = true;
     this._tickCount = 0;
@@ -434,9 +453,193 @@ class YaHomeHubPanel extends HTMLElement {
     return `<div class="player-modal" data-player-modal>
       <div class="player-modal-backdrop" data-close-player></div>
       <div class="player-modal-body">
-        ${this._renderSpeakerPlayer(speaker, true)}
+        ${this._renderFullPlayerCard(speaker)}
       </div>
     </div>`;
+  }
+
+  _renderFullPlayerCard(speaker) {
+    const entityId = speaker.entity_id;
+    const entity = this._hass.states[entityId];
+    if (!entity) return "";
+    const attrs = entity.attributes || {};
+    const playing = entity.state === "playing";
+    const paused = entity.state === "paused";
+    const trackId = String(attrs.media_content_id || "");
+    const trackInfo = /^\d+$/.test(trackId) ? this._trackInfo(trackId) : null;
+    const image = this._speakerImage(speaker);
+    const cover =
+      attrs.entity_picture || (trackInfo && trackInfo.cover) || image;
+    const title = attrs.media_title || "Готов к воспроизведению";
+    const artist = attrs.media_artist || speaker.name;
+    const album =
+      attrs.media_album_name ||
+      attrs.media_playlist ||
+      (trackInfo && trackInfo.album) ||
+      "";
+    const duration = Number(attrs.media_duration) || 0;
+    const position = this._currentPosition(entity);
+    const volume =
+      attrs.volume_level !== undefined && attrs.volume_level !== null
+        ? Math.round(Number(attrs.volume_level) * 100)
+        : 0;
+    const muted = Boolean(attrs.is_volume_muted) || volume === 0;
+    const lyrics = this._lyricsFor(speaker);
+    const lyric = this._lyricLines(lyrics, position + this._lyricsOffset);
+    const skin = this._playerSkin || 2;
+    const kicker = playing
+      ? "Сейчас играет"
+      : paused
+      ? "Пауза"
+      : entity.state === "off"
+      ? "Выключена"
+      : "Колонка";
+    return `<article class="player full full-player skin-${skin} ${
+      playing ? "playing" : ""
+    } ${paused ? "paused" : ""}" data-player="${this._esc(
+      speaker.id
+    )}" data-player-entity="${this._esc(entityId)}" ${
+      cover ? `style="--cover:url('${this._esc(cover)}')"` : ""
+    }>
+      <div class="full-bg"></div>
+      <div class="full-shade"></div>
+      <div class="full-content">
+        <header class="full-header">
+          <div class="full-title">
+            <span class="full-kicker" data-player-kicker>${kicker}</span>
+            <h2 data-player-title>${this._esc(title)}</h2>
+            <p data-player-meta>${this._esc(artist)}${
+      album ? ` · ${this._esc(album)}` : ""
+    }</p>
+          </div>
+          <div class="full-actions">
+            <button class="round-btn" data-toggle-lyrics title="Текст песни"><ha-icon icon="mdi:text-box-music"></ha-icon></button>
+            <button class="round-btn" data-close-player title="Закрыть"><ha-icon icon="mdi:close"></ha-icon></button>
+            <button class="round-btn power ${
+              entity.state !== "off" ? "on" : ""
+            }" data-player-power="${this._esc(
+      entityId
+    )}" title="Вкл/выкл"><ha-icon icon="mdi:power"></ha-icon></button>
+          </div>
+        </header>
+        <div class="full-main">
+          <div class="full-cover-wrap">
+            <div class="player-cover big">
+              ${
+                cover
+                  ? `<img data-player-cover src="${this._esc(
+                      cover
+                    )}" alt="" loading="lazy" />`
+                  : `<ha-icon data-cover-fallback icon="mdi:speaker"></ha-icon>`
+              }
+              ${
+                this._showLyrics
+                  ? `<div class="lyrics-overlay">
+                      <div class="lyrics-prev" data-lyrics-prev>${this._esc(
+                        lyric.prev
+                      )}</div>
+                      <div class="lyrics-current-row">
+                        <span class="lyrics-countdown" data-lyrics-countdown>${this._formatCountdown(
+                          lyric.remaining
+                        )}</span>
+                        <div class="lyrics-current" data-lyrics-current>${this._esc(
+                          lyric.current
+                        )}</div>
+                      </div>
+                      <div class="lyrics-next" data-lyrics-next>${this._esc(
+                        lyric.next
+                      )}</div>
+                    </div>`
+                  : ""
+              }
+            </div>
+          </div>
+          <div class="full-side">
+            <div class="full-viz">${this._renderViz(playing)}</div>
+            <div class="viz-switch full-viz-switch">
+              ${this._vizOptions()
+                .map(
+                  ([id, label, icon]) =>
+                    `<button class="${
+                      this._viz === id ? "active" : ""
+                    }" data-viz="${id}" title="${label}"><ha-icon icon="${icon}"></ha-icon></button>`
+                )
+                .join("")}
+            </div>
+            <div class="full-modes">
+              <button class="mode-btn ${
+                attrs.shuffle ? "active" : ""
+              }" data-shuffle="${this._esc(
+      entityId
+    )}"><ha-icon icon="mdi:shuffle"></ha-icon> Перемешать</button>
+              <select data-repeat="${this._esc(entityId)}">
+                <option value="off" ${
+                  attrs.repeat === "off" ? "selected" : ""
+                }>Без повтора</option>
+                <option value="all" ${
+                  attrs.repeat === "all" ? "selected" : ""
+                }>Повторять всё</option>
+                <option value="one" ${
+                  attrs.repeat === "one" ? "selected" : ""
+                }>Повторять трек</option>
+              </select>
+            </div>
+          </div>
+        </div>
+        <div class="full-seek">
+          <input type="range" min="0" max="${duration}" step="1" value="${position}"
+            data-seek-entity="${this._esc(
+              entityId
+            )}" data-player-seek data-duration="${duration}" ${
+      duration ? "" : "disabled"
+    } />
+          <div class="times">
+            <span data-current-for="${this._esc(
+              entityId
+            )}" data-player-current>${this._formatTime(position)}</span>
+            <span data-player-duration>${this._formatTime(duration)}</span>
+          </div>
+        </div>
+        <div class="full-controls">
+          <div class="transport">
+            <button class="icon-btn" data-player-action="previous" data-player-entity="${this._esc(
+              entityId
+            )}" title="Предыдущий трек"><ha-icon icon="mdi:skip-previous"></ha-icon></button>
+            <button class="icon-btn play" data-player-action="playpause" data-player-entity="${this._esc(
+              entityId
+            )}" data-player-play title="${playing ? "Пауза" : "Играть"}">
+              <ha-icon icon="${playing ? "mdi:pause" : "mdi:play"}"></ha-icon>
+            </button>
+            <button class="icon-btn" data-player-action="next" data-player-entity="${this._esc(
+              entityId
+            )}" title="Следующий трек"><ha-icon icon="mdi:skip-next"></ha-icon></button>
+          </div>
+          <div class="volume-control">
+            <button class="volume-toggle" data-player-mute="${this._esc(
+              entityId
+            )}" title="${muted ? "Включить звук" : "Выключить звук"}">
+              <ha-icon icon="${muted ? "mdi:volume-off" : "mdi:volume-high"}"></ha-icon>
+            </button>
+            <input type="range" min="0" max="100" step="1" value="${volume}"
+              data-volume-entity="${this._esc(
+                entityId
+              )}" data-player-volume />
+            <span data-volume-for="${this._esc(
+              entityId
+            )}" data-player-volume-label>${volume}%</span>
+          </div>
+        </div>
+        <div class="lyrics-sync">
+          <span>Синхронизация текста</span>
+          <button class="sync-btn" data-lyrics-offset="-0.5">−0.5</button>
+          <b data-lyrics-offset-label>${this._lyricsOffset.toFixed(
+            1
+          )} с</b>
+          <button class="sync-btn" data-lyrics-offset="0.5">+0.5</button>
+        </div>
+        ${this._renderMusicHub(speaker.id, true)}
+      </div>
+    </article>`;
   }
 
   _renderTabs(data) {
@@ -864,20 +1067,328 @@ class YaHomeHubPanel extends HTMLElement {
       .join("")}</div></div>`;
   }
 
+  _skinName(skin) {
+    return (
+      {
+        1: "Классика",
+        2: "Полночь",
+        3: "Винил",
+        4: "Стекло",
+        5: "Неон",
+        6: "Минимал",
+        7: "Аврора",
+        8: "Студия",
+      }[skin] || "Классика"
+    );
+  }
+
+  _musicSpeakers() {
+    return (this._data?.speakers || []).filter(
+      (speaker) => speaker.entity_id && this._hass.states[speaker.entity_id]
+    );
+  }
+
+  _musicTargetId(targetId) {
+    const speakers = this._musicSpeakers();
+    if (!speakers.length) return null;
+    if (targetId && speakers.some((speaker) => speaker.id === targetId)) {
+      return targetId;
+    }
+    if (
+      this._musicTarget &&
+      speakers.some((speaker) => speaker.id === this._musicTarget)
+    ) {
+      return this._musicTarget;
+    }
+    return speakers[0].id;
+  }
+
+  _cacheTracks(tracks) {
+    for (const track of tracks || []) {
+      if (track && track.id) this._musicTracks[track.id] = track;
+    }
+  }
+
+  _renderMusicHub(targetId, compact = false) {
+    const target = this._musicTargetId(targetId);
+    if (!target) return "";
+    const speakers = this._musicSpeakers();
+    const speaker = speakers.find((item) => item.id === target);
+    const entityId = speaker?.entity_id || "";
+    const queue = this._musicQueues[target] || { tracks: [], index: -1 };
+    const tabs = [
+      ["search", "Поиск"],
+      ["queue", "Очередь"],
+      ["likes", "Лайки"],
+      ["playlists", "Плейлисты"],
+    ];
+    return `<section class="music-hub ${compact ? "compact" : ""}" data-music-hub="${this._esc(
+      target
+    )}" data-compact="${compact ? "1" : "0"}">
+      <div class="music-hub-head">
+        <div>
+          <h3>Яндекс Музыка</h3>
+          <p>Поиск, очередь, лайки и плейлисты</p>
+        </div>
+        ${
+          speakers.length > 1
+            ? `<select data-music-target-select>${speakers
+                .map(
+                  (item) =>
+                    `<option value="${this._esc(item.id)}" ${
+                      item.id === target ? "selected" : ""
+                    }>${this._esc(item.name)}</option>`
+                )
+                .join("")}</select>`
+            : ""
+        }
+      </div>
+      <div class="music-search-bar">
+        <input data-music-query value="${this._esc(
+          this._musicQuery
+        )}" placeholder="Трек, исполнитель или ссылка">
+        <button class="action-btn" data-music-action="search">Найти</button>
+      </div>
+      <div class="music-tabs">
+        ${tabs
+          .map(
+            ([id, label]) =>
+              `<button class="${this._musicTab === id ? "active" : ""}" data-music-action="tab" data-tab="${id}">${label}${
+                id === "queue" && queue.tracks.length
+                  ? ` <b>${queue.tracks.length}</b>`
+                  : ""
+              }</button>`
+          )
+          .join("")}
+      </div>
+      ${
+        this._musicNotice
+          ? `<div class="music-hint notice">${this._esc(
+              this._musicNotice
+            )}</div>`
+          : ""
+      }
+      <div class="music-content">${this._renderMusicContent(
+        target,
+        entityId
+      )}</div>
+      <div class="skin-picker">
+        <span>Вид плеера: <b>${this._skinName(this._playerSkin)}</b></span>
+        ${[
+          [1, "Классика"],
+          [2, "Полночь"],
+          [3, "Винил"],
+          [4, "Стекло"],
+          [5, "Неон"],
+          [6, "Минимал"],
+          [7, "Аврора"],
+          [8, "Студия"],
+        ]
+          .map(
+            ([skin, name]) =>
+              `<button class="${
+                this._playerSkin === skin ? "active" : ""
+              }" data-music-action="skin" data-skin="${skin}" title="${name}">${skin}</button>`
+          )
+          .join("")}
+      </div>
+    </section>`;
+  }
+
+  _renderMusicContent(targetId, entityId) {
+    if (this._musicLoading) {
+      return `<div class="music-hint">Загружаю...</div>`;
+    }
+    if (this._musicError) {
+      return `<div class="music-hint error-text">${this._esc(
+        this._musicError
+      )}</div>`;
+    }
+    if (this._musicTab === "queue") {
+      return this._renderQueue(targetId, entityId);
+    }
+    if (this._musicTab === "likes") {
+      if (!this._musicLikes.length) {
+        return `<button class="action-btn" data-music-action="load-likes" data-target-id="${this._esc(
+          targetId
+        )}">Загрузить лайки</button>`;
+      }
+      return this._renderTrackList(
+        this._musicLikes,
+        targetId,
+        entityId,
+        "likes"
+      );
+    }
+    if (this._musicTab === "playlists") {
+      if (this._musicPlaylist) {
+        return `<div class="playlist-head">
+            <button class="ghost-btn" data-music-action="back-playlists">← Плейлисты</button>
+            <b>${this._esc(this._musicPlaylist.title || "Плейлист")}</b>
+          </div>
+          ${this._renderTrackList(
+            this._musicPlaylistTracks,
+            targetId,
+            entityId,
+            "playlist"
+          )}`;
+      }
+      if (!this._musicPlaylists.length) {
+        return `<button class="action-btn" data-music-action="load-playlists" data-target-id="${this._esc(
+          targetId
+        )}">Загрузить плейлисты</button>`;
+      }
+      return `<div class="playlist-grid">${this._musicPlaylists
+        .map(
+          (playlist) =>
+            `<button class="playlist-card" data-music-action="open-playlist" data-kind="${this._esc(
+              playlist.kind
+            )}" data-target-id="${this._esc(targetId)}">
+              <img src="${this._esc(playlist.cover || "")}" alt="">
+              <b>${this._esc(playlist.title)}</b>
+              <small>${playlist.track_count} треков</small>
+            </button>`
+        )
+        .join("")}</div>`;
+    }
+    if (!this._musicResults.length) {
+      return `<div class="music-hint">Введите название песни, исполнителя или ссылку — результаты появятся здесь.</div>`;
+    }
+    return this._renderTrackList(
+      this._musicResults,
+      targetId,
+      entityId,
+      "search"
+    );
+  }
+
+  _renderTrackList(tracks, targetId, entityId, kind) {
+    if (!tracks.length) {
+      return `<div class="music-hint">Здесь пока пусто.</div>`;
+    }
+    return `<div class="track-list">${tracks
+      .map(
+        (track, index) =>
+          `<div class="track-row">
+            <img class="track-cover" src="${this._esc(
+              track.cover || ""
+            )}" alt="">
+            <div class="track-meta">
+              <b>${this._esc(track.title)}</b>
+              <small>${this._esc(track.artist || "")}${
+            track.album ? ` · ${this._esc(track.album)}` : ""
+          }</small>
+            </div>
+            <span class="track-duration">${this._formatTime(
+              track.duration
+            )}</span>
+            <button class="track-btn" data-music-action="play" data-track-id="${this._esc(
+              track.id
+            )}" data-track-index="${index}" data-track-kind="${kind}" data-target-id="${this._esc(
+            targetId
+          )}" data-target-entity="${this._esc(
+            entityId
+          )}" title="Играть"><ha-icon icon="mdi:play"></ha-icon></button>
+            <button class="track-btn" data-music-action="add" data-track-id="${this._esc(
+              track.id
+            )}" data-target-id="${this._esc(
+            targetId
+          )}" data-target-entity="${this._esc(
+            entityId
+          )}" title="В очередь"><ha-icon icon="mdi:playlist-plus"></ha-icon></button>
+          </div>`
+      )
+      .join("")}</div>`;
+  }
+
+  _renderQueue(targetId, entityId) {
+    const queue = this._musicQueues[targetId] || {
+      tracks: [],
+      index: -1,
+    };
+    if (!queue.tracks.length) {
+      return `<div class="music-hint">Очередь пуста. Добавьте треки из поиска, лайков или плейлистов.</div>`;
+    }
+    return `<div class="queue-head">
+        <button class="action-btn" data-music-action="play-queue" data-target-id="${this._esc(
+          targetId
+        )}" data-target-entity="${this._esc(entityId)}">Играть очередь</button>
+        <button class="ghost-btn" data-music-action="prev" data-target-id="${this._esc(
+          targetId
+        )}" data-target-entity="${this._esc(entityId)}">←</button>
+        <button class="ghost-btn" data-music-action="next" data-target-id="${this._esc(
+          targetId
+        )}" data-target-entity="${this._esc(entityId)}">→</button>
+        <button class="ghost-btn" data-music-action="clear-queue" data-target-id="${this._esc(
+          targetId
+        )}" data-target-entity="${this._esc(entityId)}">Очистить</button>
+      </div>
+      <div class="track-list">${queue.tracks
+        .map(
+          (track, index) =>
+            `<div class="track-row ${
+              index === queue.index ? "current" : ""
+            }">
+              <img class="track-cover" src="${this._esc(
+                track.cover || ""
+              )}" alt="">
+              <div class="track-meta">
+                <b>${this._esc(track.title)}</b>
+                <small>${this._esc(track.artist || "")}</small>
+              </div>
+              <button class="track-btn" data-music-action="play-queue-index" data-track-index="${index}" data-target-id="${this._esc(
+              targetId
+            )}" data-target-entity="${this._esc(
+              entityId
+            )}" title="Играть"><ha-icon icon="mdi:play"></ha-icon></button>
+              <button class="track-btn" data-music-action="remove-queue" data-track-index="${index}" data-target-id="${this._esc(
+              targetId
+            )}" data-target-entity="${this._esc(
+              entityId
+            )}" title="Убрать"><ha-icon icon="mdi:close"></ha-icon></button>
+            </div>`
+        )
+        .join("")}</div>`;
+  }
+
+  _renderMusicHubDom(targetId) {
+    const container = this.shadowRoot
+      ? this.shadowRoot.querySelector(
+          `[data-music-hub="${targetId}"]`
+        )
+      : null;
+    if (!container) return;
+    const compact = container.getAttribute("data-compact") === "1";
+    container.innerHTML = this._renderMusicHub(targetId, compact);
+  }
+
+  _vizOptions() {
+    return [
+      ["bars", "Спектр", "mdi:equalizer"],
+      ["wave", "Волна", "mdi:sine-wave"],
+      ["orbit", "Орбита", "mdi:orbit"],
+      ["dots", "Точки", "mdi:dots-hexagon"],
+      ["pulse", "Пульс", "mdi:pulse"],
+      ["spectrum", "Спектр 2", "mdi:chart-bar"],
+      ["mirror", "Зеркало", "mdi:mirror"],
+      ["rings", "Кольца", "mdi:circle-double"],
+      ["rain", "Дождь", "mdi:weather-rainy"],
+      ["blocks", "Блоки", "mdi:view-grid"],
+    ];
+  }
+
   _renderSpeakerPlayers(speakers) {
     const withEntity = speakers.filter(
       (speaker) => speaker.entity_id && this._hass.states[speaker.entity_id]
     );
-    const viz = [
-      ["bars", "Спектр", "mdi:equalizer"],
-      ["wave", "Волна", "mdi:sine-wave"],
-      ["orbit", "Орбита", "mdi:orbit"],
-    ];
+    const viz = this._vizOptions();
     if (!speakers.length) {
       return `<div class="empty">Колонки не найдены. Проверьте cookies и токен в настройках интеграции.</div>`;
     }
+    const targetId = this._musicTargetId(withEntity[0]?.id);
     return `
       <div class="speakers-section">
+        ${this._renderMusicHub(targetId)}
         <div class="speaker-toolbar">
           <div>
             <h3>Музыка</h3>
@@ -1117,7 +1628,15 @@ class YaHomeHubPanel extends HTMLElement {
   }
 
   _lyricLines(lyrics, position) {
-    if (!lyrics) return { current: "", next: "" };
+    const empty = {
+      prev: "",
+      current: "",
+      next: "",
+      remaining: null,
+      start: null,
+      end: null,
+    };
+    if (!lyrics) return empty;
     const timed = [];
     const plain = [];
     for (const raw of String(lyrics).split(/\r?\n/)) {
@@ -1128,27 +1647,45 @@ class YaHomeHubPanel extends HTMLElement {
         const seconds =
           Number(match[1]) * 60 +
           Number(match[2]) +
-          (match[3] ? Number(match[3]) / (match[3].length === 2 ? 100 : 1000) : 0);
+          (match[3]
+            ? Number(match[3]) / (match[3].length === 2 ? 100 : 1000)
+            : 0);
         timed.push({ seconds, text: match[4].trim() });
       } else if (!line.startsWith("[")) {
         plain.push(line);
       }
     }
+    const pos = Math.max(0, Number(position) || 0);
     if (timed.length) {
       let index = 0;
       for (let i = 0; i < timed.length; i += 1) {
-        if (timed[i].seconds <= position) index = i;
+        if (timed[i].seconds <= pos) index = i;
+        else break;
       }
+      const start = timed[index].seconds;
+      const end = timed[index + 1]?.seconds ?? null;
       return {
+        prev: timed[index - 1]?.text || "",
         current: timed[index]?.text || "",
         next: timed[index + 1]?.text || "",
+        remaining: end !== null ? Math.max(0, end - pos) : null,
+        start,
+        end,
       };
     }
     if (plain.length) {
-      const index = Math.floor((Number(position) || 0) / 4) % plain.length;
-      return { current: plain[index], next: plain[index + 1] || "" };
+      const index = Math.floor(pos / 4) % plain.length;
+      const start = index * 4;
+      return {
+        prev: plain[index - 1] || "",
+        current: plain[index],
+        next: plain[index + 1] || "",
+        remaining: Math.max(0, start + 4 - pos),
+        start,
+        end: start + 4,
+      };
     }
-    return { current: "", next: "" };
+    return empty;
   }
 
   _lyricsFor(speaker) {
@@ -1208,11 +1745,13 @@ class YaHomeHubPanel extends HTMLElement {
     const lyrics = full ? this._lyricsFor(speaker) : "";
     const lyric = full
       ? this._lyricLines(lyrics, position + this._lyricsOffset)
-      : { current: "", next: "" };
+      : { prev: "", current: "", next: "", remaining: null };
     return `
-      <article class="player ${full ? "full" : ""} ${playing ? "playing" : ""} ${
-      paused ? "paused" : ""
-    }" data-player="${this._esc(speaker.id)}" data-player-entity="${this._esc(
+      <article class="player skin-${this._playerSkin} ${full ? "full" : ""} ${
+      playing ? "playing" : ""
+    } ${paused ? "paused" : ""}" data-player="${this._esc(
+      speaker.id
+    )}" data-player-entity="${this._esc(
       entityId
     )}" ${
       cover ? `style="--cover:url('${this._esc(cover)}')"` : ""
@@ -1232,9 +1771,17 @@ class YaHomeHubPanel extends HTMLElement {
               ${
                 full && this._showLyrics
                   ? `<div class="lyrics-overlay">
-                      <div class="lyrics-current" data-lyrics-current>${this._esc(
-                        lyric.current
+                      <div class="lyrics-prev" data-lyrics-prev>${this._esc(
+                        lyric.prev
                       )}</div>
+                      <div class="lyrics-current-row">
+                        <span class="lyrics-countdown" data-lyrics-countdown>${this._formatCountdown(
+                          lyric.remaining
+                        )}</span>
+                        <div class="lyrics-current" data-lyrics-current>${this._esc(
+                          lyric.current
+                        )}</div>
+                      </div>
                       <div class="lyrics-next" data-lyrics-next>${this._esc(
                         lyric.next
                       )}</div>
@@ -1479,7 +2026,9 @@ class YaHomeHubPanel extends HTMLElement {
           : 0;
       const volumeInput = el.querySelector("[data-player-volume]");
       if (volumeInput && root.activeElement !== volumeInput) {
-        if (Number(volumeInput.value) !== volume) volumeInput.value = volume;
+        if (Number(volumeInput.value) !== volume) {
+          this._smoothRange(volumeInput, volume);
+        }
       }
       const volumeLabel = el.querySelector("[data-player-volume-label]");
       const volumeText = `${volume}%`;
@@ -1517,13 +2066,21 @@ class YaHomeHubPanel extends HTMLElement {
       if (el.classList.contains("full") && this._showLyrics) {
         const lyrics = this._lyricsFor(speaker);
         const line = this._lyricLines(lyrics, position + this._lyricsOffset);
-        const currentLine = el.querySelector("[data-lyrics-current]");
-        const nextLine = el.querySelector("[data-lyrics-next]");
-        if (currentLine && currentLine.textContent !== line.current) {
-          currentLine.textContent = line.current;
-        }
-        if (nextLine && nextLine.textContent !== line.next) {
-          nextLine.textContent = line.next;
+        this._setLyricText(
+          el.querySelector("[data-lyrics-prev]"),
+          line.prev
+        );
+        this._setLyricText(
+          el.querySelector("[data-lyrics-current]"),
+          line.current
+        );
+        this._setLyricText(
+          el.querySelector("[data-lyrics-next]"),
+          line.next
+        );
+        const countdown = el.querySelector("[data-lyrics-countdown]");
+        if (countdown) {
+          countdown.textContent = this._formatCountdown(line.remaining);
         }
       }
     });
@@ -1531,21 +2088,56 @@ class YaHomeHubPanel extends HTMLElement {
   }
 
   _renderViz(playing) {
-    if (this._viz === "wave") {
-      return `<div class="viz viz-wave">${Array.from(
-        { length: 24 },
+    const bars = (count) =>
+      Array.from(
+        { length: count },
         (_, i) =>
-          `<span style="--i:${i};--h:${18 + ((i * 29) % 70)}%"></span>`
-      ).join("")}</div>`;
+          `<span style="--i:${i};--h:${16 + ((i * 37) % 78)}%"></span>`
+      ).join("");
+    switch (this._viz) {
+      case "wave":
+        return `<div class="viz viz-wave">${Array.from(
+          { length: 24 },
+          (_, i) =>
+            `<span style="--i:${i};--h:${18 + ((i * 29) % 70)}%"></span>`
+        ).join("")}</div>`;
+      case "orbit":
+        return `<div class="viz viz-orbit"><i></i><i></i><i></i><b></b></div>`;
+      case "dots":
+        return `<div class="viz viz-dots">${Array.from(
+          { length: 28 },
+          (_, i) =>
+            `<span style="--i:${i};--h:${20 + ((i * 23) % 70)}%"></span>`
+        ).join("")}</div>`;
+      case "pulse":
+        return `<div class="viz viz-pulse"><i></i><i></i><i></i><i></i><b></b></div>`;
+      case "spectrum":
+        return `<div class="viz viz-spectrum"><div>${bars(
+          32
+        )}</div><div class="mirror">${bars(32)}</div></div>`;
+      case "mirror":
+        return `<div class="viz viz-mirror"><div>${bars(
+          24
+        )}</div><div class="flip">${bars(24)}</div></div>`;
+      case "rings":
+        return `<div class="viz viz-rings"><i></i><i></i><i></i><b></b></div>`;
+      case "rain":
+        return `<div class="viz viz-rain">${Array.from(
+          { length: 20 },
+          (_, i) =>
+            `<span style="--i:${i};--x:${(i * 47) % 100}%;--d:${
+              (i % 7) * 0.18
+            }s"></span>`
+        ).join("")}</div>`;
+      case "blocks":
+        return `<div class="viz viz-blocks">${Array.from(
+          { length: 16 },
+          (_, i) =>
+            `<span style="--i:${i};--h:${24 + ((i * 31) % 70)}%"></span>`
+        ).join("")}</div>`;
+      default:
+        return `<div class="viz viz-bars">${bars(42)}</div>`;
     }
-    if (this._viz === "orbit") {
-      return `<div class="viz viz-orbit"><i></i><i></i><i></i><b></b></div>`;
-    }
-    return `<div class="viz viz-bars">${Array.from(
-      { length: 42 },
-      (_, i) =>
-        `<span style="--i:${i};--h:${16 + ((i * 37) % 78)}%"></span>`
-    ).join("")}</div>`;
   }
 
   _currentPosition(entity) {
@@ -1618,7 +2210,7 @@ class YaHomeHubPanel extends HTMLElement {
       this._ticker = null;
     }
     if ((this._tab !== "speakers" && !this._fullPlayer) || !this._data) return;
-    this._ticker = setInterval(() => this._tick(), 250);
+    this._ticker = setInterval(() => this._tick(), 100);
   }
 
   _tick() {
@@ -1663,75 +2255,374 @@ class YaHomeHubPanel extends HTMLElement {
       lyrics,
       this._currentPosition(entity) + this._lyricsOffset
     );
-    const current = player.querySelector("[data-lyrics-current]");
-    const next = player.querySelector("[data-lyrics-next]");
-    if (current && current.textContent !== line.current) {
-      current.textContent = line.current;
-    }
-    if (next && next.textContent !== line.next) {
-      next.textContent = line.next;
-    }
+    this._setLyricText(player.querySelector("[data-lyrics-prev]"), line.prev);
+    this._setLyricText(
+      player.querySelector("[data-lyrics-current]"),
+      line.current
+    );
+    this._setLyricText(player.querySelector("[data-lyrics-next]"), line.next);
+    const countdown = player.querySelector("[data-lyrics-countdown]");
+    if (countdown) countdown.textContent = this._formatCountdown(line.remaining);
   }
 
-  async _searchMusic(speakerId, entityId, query) {
-    const resultsEl = this.shadowRoot
-      ? this.shadowRoot.querySelector(
-          `[data-music-results="${speakerId}"]`
-        )
-      : null;
-    if (resultsEl) resultsEl.innerHTML = `<div class="music-hint">Ищу...</div>`;
-    if (/^https?:\/\//i.test(query)) {
-      if (resultsEl) resultsEl.innerHTML = "";
-      this._callService("media_player", "play_media", {
-        entity_id: entityId,
-        media_content_id: query,
-        media_content_type: "music",
+  _musicEntity(targetId) {
+    return (
+      this._musicSpeakers().find((speaker) => speaker.id === targetId)
+        ?.entity_id || ""
+    );
+  }
+
+  _onMusicAction(event) {
+    const el = event.target.closest("[data-music-action]");
+    if (!el) return;
+    const action = el.getAttribute("data-music-action");
+    const hub = el.closest("[data-music-hub]");
+    const targetId =
+      el.getAttribute("data-target-id") ||
+      hub?.getAttribute("data-music-hub") ||
+      this._musicTargetId();
+    if (!targetId) return;
+    const entityId =
+      el.getAttribute("data-target-entity") || this._musicEntity(targetId);
+    if (action === "search") {
+      const input = hub?.querySelector("[data-music-query]");
+      this._searchMusic(targetId, entityId, input?.value || "");
+      return;
+    }
+    if (action === "tab") {
+      this._musicTab = el.getAttribute("data-tab");
+      this._musicError = null;
+      this._musicNotice = null;
+      if (this._musicTab === "likes" && !this._musicLikes.length) {
+        this._loadLikes(targetId);
+        return;
+      }
+      if (
+        this._musicTab === "playlists" &&
+        !this._musicPlaylists.length
+      ) {
+        this._loadPlaylists(targetId);
+        return;
+      }
+      if (this._musicTab === "queue") {
+        this._refreshQueue(targetId);
+        return;
+      }
+      this._renderMusicHubDom(targetId);
+      return;
+    }
+    if (action === "load-likes") {
+      this._loadLikes(targetId);
+      return;
+    }
+    if (action === "load-playlists") {
+      this._loadPlaylists(targetId);
+      return;
+    }
+    if (action === "open-playlist") {
+      this._openPlaylist(targetId, el.getAttribute("data-kind"));
+      return;
+    }
+    if (action === "back-playlists") {
+      this._musicPlaylist = null;
+      this._musicPlaylistTracks = [];
+      this._musicTab = "playlists";
+      this._renderMusicHubDom(targetId);
+      return;
+    }
+    if (action === "play") {
+      this._playTrackFromList(el, targetId, entityId);
+      return;
+    }
+    if (action === "add") {
+      this._addTrackToQueue(el, targetId, entityId);
+      return;
+    }
+    if (action === "play-queue") {
+      const queue = this._musicQueues[targetId] || {
+        tracks: [],
+        index: -1,
+      };
+      this._queueAction("music_queue_play", targetId, entityId, {
+        index: Math.max(0, queue.index || 0),
       });
       return;
     }
+    if (action === "play-queue-index") {
+      this._queueAction("music_queue_play", targetId, entityId, {
+        index: Number(el.getAttribute("data-track-index") || 0),
+      });
+      return;
+    }
+    if (action === "remove-queue") {
+      this._queueAction("music_queue_remove", targetId, entityId, {
+        index: Number(el.getAttribute("data-track-index") || 0),
+      });
+      return;
+    }
+    if (action === "clear-queue") {
+      this._queueAction("music_queue_clear", targetId, entityId, {});
+      return;
+    }
+    if (action === "next" || action === "prev") {
+      this._queueAction("music_next", targetId, entityId, {
+        delta: action === "next" ? 1 : -1,
+      });
+      return;
+    }
+    if (action === "skin") {
+      this._playerSkin = Number(el.getAttribute("data-skin")) || 2;
+      try {
+        localStorage.setItem(
+          "yahome-hub-player-skin",
+          String(this._playerSkin)
+        );
+      } catch (err) {
+        /* ignore */
+      }
+      this._fullPlayer = targetId;
+      this._render();
+    }
+  }
+
+  _onMusicChange(event) {
+    const select = event.target.closest("[data-music-target-select]");
+    if (!select) return;
+    this._musicTarget = select.value;
+    this._musicTab = "search";
+    this._musicPlaylist = null;
+    this._render();
+  }
+
+  _onMusicKeydown(event) {
+    if (event.key !== "Enter") return;
+    const input = event.target.closest("[data-music-query]");
+    if (!input) return;
+    event.preventDefault();
+    const hub = input.closest("[data-music-hub]");
+    const targetId =
+      hub?.getAttribute("data-music-hub") || this._musicTargetId();
+    if (targetId) {
+      this._searchMusic(
+        targetId,
+        this._musicEntity(targetId),
+        input.value.trim()
+      );
+    }
+  }
+
+  async _searchMusic(targetId, entityId, query) {
+    const value = String(query || "").trim();
+    if (!value) return;
+    this._musicQuery = value;
+    this._musicError = null;
+    this._musicNotice = null;
+    if (/^https?:\/\//i.test(value)) {
+      this._musicNotice = "Отправляю ссылку на колонку...";
+      this._renderMusicHubDom(targetId);
+      try {
+        await this._hass.callService("media_player", "play_media", {
+          entity_id: entityId,
+          media_content_id: value,
+          media_content_type: "music",
+        });
+        this._musicNotice = "Ссылка отправлена на колонку";
+      } catch (err) {
+        this._musicError = this._message(err);
+      }
+      this._renderMusicHubDom(targetId);
+      return;
+    }
+    this._musicLoading = true;
+    this._renderMusicHubDom(targetId);
     try {
       const result = await this._hass.callWS({
         type: "yahome_hub/music_search",
-        query,
+        query: value,
       });
-      const tracks = result?.tracks || [];
-      if (!resultsEl) return;
-      if (!tracks.length) {
-        resultsEl.innerHTML = `<div class="music-hint">Ничего не найдено</div>`;
-        return;
-      }
-      resultsEl.innerHTML = tracks
-        .map(
-          (track) =>
-            `<button class="music-result" data-play-track="${this._esc(
-              track.id
-            )}" data-play-entity="${this._esc(entityId)}">
-              <img src="${this._esc(track.cover || "")}" alt="">
-              <span><b>${this._esc(track.title)}</b><small>${this._esc(
-              track.artist
-            )}${
-              track.album ? ` · ${this._esc(track.album)}` : ""
-            }</small></span>
-              <ha-icon icon="mdi:play-circle"></ha-icon>
-            </button>`
-        )
-        .join("");
-      resultsEl.querySelectorAll("[data-play-track]").forEach((button) => {
-        button.addEventListener("click", () => {
-          this._callService("media_player", "play_media", {
-            entity_id: button.getAttribute("data-play-entity"),
-            media_content_id: button.getAttribute("data-play-track"),
-            media_content_type: "music",
-          });
-        });
-      });
+      this._musicResults = result?.tracks || [];
+      this._cacheTracks(this._musicResults);
+      this._musicTab = "search";
+      this._musicNotice = this._musicResults.length
+        ? `Найдено: ${this._musicResults.length}`
+        : "Ничего не найдено";
     } catch (err) {
-      if (resultsEl) {
-        resultsEl.innerHTML = `<div class="music-hint">Ошибка: ${this._esc(
-          this._message(err)
-        )}</div>`;
-      }
+      this._musicError = this._message(err);
     }
+    this._musicLoading = false;
+    this._renderMusicHubDom(targetId);
+  }
+
+  async _loadLikes(targetId) {
+    this._musicLoading = true;
+    this._musicError = null;
+    this._musicNotice = null;
+    this._renderMusicHubDom(targetId);
+    try {
+      const result = await this._hass.callWS({
+        type: "yahome_hub/music_likes",
+      });
+      this._musicLikes = result?.tracks || [];
+      this._cacheTracks(this._musicLikes);
+    } catch (err) {
+      this._musicError = this._message(err);
+    }
+    this._musicLoading = false;
+    this._renderMusicHubDom(targetId);
+  }
+
+  async _loadPlaylists(targetId) {
+    this._musicLoading = true;
+    this._musicError = null;
+    this._musicNotice = null;
+    this._renderMusicHubDom(targetId);
+    try {
+      const result = await this._hass.callWS({
+        type: "yahome_hub/music_playlists",
+      });
+      this._musicPlaylists = result?.playlists || [];
+    } catch (err) {
+      this._musicError = this._message(err);
+    }
+    this._musicLoading = false;
+    this._renderMusicHubDom(targetId);
+  }
+
+  async _openPlaylist(targetId, kind) {
+    this._musicLoading = true;
+    this._musicError = null;
+    this._musicNotice = null;
+    this._renderMusicHubDom(targetId);
+    try {
+      const result = await this._hass.callWS({
+        type: "yahome_hub/music_playlist",
+        kind,
+      });
+      this._musicPlaylist =
+        this._musicPlaylists.find((item) => item.kind === kind) || {
+          title: "Плейлист",
+        };
+      this._musicPlaylistTracks = result?.tracks || [];
+      this._cacheTracks(this._musicPlaylistTracks);
+      this._musicTab = "playlists";
+    } catch (err) {
+      this._musicError = this._message(err);
+    }
+    this._musicLoading = false;
+    this._renderMusicHubDom(targetId);
+  }
+
+  async _refreshQueue(targetId) {
+    const entityId = this._musicEntity(targetId);
+    if (!entityId) return;
+    try {
+      const queue = await this._hass.callWS({
+        type: "yahome_hub/music_queue",
+        entity_id: entityId,
+      });
+      this._musicQueues[targetId] = queue || { tracks: [], index: -1 };
+    } catch (err) {
+      this._musicError = this._message(err);
+    }
+    this._renderMusicHubDom(targetId);
+  }
+
+  async _playTrackFromList(el, targetId, entityId) {
+    const kind = el.getAttribute("data-track-kind") || "search";
+    const tracks =
+      kind === "likes"
+        ? this._musicLikes
+        : kind === "playlist"
+        ? this._musicPlaylistTracks
+        : this._musicResults;
+    const index = Number(el.getAttribute("data-track-index") || 0);
+    const track =
+      this._musicTracks[el.getAttribute("data-track-id")] || tracks[index];
+    if (!track || !entityId) return;
+    this._musicNotice = `Включаю: ${track.title}`;
+    this._musicError = null;
+    this._renderMusicHubDom(targetId);
+    try {
+      await this._hass.callWS({
+        type: "yahome_hub/music_play",
+        entity_id: entityId,
+        track_id: track.id,
+        queue: tracks,
+        index,
+      });
+      this._musicQueues[targetId] = { tracks, index };
+      this._musicNotice = `Играет: ${track.title}`;
+    } catch (err) {
+      this._musicError = this._message(err);
+      this._musicNotice = null;
+    }
+    this._renderMusicHubDom(targetId);
+  }
+
+  async _addTrackToQueue(el, targetId, entityId) {
+    const track = this._musicTracks[el.getAttribute("data-track-id")];
+    if (!track || !entityId) return;
+    try {
+      const queue = await this._hass.callWS({
+        type: "yahome_hub/music_queue_add",
+        entity_id: entityId,
+        track,
+      });
+      this._musicQueues[targetId] = queue;
+      this._musicNotice = `В очередь: ${track.title}`;
+    } catch (err) {
+      this._musicError = this._message(err);
+    }
+    this._renderMusicHubDom(targetId);
+  }
+
+  async _queueAction(service, targetId, entityId, data) {
+    try {
+      await this._hass.callWS({
+        type: `yahome_hub/${service}`,
+        entity_id: entityId,
+        ...data,
+      });
+      await this._refreshQueue(targetId);
+      this._musicNotice = "Очередь обновлена";
+    } catch (err) {
+      this._musicError = this._message(err);
+    }
+    this._renderMusicHubDom(targetId);
+  }
+
+  _smoothRange(input, target, duration = 180) {
+    if (!input) return;
+    const token = (input._smoothToken || 0) + 1;
+    input._smoothToken = token;
+    const start = Number(input.value) || 0;
+    if (Math.abs(start - target) < 0.5) {
+      input.value = target;
+      return;
+    }
+    const started = performance.now();
+    const step = (now) => {
+      if (input._smoothToken !== token) return;
+      const progress = Math.min(1, (now - started) / duration);
+      input.value = start + (target - start) * progress;
+      if (progress < 1) requestAnimationFrame(step);
+    };
+    requestAnimationFrame(step);
+  }
+
+  _formatCountdown(value) {
+    if (value === null || value === undefined) return "";
+    const number = Number(value);
+    if (!Number.isFinite(number)) return "";
+    return Math.max(0, number).toFixed(1);
+  }
+
+  _setLyricText(element, text) {
+    if (!element || element.textContent === text) return;
+    element.textContent = text;
+    element.classList.remove("lyric-in");
+    void element.offsetWidth;
+    element.classList.add("lyric-in");
   }
 
   _setLyricsOffset(value) {
@@ -1774,6 +2665,9 @@ class YaHomeHubPanel extends HTMLElement {
   _attachEvents() {
     const root = this.shadowRoot;
     if (!root) return;
+    root.addEventListener("click", (event) => this._onMusicAction(event));
+    root.addEventListener("change", (event) => this._onMusicChange(event));
+    root.addEventListener("keydown", (event) => this._onMusicKeydown(event));
     root.querySelectorAll("[data-open-player]").forEach((el) => {
       el.addEventListener("click", (event) => {
         event.stopPropagation();
@@ -2011,6 +2905,7 @@ class YaHomeHubPanel extends HTMLElement {
     });
     root.querySelectorAll("[data-volume-entity]").forEach((el) => {
       el.addEventListener("input", () => {
+        el._smoothToken = (el._smoothToken || 0) + 1;
         const label = root.querySelector(
           `[data-volume-for="${el.getAttribute("data-volume-entity")}"]`
         );
@@ -2371,29 +3266,30 @@ class YaHomeHubPanel extends HTMLElement {
         box-shadow: 0 8px 18px rgba(91, 108, 255, .25);
       }
       .speakers-section { display: flex; flex-direction: column; gap: 16px; }
-      .speaker-toolbar { display: flex; justify-content: space-between; align-items: flex-end; gap: 16px; }
+      .speaker-toolbar { display: flex; justify-content: space-between; align-items: flex-end; gap: 16px; flex-wrap: wrap; }
       .speaker-toolbar h3 { margin: 0 0 4px; font-size: 17px; }
       .viz-switch {
         display: flex; gap: 3px; padding: 4px; border: 1px solid var(--divider-color, #e4e7ec);
         background: var(--card-background-color, #fff); border-radius: 14px; flex: none;
+        max-width: 100%; overflow-x: auto; scrollbar-width: thin;
       }
       .viz-switch button {
         display: inline-flex; align-items: center; gap: 5px; border: 0; background: transparent;
         color: var(--secondary-text-color, #667085); border-radius: 10px; padding: 7px 9px;
-        font: inherit; font-size: 11px; cursor: pointer;
+        font: inherit; font-size: 11px; cursor: pointer; flex: none; white-space: nowrap;
       }
       .viz-switch button ha-icon { --mdc-icon-size: 15px; }
       .viz-switch button.active { background: var(--primary-color, #5b6cff); color: #fff; }
-      .players { display: grid; grid-template-columns: repeat(auto-fill, minmax(340px, 1fr)); gap: 16px; }
+      .players { display: grid; grid-template-columns: repeat(auto-fit, minmax(520px, 1fr)); gap: 20px; }
       .player {
-        position: relative; overflow: hidden; border-radius: 24px; padding: 18px;
+        position: relative; overflow: hidden; border-radius: 30px; padding: 24px;
         border: 1px solid var(--divider-color, #e4e7ec); background: var(--card-background-color, #fff);
         isolation: isolate;
       }
       .player-bg {
         position: absolute; inset: -25%; z-index: -2; background-image: var(--cover);
         background-size: cover; background-position: center; filter: blur(38px) saturate(1.4);
-        opacity: .22; transform: scale(1.15);
+        opacity: .34; transform: scale(1.15);
       }
       .player-glow {
         position: absolute; inset: 0; z-index: -1; pointer-events: none;
@@ -2402,10 +3298,10 @@ class YaHomeHubPanel extends HTMLElement {
       .player-content { position: relative; display: flex; flex-direction: column; gap: 12px; }
       .player-head { display: flex; align-items: center; gap: 14px; }
       .player-cover {
-        position: relative; width: 84px; height: 84px; flex: none; border-radius: 20px; overflow: hidden;
-        display: grid; place-items: center; color: #fff; font-size: 34px;
+        position: relative; width: 120px; height: 120px; flex: none; border-radius: 26px; overflow: hidden;
+        display: grid; place-items: center; color: #fff; font-size: 44px;
         background: linear-gradient(135deg, #5b6cff, #8f43ff 55%, #ff4f9a);
-        box-shadow: 0 14px 28px rgba(16, 24, 40, .18);
+        box-shadow: 0 18px 38px rgba(16, 24, 40, .24);
       }
       .player-cover img { width: 100%; height: 100%; object-fit: cover; display: block; }
       .player.playing .player-cover img { animation: coverFloat 5s ease-in-out infinite; }
@@ -2419,7 +3315,7 @@ class YaHomeHubPanel extends HTMLElement {
         color: var(--secondary-text-color, #667085); font-weight: 700;
       }
       .player-meta h3 {
-        margin: 4px 0; font-size: 17px; line-height: 1.25;
+        margin: 5px 0; font-size: 24px; line-height: 1.2;
         white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
       }
       .player-meta p {
@@ -2464,21 +3360,41 @@ class YaHomeHubPanel extends HTMLElement {
       .player.full .player-controls .icon-btn.play { width: 58px; height: 58px; border-radius: 18px; }
       .player.full .volume-control { min-width: 220px; }
       .lyrics-overlay {
-        position: absolute; left: 0; right: 0; bottom: 0; padding: 26px 24px 22px;
-        background: linear-gradient(to top, rgba(5,6,15,.92), rgba(5,6,15,.1) 80%, transparent);
+        position: absolute; left: 0; right: 0; bottom: 0; padding: 22px 20px 18px;
+        background: linear-gradient(to top, rgba(5,6,15,.95), rgba(5,6,15,.35) 72%, transparent);
         text-align: center; pointer-events: none;
+      }
+      .lyrics-prev {
+        color: rgba(255,255,255,.5); font-size: 13px; line-height: 1.25;
+        margin-bottom: 6px; text-shadow: 0 2px 12px rgba(0,0,0,.8);
+        transition: opacity .35s ease;
+      }
+      .lyrics-current-row {
+        display: flex; align-items: center; justify-content: center; gap: 10px;
+      }
+      .lyrics-countdown {
+        flex: none; min-width: 36px; text-align: right;
+        color: rgba(255,255,255,.62); font-size: 12px;
+        font-variant-numeric: tabular-nums;
+        text-shadow: 0 2px 12px rgba(0,0,0,.8);
       }
       .lyrics-current {
         color: #fff; font-size: 25px; line-height: 1.25; font-weight: 700;
         text-shadow: 0 2px 16px rgba(0,0,0,.85);
+        max-width: calc(100% - 50px);
       }
       .lyrics-next {
-        color: rgba(255,255,255,.68); font-size: 15px; line-height: 1.3;
+        color: rgba(255,255,255,.68); font-size: 14px; line-height: 1.3;
         margin-top: 7px; text-shadow: 0 2px 12px rgba(0,0,0,.8);
       }
+      .lyric-in { animation: lyricIn .35s ease both; }
+      @keyframes lyricIn {
+        from { opacity: 0; transform: translateY(5px); }
+        to { opacity: 1; transform: translateY(0); }
+      }
       .viz {
-        height: 58px; display: flex; align-items: flex-end; justify-content: center; gap: 3px;
-        padding: 8px 10px; border-radius: 14px; overflow: hidden;
+        height: 82px; display: flex; align-items: flex-end; justify-content: center; gap: 3px;
+        padding: 9px 12px; border-radius: 16px; overflow: hidden;
         background: color-mix(in srgb, var(--primary-color, #5b6cff) 7%, transparent);
       }
       .viz-bars span {
@@ -2528,11 +3444,11 @@ class YaHomeHubPanel extends HTMLElement {
       }
       .player-controls { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
       .transport { display: flex; align-items: center; gap: 6px; }
-      .player-controls .icon-btn { width: 38px; height: 38px; border-radius: 12px; }
+      .player-controls .icon-btn { width: 46px; height: 46px; border-radius: 14px; }
       .player-controls .icon-btn.play {
-        width: 46px; height: 46px; border-radius: 15px; border-color: transparent;
+        width: 56px; height: 56px; border-radius: 18px; border-color: transparent;
         background: linear-gradient(135deg, #5b6cff, #ff4f9a); color: #fff;
-        box-shadow: 0 8px 18px rgba(91, 108, 255, .3);
+        box-shadow: 0 10px 24px rgba(91, 108, 255, .34);
       }
       .volume-control {
         display: flex; align-items: center; gap: 6px; flex: 1; min-width: 130px;
@@ -2701,6 +3617,425 @@ class YaHomeHubPanel extends HTMLElement {
         padding: 7px 9px; background: var(--card-background-color, #fff);
         color: inherit; font-size: 11px;
       }
+      .music-hub {
+        margin-bottom: 20px; padding: 18px; border-radius: 26px;
+        background:
+          radial-gradient(circle at 0% 0%, rgba(108,124,255,.32), transparent 42%),
+          radial-gradient(circle at 100% 0%, rgba(255,79,154,.18), transparent 38%),
+          linear-gradient(180deg, #171b2b, #0d101b);
+        border: 1px solid rgba(255,255,255,.12);
+        color: #eef0ff;
+        box-shadow: 0 20px 50px rgba(0,0,0,.18);
+      }
+      .music-hub.compact { margin-top: 16px; margin-bottom: 0; box-shadow: none; }
+      .music-hub-head { display: flex; justify-content: space-between; gap: 12px; align-items: flex-start; }
+      .music-hub-head h3 { margin: 0 0 4px; font-size: 18px; color: #fff; }
+      .music-hub-head p { margin: 0; font-size: 12px; color: rgba(238,240,255,.58); }
+      .music-hub-head select {
+        border: 1px solid rgba(255,255,255,.16); border-radius: 10px;
+        background: rgba(255,255,255,.08); color: #eef0ff; padding: 8px 10px;
+        font-size: 11px; max-width: 220px;
+      }
+      .music-search-bar { display: flex; gap: 8px; margin-top: 14px; }
+      .music-search-bar input {
+        flex: 1; min-width: 0; border: 1px solid rgba(255,255,255,.16);
+        border-radius: 11px; padding: 10px 12px; background: rgba(255,255,255,.08);
+        color: #eef0ff; font: inherit; font-size: 12px; outline: none;
+      }
+      .music-search-bar input:focus { border-color: rgba(108,124,255,.8); }
+      .music-search-bar .action-btn { flex: none; }
+      .music-tabs { display: flex; gap: 6px; margin-top: 12px; flex-wrap: wrap; }
+      .music-tabs button {
+        border: 1px solid rgba(255,255,255,.14); border-radius: 10px;
+        background: transparent; color: rgba(238,240,255,.68);
+        padding: 7px 11px; font-size: 11px; cursor: pointer;
+      }
+      .music-tabs button.active {
+        background: linear-gradient(135deg, #6c7cff, #ff4f9a);
+        border-color: transparent; color: #fff;
+      }
+      .music-tabs b { font-weight: 700; }
+      .music-content { margin-top: 12px; max-height: 390px; overflow: auto; padding-right: 4px; }
+      .track-list { display: flex; flex-direction: column; gap: 6px; }
+      .track-row {
+        display: flex; align-items: center; gap: 9px; padding: 7px 9px;
+        border-radius: 12px; background: rgba(255,255,255,.06);
+        border: 1px solid rgba(255,255,255,.07);
+      }
+      .track-row.current {
+        border-color: rgba(108,124,255,.8);
+        background: rgba(108,124,255,.16);
+      }
+      .track-cover {
+        width: 40px; height: 40px; border-radius: 9px; object-fit: cover;
+        flex: none; background: #101018;
+      }
+      .track-meta { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 2px; }
+      .track-meta b { font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+      .track-meta small { font-size: 10px; color: rgba(238,240,255,.55); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+      .track-duration { font-size: 10px; color: rgba(238,240,255,.5); }
+      .track-btn {
+        width: 30px; height: 30px; border-radius: 9px; flex: none;
+        border: 1px solid rgba(255,255,255,.14); background: transparent;
+        color: #eef0ff; cursor: pointer; display: grid; place-items: center;
+      }
+      .track-btn:hover { border-color: #8f9bff; color: #b9c2ff; }
+      .queue-head { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 10px; }
+      .playlist-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(140px, 1fr)); gap: 10px; }
+      .playlist-card {
+        display: flex; flex-direction: column; gap: 6px; padding: 8px;
+        border: 1px solid rgba(255,255,255,.1); border-radius: 14px;
+        background: rgba(255,255,255,.06); color: #eef0ff; text-align: left; cursor: pointer;
+      }
+      .playlist-card:hover { border-color: rgba(108,124,255,.8); }
+      .playlist-card img { width: 100%; aspect-ratio: 1; object-fit: cover; border-radius: 10px; background: #101018; }
+      .playlist-card b { font-size: 11px; }
+      .playlist-card small { font-size: 10px; color: rgba(238,240,255,.55); }
+      .playlist-head { display: flex; align-items: center; gap: 10px; margin-bottom: 10px; font-size: 12px; }
+      .skin-picker {
+        display: flex; align-items: center; gap: 6px; flex-wrap: wrap;
+        margin-top: 13px; padding-top: 12px;
+        border-top: 1px solid rgba(255,255,255,.09);
+        font-size: 11px; color: rgba(238,240,255,.55);
+      }
+      .skin-picker button {
+        width: 27px; height: 27px; border-radius: 8px;
+        border: 1px solid rgba(255,255,255,.16); background: transparent;
+        color: #eef0ff; cursor: pointer; font-size: 11px;
+      }
+      .skin-picker button.active {
+        background: linear-gradient(135deg, #5b6cff, #ff4f9a);
+        border-color: transparent; color: #fff;
+      }
+      .skin-picker b { color: #fff; font-weight: 600; }
+      .music-hint { font-size: 11px; color: rgba(238,240,255,.55); padding: 8px 2px; }
+      .music-hint.notice { color: #9facff; }
+      .error-text { color: #ff8da1; }
+      .full-player,
+      .player.full.full-player {
+        position: relative; overflow: hidden; border-radius: 32px;
+        color: #fff; background: #080a12; padding: 0; border: 0;
+        min-height: 620px;
+        box-shadow: 0 40px 100px rgba(0,0,0,.55);
+      }
+      .player.full.full-player .player-cover.big {
+        width: 100%; height: auto; aspect-ratio: 1;
+      }
+      .player.full.full-player .player-cover.big img { border-radius: 24px; }
+      .player.full.full-player .full-viz .viz { height: 100%; }
+      .full-bg {
+        position: absolute; inset: -30px;
+        background-image: var(--cover);
+        background-size: cover; background-position: center;
+        filter: blur(38px) brightness(.56) saturate(1.25);
+        transform: scale(1.12);
+      }
+      .full-shade {
+        position: absolute; inset: 0;
+        background:
+          radial-gradient(circle at 15% 5%, rgba(108,124,255,.18), transparent 38%),
+          linear-gradient(180deg, rgba(5,6,15,.24), rgba(5,6,15,.62) 52%, rgba(5,6,15,.88));
+      }
+      .full-content {
+        position: relative; z-index: 1; padding: 24px;
+        display: flex; flex-direction: column; gap: 14px;
+      }
+      .full-header { display: flex; align-items: flex-start; justify-content: space-between; gap: 14px; }
+      .full-kicker { font-size: 10px; letter-spacing: .14em; text-transform: uppercase; color: rgba(255,255,255,.55); }
+      .full-title h2 { margin: 5px 0 4px; font-size: 28px; line-height: 1.12; }
+      .full-title p { margin: 0; font-size: 13px; color: rgba(255,255,255,.66); }
+      .full-actions { display: flex; gap: 8px; }
+      .round-btn {
+        width: 38px; height: 38px; border-radius: 50%;
+        border: 1px solid rgba(255,255,255,.18);
+        background: rgba(255,255,255,.1); color: #fff;
+        display: grid; place-items: center; cursor: pointer;
+      }
+      .round-btn:hover { background: rgba(255,255,255,.18); }
+      .full-main {
+        display: grid; grid-template-columns: minmax(280px, 380px) 1fr;
+        gap: 22px; align-items: center;
+      }
+      .full-cover-wrap { min-width: 0; }
+      .full-player .player-cover.big {
+        width: 100%; height: auto; aspect-ratio: 1; border-radius: 24px;
+        box-shadow: 0 26px 70px rgba(0,0,0,.5);
+      }
+      .full-side { display: flex; flex-direction: column; gap: 12px; min-width: 0; }
+      .full-viz {
+        height: 150px; display: flex; align-items: stretch;
+        padding: 12px; border-radius: 18px;
+        background: rgba(255,255,255,.06);
+        border: 1px solid rgba(255,255,255,.08);
+      }
+      .full-viz .viz { flex: 1; height: 100%; background: transparent; padding: 0; }
+      .full-viz-switch { display: flex; flex-wrap: wrap; gap: 4px; justify-content: flex-end; }
+      .full-viz-switch button {
+        width: 29px; height: 29px; border-radius: 8px;
+        border: 1px solid rgba(255,255,255,.14); background: transparent;
+        color: rgba(255,255,255,.7); cursor: pointer;
+      }
+      .full-viz-switch button.active {
+        background: linear-gradient(135deg, #5b6cff, #ff4f9a);
+        border-color: transparent; color: #fff;
+      }
+      .full-modes { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+      .full-modes .mode-btn { color: rgba(255,255,255,.75); border-color: rgba(255,255,255,.14); }
+      .full-modes .mode-btn.active { color: #fff; border-color: #8f9bff; background: rgba(108,124,255,.2); }
+      .full-modes select {
+        border: 1px solid rgba(255,255,255,.14); border-radius: 9px;
+        background: rgba(255,255,255,.08); color: #fff; padding: 7px 9px; font-size: 11px;
+      }
+      .full-seek input[type="range"] { width: 100%; accent-color: #8f9bff; }
+      .full-seek .times { color: rgba(255,255,255,.6); }
+      .full-controls { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; }
+      .full-controls .transport { display: flex; align-items: center; gap: 8px; }
+      .full-controls .icon-btn {
+        width: 44px; height: 44px; border-radius: 14px;
+        background: rgba(255,255,255,.08); border: 1px solid rgba(255,255,255,.14);
+        color: #fff;
+      }
+      .full-controls .icon-btn.play {
+        width: 56px; height: 56px; border-radius: 18px; border: 0;
+        background: linear-gradient(135deg, #5b6cff, #ff4f9a); color: #fff;
+        box-shadow: 0 10px 28px rgba(91,108,255,.36);
+      }
+      .full-controls .volume-control { flex: 1; min-width: 180px; color: rgba(255,255,255,.7); }
+      .full-controls .volume-toggle { color: #fff; }
+      .full-player .lyrics-sync { color: rgba(255,255,255,.6); }
+      .full-player .lyrics-sync b { color: #fff; }
+      .full-player .sync-btn { border-color: rgba(255,255,255,.18); color: #fff; }
+      .full-player .sync-btn:hover { border-color: #8f9bff; color: #b9c2ff; }
+      .full-player .music-hub { margin-top: 4px; }
+      .speaker-control {
+        background: linear-gradient(180deg, #171b2b, #0d101b);
+        color: #eef0ff; border-color: rgba(255,255,255,.12);
+      }
+      .speaker-control .muted { color: rgba(238,240,255,.55); }
+      .speaker-control .control-block {
+        background: rgba(255,255,255,.06); border-color: rgba(255,255,255,.09);
+      }
+      .speaker-control .control-block h4,
+      .speaker-control .control-block p,
+      .speaker-control .control-block label { color: rgba(238,240,255,.8); }
+      .speaker-control .control-block select,
+      .speaker-control .control-block input,
+      .speaker-control .control-block textarea {
+        background: rgba(255,255,255,.08); color: #eef0ff; border-color: rgba(255,255,255,.14);
+      }
+      .speaker-control .ghost-btn { color: #eef0ff; border-color: rgba(255,255,255,.16); }
+      .speaker-control .sensor-tile { background: rgba(255,255,255,.06); border-color: rgba(255,255,255,.09); }
+      .player {
+        --skin-accent: #6c7cff;
+        --skin-accent-2: #ff4f9a;
+      }
+      .player .icon-btn.play,
+      .player .viz-bars span,
+      .player .viz-wave span,
+      .player .viz-dots span,
+      .player .viz-spectrum span,
+      .player .viz-mirror span,
+      .player .viz-blocks span {
+        background: linear-gradient(135deg, var(--skin-accent), var(--skin-accent-2));
+      }
+      .player.skin-2 { --skin-accent: #7c8cff; --skin-accent-2: #4fd1ff; }
+      .player.skin-3 { --skin-accent: #f2b35e; --skin-accent-2: #ff7a59; }
+      .player.skin-4 { --skin-accent: #8be9fd; --skin-accent-2: #c084fc; }
+      .player.skin-5 { --skin-accent: #ff3df2; --skin-accent-2: #39e7ff; }
+      .player.skin-6 { --skin-accent: #111827; --skin-accent-2: #6b7280; }
+      .player.skin-7 { --skin-accent: #37d39a; --skin-accent-2: #6c7cff; }
+      .player.skin-8 { --skin-accent: #d6b36a; --skin-accent-2: #b08b46; }
+      .full-player {
+        --skin-accent: #6c7cff;
+        --skin-accent-2: #ff4f9a;
+        --skin-text: #fff;
+        --skin-muted: rgba(255,255,255,.6);
+      }
+      .full-player .full-title h2 { color: var(--skin-text); }
+      .full-player .full-title p,
+      .full-player .full-kicker { color: var(--skin-muted); }
+      .full-player .full-controls .icon-btn.play,
+      .full-player .full-viz-switch button.active {
+        background: linear-gradient(135deg, var(--skin-accent), var(--skin-accent-2));
+      }
+      .full-player .viz-bars span,
+      .full-player .viz-wave span,
+      .full-player .viz-dots span,
+      .full-player .viz-spectrum span,
+      .full-player .viz-mirror span,
+      .full-player .viz-blocks span {
+        background: linear-gradient(to top, var(--skin-accent), var(--skin-accent-2));
+      }
+      .full-player.skin-1 { --skin-accent: #6c7cff; --skin-accent-2: #ff4f9a; }
+      .full-player.skin-2 { --skin-accent: #7c8cff; --skin-accent-2: #4fd1ff; }
+      .full-player.skin-2 .full-shade {
+        background:
+          radial-gradient(circle at 20% 0%, rgba(79,209,255,.18), transparent 40%),
+          linear-gradient(180deg, rgba(4,8,20,.45), rgba(4,8,20,.9));
+      }
+      .full-player.skin-3 {
+        --skin-accent: #f2b35e; --skin-accent-2: #ff7a59;
+        --skin-text: #fff7ea; --skin-muted: rgba(255,247,234,.6);
+      }
+      .full-player.skin-3 .full-title h2 { font-family: Georgia, "Times New Roman", serif; }
+      .full-player.skin-3 .full-bg { filter: blur(40px) brightness(.3) sepia(.55) saturate(1.2); }
+      .full-player.skin-3 .player-cover.big {
+        border-radius: 50%;
+        box-shadow: 0 0 0 14px rgba(0,0,0,.55), 0 0 0 18px rgba(255,255,255,.1), 0 30px 70px rgba(0,0,0,.55);
+      }
+      .full-player.skin-4 {
+        --skin-accent: #8be9fd; --skin-accent-2: #c084fc;
+        --skin-muted: rgba(255,255,255,.66);
+      }
+      .full-player.skin-4 .full-shade {
+        background: linear-gradient(180deg, rgba(20,28,40,.35), rgba(10,15,25,.68));
+      }
+      .full-player.skin-4 .full-viz,
+      .full-player.skin-4 .round-btn,
+      .full-player.skin-4 .full-controls .icon-btn {
+        backdrop-filter: blur(16px); background: rgba(255,255,255,.12);
+      }
+      .full-player.skin-5 {
+        --skin-accent: #ff3df2; --skin-accent-2: #39e7ff;
+        --skin-text: #f5f3ff; --skin-muted: rgba(245,243,255,.62);
+      }
+      .full-player.skin-5 .full-shade {
+        background:
+          radial-gradient(circle at 80% 0%, rgba(255,61,242,.2), transparent 40%),
+          linear-gradient(180deg, rgba(3,0,10,.5), rgba(3,0,10,.94));
+      }
+      .full-player.skin-5 .full-viz {
+        border: 1px solid rgba(255,61,242,.55);
+        box-shadow: 0 0 24px rgba(255,61,242,.22), inset 0 0 24px rgba(57,231,255,.08);
+      }
+      .full-player.skin-5 .full-title h2 {
+        text-transform: uppercase; letter-spacing: .04em;
+        text-shadow: 0 0 18px rgba(255,61,242,.65);
+      }
+      .full-player.skin-5 .full-viz-switch button.active {
+        box-shadow: 0 0 14px rgba(255,61,242,.6);
+      }
+      .full-player.skin-6 {
+        --skin-accent: #111827; --skin-accent-2: #6b7280;
+        --skin-text: #111827; --skin-muted: rgba(17,24,39,.55);
+        background: #f4efe7;
+      }
+      .full-player.skin-6 .full-bg { display: none; }
+      .full-player.skin-6 .full-shade { background: linear-gradient(180deg, #f8f4ed, #eee7dc); }
+      .full-player.skin-6 .round-btn,
+      .full-player.skin-6 .full-viz-switch button,
+      .full-player.skin-6 .full-modes .mode-btn,
+      .full-player.skin-6 .full-modes select,
+      .full-player.skin-6 .sync-btn {
+        color: #111827; border-color: rgba(17,24,39,.18);
+        background: rgba(17,24,39,.04);
+      }
+      .full-player.skin-6 .full-viz { background: rgba(17,24,39,.05); border-color: rgba(17,24,39,.1); }
+      .full-player.skin-6 .full-controls .icon-btn {
+        background: rgba(17,24,39,.06); border-color: rgba(17,24,39,.16); color: #111827;
+      }
+      .full-player.skin-6 .full-controls .volume-control,
+      .full-player.skin-6 .volume-toggle,
+      .full-player.skin-6 .lyrics-sync,
+      .full-player.skin-6 .times { color: rgba(17,24,39,.65); }
+      .full-player.skin-6 .lyrics-sync b { color: #111827; }
+      .full-player.skin-6 .player-cover.big { border-radius: 6px; }
+      .full-player.skin-7 {
+        --skin-accent: #37d39a; --skin-accent-2: #6c7cff;
+        --skin-text: #f2fff9; --skin-muted: rgba(242,255,249,.62);
+      }
+      .full-player.skin-7 .full-shade {
+        background: linear-gradient(135deg, rgba(55,211,154,.18), rgba(108,124,255,.18) 45%, rgba(255,79,154,.15));
+        background-size: 200% 200%;
+        animation: auroraShift 12s ease-in-out infinite alternate;
+      }
+      @keyframes auroraShift {
+        from { background-position: 0% 50%; }
+        to { background-position: 100% 50%; }
+      }
+      .full-player.skin-8 {
+        --skin-accent: #d6b36a; --skin-accent-2: #b08b46;
+        --skin-text: #f2efe8; --skin-muted: rgba(242,239,232,.6);
+      }
+      .full-player.skin-8 .full-title h2 {
+        font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+        letter-spacing: -.02em;
+      }
+      .full-player.skin-8 .full-shade {
+        background: linear-gradient(180deg, rgba(18,18,18,.6), rgba(8,8,8,.96));
+      }
+      .full-player.skin-8 .player-cover.big { border-radius: 8px; }
+      .full-player.skin-8 .full-viz { border: 1px solid rgba(214,179,106,.35); }
+
+      .viz { position: relative; }
+      .viz-dots { gap: 7px; align-items: center; }
+      .viz-dots span {
+        width: 7px; height: 7px; border-radius: 50%;
+        animation: dotPulse 1.1s ease-in-out infinite alternate;
+        animation-delay: calc(var(--i) * -0.08s);
+      }
+      @keyframes dotPulse {
+        from { transform: scale(.55); opacity: .5; }
+        to { transform: scale(1.35); opacity: 1; }
+      }
+      .viz-pulse, .viz-rings { align-items: center; justify-content: center; }
+      .viz-pulse i, .viz-rings i {
+        position: absolute; border-radius: 50%; border: 2px solid rgba(108,124,255,.55);
+        width: 22%; aspect-ratio: 1; left: 50%; top: 50%;
+        transform: translate(-50%, -50%);
+        animation: ringPulse 2.2s ease-out infinite;
+      }
+      .viz-pulse i:nth-child(2) { animation-delay: .45s; border-color: rgba(255,79,154,.45); }
+      .viz-pulse i:nth-child(3) { animation-delay: .9s; }
+      .viz-pulse i:nth-child(4) { animation-delay: 1.35s; border-color: rgba(255,79,154,.3); }
+      .viz-pulse b, .viz-rings b {
+        width: 9%; aspect-ratio: 1; border-radius: 50%;
+        background: linear-gradient(135deg, #6c7cff, #ff4f9a);
+      }
+      @keyframes ringPulse {
+        0% { opacity: .8; transform: translate(-50%, -50%) scale(.35); }
+        80%, 100% { opacity: 0; transform: translate(-50%, -50%) scale(4.2); }
+      }
+      .viz-rings i {
+        border-color: transparent; border-top-color: #6c7cff;
+        animation: ringSpin 2.8s linear infinite;
+        width: 36%; aspect-ratio: 1;
+      }
+      .viz-rings i:nth-child(2) { width: 58%; border-top-color: #ff4f9a; animation-duration: 4.2s; animation-direction: reverse; }
+      .viz-rings i:nth-child(3) { width: 80%; border-top-color: #37d39a; animation-duration: 5.6s; }
+      @keyframes ringSpin { to { transform: translate(-50%, -50%) rotate(360deg); } }
+      .viz-spectrum, .viz-mirror { display: flex; flex-direction: column; gap: 3px; }
+      .viz-spectrum > div, .viz-mirror > div {
+        display: flex; align-items: flex-end; gap: 3px; height: 50%;
+      }
+      .viz-spectrum .mirror, .viz-mirror .flip { transform: scaleY(-1); }
+      .viz-spectrum span, .viz-mirror span {
+        flex: 1; height: var(--h); border-radius: 3px;
+        transform-origin: bottom; animation: barDance 1.15s ease-in-out infinite alternate;
+        animation-delay: calc(var(--i) * -0.05s); opacity: .85;
+      }
+      .viz-rain span {
+        position: absolute; top: -22%; width: 3px; height: 18%;
+        left: var(--x); border-radius: 2px;
+        background: linear-gradient(to bottom, rgba(108,124,255,0), #6c7cff);
+        animation: rainFall 1.45s linear infinite;
+        animation-delay: var(--d);
+      }
+      @keyframes rainFall {
+        from { transform: translateY(0); opacity: 0; }
+        20% { opacity: .9; }
+        to { transform: translateY(760%); opacity: 0; }
+      }
+      .viz-blocks span {
+        flex: 1; height: var(--h); border-radius: 4px;
+        transform-origin: bottom;
+        animation: blockJump .9s ease-in-out infinite alternate;
+        animation-delay: calc(var(--i) * -0.05s);
+      }
+      @keyframes blockJump {
+        from { transform: scaleY(.55); opacity: .55; }
+        to { transform: scaleY(1); opacity: 1; }
+      }
       @media (max-width: 720px) {
         .shell { padding: 18px 14px 50px; }
         .stats { grid-template-columns: repeat(2, minmax(0, 1fr)); }
@@ -2710,14 +4045,29 @@ class YaHomeHubPanel extends HTMLElement {
         .viz-switch { align-self: flex-start; }
         .players { grid-template-columns: 1fr; }
         .player-head { align-items: flex-start; }
-        .player-cover { width: 68px; height: 68px; border-radius: 16px; }
+        .player-cover { width: 88px; height: 88px; border-radius: 20px; }
+        .player-meta h3 { font-size: 19px; }
         .eq-select { max-width: none; width: 100%; }
         .player.full { padding: 18px; }
         .player.full .player-head { flex-direction: column; }
         .player.full .player-cover.big { width: 100%; height: auto; aspect-ratio: 1; }
         .player.full .player-meta h3 { font-size: 22px; }
+        .lyrics-prev { font-size: 11px; }
         .lyrics-current { font-size: 19px; }
-        .lyrics-next { font-size: 13px; }
+        .lyrics-next { font-size: 12px; }
+        .lyrics-countdown { font-size: 10px; min-width: 28px; }
+        .full-content { padding: 16px; }
+        .full-main { grid-template-columns: 1fr; gap: 14px; }
+        .full-player .player-cover.big { max-width: 380px; margin: 0 auto; }
+        .full-title h2 { font-size: 22px; }
+        .full-viz { height: 110px; }
+        .music-hub { padding: 14px; border-radius: 20px; }
+        .music-hub-head { flex-direction: column; align-items: stretch; }
+        .music-hub-head select { max-width: none; }
+        .music-search-bar { flex-direction: column; }
+        .music-content { max-height: 320px; }
+        .track-duration { display: none; }
+        .playlist-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
       }
     `;
   }
