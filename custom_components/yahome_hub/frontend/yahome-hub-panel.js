@@ -1269,7 +1269,11 @@ class YaHomeHubPanel extends HTMLElement {
     return `<div class="track-list">${tracks
       .map(
         (track, index) =>
-          `<div class="track-row">
+          `<div class="track-row" data-music-action="play" data-track-id="${this._esc(
+            track.id
+          )}" data-track-index="${index}" data-track-kind="${kind}" data-target-id="${this._esc(
+            targetId
+          )}" data-target-entity="${this._esc(entityId)}">
             <img class="track-cover" src="${this._esc(
               track.cover || ""
             )}" alt="">
@@ -1328,7 +1332,9 @@ class YaHomeHubPanel extends HTMLElement {
           (track, index) =>
             `<div class="track-row ${
               index === queue.index ? "current" : ""
-            }">
+            }" data-music-action="play-queue-index" data-track-index="${index}" data-target-id="${this._esc(
+              targetId
+            )}" data-target-entity="${this._esc(entityId)}">
               <img class="track-cover" src="${this._esc(
                 track.cover || ""
               )}" alt="">
@@ -3660,7 +3666,7 @@ class YaHomeHubPanel extends HTMLElement {
       .track-row {
         display: flex; align-items: center; gap: 9px; padding: 7px 9px;
         border-radius: 12px; background: rgba(255,255,255,.06);
-        border: 1px solid rgba(255,255,255,.07);
+        border: 1px solid rgba(255,255,255,.07); cursor: pointer;
       }
       .track-row.current {
         border-color: rgba(108,124,255,.8);
