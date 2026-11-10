@@ -22,6 +22,15 @@ class YaHomeHubPanel extends HTMLElement {
     this._lyricsCache = {};
     this._fullPlayer = null;
     this._showLyrics = true;
+    this._lyricsOffset = 0;
+    try {
+      const stored = Number(localStorage.getItem("yahome-hub-lyrics-offset"));
+      if (Number.isFinite(stored)) {
+        this._lyricsOffset = Math.max(-5, Math.min(5, stored));
+      }
+    } catch (err) {
+      this._lyricsOffset = 0;
+    }
     this._ticker = null;
     this._stateTimer = null;
     this._hassReady = false;
@@ -73,13 +82,19 @@ class YaHomeHubPanel extends HTMLElement {
   async _subscribe() {
     if (!this._hass || this._unsub) return;
     this._unsub = this._hass.connection.subscribeEvents(
-      () => this._load(),
+      () =>
+        this._load(
+          (this._tab === "speakers" || this._fullPlayer) && !this._selected
+        ),
       "yahome_hub_updated"
     );
     this._stateUnsub = this._hass.connection.subscribeEvents(
       (event) => this._onStateChanged(event),
       "state_changed"
     );
+    this._hass
+      .callWS({ type: "yahome_hub/lyrics_offset", offset: this._lyricsOffset })
+      .catch(() => {});
   }
 
   _onStateChanged(event) {
@@ -101,8 +116,9 @@ class YaHomeHubPanel extends HTMLElement {
     this._stateTimer = setTimeout(() => this._updatePlayerDom(), 220);
   }
 
-  async _load() {
+  async _load(silent = false) {
     if (!this._hass) return;
+    const previous = this._data;
     try {
       this._error = null;
       this._data = await this._hass.callWS({ type: "yahome_hub/devices" });
@@ -110,7 +126,29 @@ class YaHomeHubPanel extends HTMLElement {
       this._error = err && err.message ? err.message : String(err);
     }
     this._loading = false;
-    this._render();
+    if (
+      !previous ||
+      !silent ||
+      this._speakerSignature(previous) !== this._speakerSignature(this._data)
+    ) {
+      this._render();
+    } else {
+      this._updatePlayerDom();
+    }
+  }
+
+  _speakerSignature(data) {
+    return JSON.stringify({
+      counts: data ? data.counts : null,
+      speakers: ((data && data.speakers) || []).map((speaker) => [
+        speaker.id,
+        speaker.name,
+        speaker.platform,
+        speaker.entity_id,
+        speaker.equalizer_entity,
+        speaker.lyrics_entity,
+      ]),
+    });
   }
 
   async _refresh() {
@@ -504,6 +542,9 @@ class YaHomeHubPanel extends HTMLElement {
           </button>
           <button class="icon-btn" data-action="export" title="Экспорт базы">
             <ha-icon icon="mdi:database-export"></ha-icon>
+          </button>
+          <button class="icon-btn" data-action="demo" title="Тест интеграций">
+            <ha-icon icon="mdi:flask-outline"></ha-icon>
           </button>
         </div>
       </header>
@@ -966,7 +1007,7 @@ class YaHomeHubPanel extends HTMLElement {
     const eqValue = eqEntity ? eqEntity.state : "";
     const lyrics = full ? this._lyricsFor(speaker) : "";
     const lyric = full
-      ? this._lyricLines(lyrics, position)
+      ? this._lyricLines(lyrics, position + this._lyricsOffset)
       : { current: "", next: "" };
     return `
       <article class="player ${full ? "full" : ""} ${playing ? "playing" : ""} ${
@@ -1021,12 +1062,9 @@ class YaHomeHubPanel extends HTMLElement {
                 full
                   ? `<button class="power" data-toggle-lyrics title="Текст песни"><ha-icon icon="mdi:text-box-music"></ha-icon></button>
                      <button class="power" data-close-player title="Закрыть"><ha-icon icon="mdi:close"></ha-icon></button>`
-                  : `<button class="power" data-expand-player="${this._esc(
+                  : `<button class="power" data-open-player="${this._esc(
                       speaker.id
-                    )}" title="Открыть плеер"><ha-icon icon="mdi:dots-vertical"></ha-icon></button>
-                     <button class="power" data-expand-player="${this._esc(
-                       speaker.id
-                     )}" title="Развернуть"><ha-icon icon="mdi:arrow-expand-all"></ha-icon></button>`
+                    )}" title="Открыть плеер"><ha-icon icon="mdi:dots-vertical"></ha-icon></button>`
               }
               <button class="power player-power ${
                 entity.state !== "off" ? "on" : ""
@@ -1094,6 +1132,18 @@ class YaHomeHubPanel extends HTMLElement {
                 : ""
             }
           </div>
+          ${
+            full && this._showLyrics
+              ? `<div class="lyrics-sync">
+                  <span>Синхронизация текста</span>
+                  <button class="sync-btn" data-lyrics-offset="-0.5">−0.5</button>
+                  <b data-lyrics-offset-label>${this._lyricsOffset.toFixed(
+                    1
+                  )} с</b>
+                  <button class="sync-btn" data-lyrics-offset="0.5">+0.5</button>
+                </div>`
+              : ""
+          }
         </div>
       </article>`;
   }
@@ -1153,64 +1203,101 @@ class YaHomeHubPanel extends HTMLElement {
       const album =
         attrs.media_album_name || attrs.media_playlist || "";
       const titleEl = el.querySelector("[data-player-title]");
-      if (titleEl) titleEl.textContent = title;
+      if (titleEl && titleEl.textContent !== title) titleEl.textContent = title;
+      const metaText = album ? `${artist} · ${album}` : artist;
       const metaEl = el.querySelector("[data-player-meta]");
-      if (metaEl) metaEl.textContent = album ? `${artist} · ${album}` : artist;
-      const kicker = el.querySelector("[data-player-kicker]");
-      if (kicker) {
-        kicker.textContent = playing
-          ? "Сейчас играет"
-          : paused
-          ? "Пауза"
-          : entity.state === "off"
-          ? "Выключена"
-          : "Колонка";
+      if (metaEl && metaEl.textContent !== metaText) {
+        metaEl.textContent = metaText;
       }
-      const playIcon = el.querySelector("[data-player-play] ha-icon");
-      if (playIcon) playIcon.setAttribute("icon", playing ? "mdi:pause" : "mdi:play");
+      const kickerText = playing
+        ? "Сейчас играет"
+        : paused
+        ? "Пауза"
+        : entity.state === "off"
+        ? "Выключена"
+        : "Колонка";
+      const kicker = el.querySelector("[data-player-kicker]");
+      if (kicker && kicker.textContent !== kickerText) {
+        kicker.textContent = kickerText;
+      }
+      const playButton = el.querySelector("[data-player-play]");
+      const playIcon = playButton ? playButton.querySelector("ha-icon") : null;
+      if (playIcon) {
+        const icon = playing ? "mdi:pause" : "mdi:play";
+        if (playIcon.getAttribute("icon") !== icon) {
+          playIcon.setAttribute("icon", icon);
+        }
+      }
+      if (playButton) playButton.title = playing ? "Пауза" : "Играть";
+      const powerButton = el.querySelector("[data-player-power]");
+      if (powerButton) {
+        powerButton.classList.toggle("on", entity.state !== "off");
+      }
       const duration = Number(attrs.media_duration) || 0;
       const position = this._currentPosition(entity);
       const seek = el.querySelector("[data-player-seek]");
       if (seek) {
         seek.max = duration;
         seek.disabled = !duration;
-        if (root.activeElement !== seek) seek.value = position;
+        if (root.activeElement !== seek) {
+          const next = Math.min(position, duration || position);
+          if (Math.abs(Number(seek.value) - next) > 0.15) seek.value = next;
+        }
       }
+      const currentText = this._formatTime(position);
       const current = el.querySelector("[data-player-current]");
-      if (current) current.textContent = this._formatTime(position);
+      if (current && current.textContent !== currentText) {
+        current.textContent = currentText;
+      }
+      const totalText = this._formatTime(duration);
       const total = el.querySelector("[data-player-duration]");
-      if (total) total.textContent = this._formatTime(duration);
+      if (total && total.textContent !== totalText) {
+        total.textContent = totalText;
+      }
       const volume =
         attrs.volume_level !== undefined && attrs.volume_level !== null
           ? Math.round(Number(attrs.volume_level) * 100)
           : 0;
       const volumeInput = el.querySelector("[data-player-volume]");
       if (volumeInput && root.activeElement !== volumeInput) {
-        volumeInput.value = volume;
+        if (Number(volumeInput.value) !== volume) volumeInput.value = volume;
       }
       const volumeLabel = el.querySelector("[data-player-volume-label]");
-      if (volumeLabel) volumeLabel.textContent = `${volume}%`;
+      const volumeText = `${volume}%`;
+      if (volumeLabel && volumeLabel.textContent !== volumeText) {
+        volumeLabel.textContent = volumeText;
+      }
       const muted = Boolean(attrs.is_volume_muted) || volume === 0;
       const muteButton = el.querySelector("[data-player-mute]");
       if (muteButton) {
-        muteButton.title = muted ? "Включить звук" : "Выключить звук";
+        const muteTitle = muted ? "Включить звук" : "Выключить звук";
+        if (muteButton.title !== muteTitle) muteButton.title = muteTitle;
         const icon = muteButton.querySelector("ha-icon");
         if (icon) {
-          icon.setAttribute("icon", muted ? "mdi:volume-off" : "mdi:volume-high");
+          const iconName = muted ? "mdi:volume-off" : "mdi:volume-high";
+          if (icon.getAttribute("icon") !== iconName) {
+            icon.setAttribute("icon", iconName);
+          }
         }
       }
       const eq = el.querySelector("[data-eq-entity]");
       if (eq && speaker.equalizer_entity) {
         const eqState = this._hass.states[speaker.equalizer_entity];
-        if (eqState && root.activeElement !== eq) eq.value = eqState.state;
+        if (eqState && root.activeElement !== eq && eq.value !== eqState.state) {
+          eq.value = eqState.state;
+        }
       }
       if (el.classList.contains("full") && this._showLyrics) {
         const lyrics = this._lyricsFor(speaker);
-        const line = this._lyricLines(lyrics, position);
+        const line = this._lyricLines(lyrics, position + this._lyricsOffset);
         const currentLine = el.querySelector("[data-lyrics-current]");
         const nextLine = el.querySelector("[data-lyrics-next]");
-        if (currentLine) currentLine.textContent = line.current;
-        if (nextLine) nextLine.textContent = line.next;
+        if (currentLine && currentLine.textContent !== line.current) {
+          currentLine.textContent = line.current;
+        }
+        if (nextLine && nextLine.textContent !== line.next) {
+          nextLine.textContent = line.next;
+        }
       }
     });
     this._startTicker();
@@ -1263,7 +1350,7 @@ class YaHomeHubPanel extends HTMLElement {
       .callWS({ type: "yahome_hub/track_info", track_id: trackId })
       .then((info) => {
         this._trackCache[trackId] = info || {};
-        if (this._tab === "speakers") this._renderSoon();
+        if (this._tab === "speakers") this._updatePlayerDom();
       })
       .catch(() => {
         this._trackCache[trackId] = {};
@@ -1303,8 +1390,8 @@ class YaHomeHubPanel extends HTMLElement {
       clearInterval(this._ticker);
       this._ticker = null;
     }
-    if (this._tab !== "speakers" || !this._data) return;
-    this._ticker = setInterval(() => this._tick(), 1000);
+    if ((this._tab !== "speakers" && !this._fullPlayer) || !this._data) return;
+    this._ticker = setInterval(() => this._tick(), 250);
   }
 
   _tick() {
@@ -1318,11 +1405,15 @@ class YaHomeHubPanel extends HTMLElement {
       const position = this._currentPosition(entity);
       input.max = duration;
       input.disabled = !duration;
-      if (root.activeElement !== input) input.value = position;
+      if (root.activeElement !== input) {
+        const next = Math.min(position, duration || position);
+        if (Math.abs(Number(input.value) - next) > 0.15) input.value = next;
+      }
       const label = root.querySelector(
         `[data-current-for="${entityId}"]`
       );
-      if (label) label.textContent = this._formatTime(position);
+      const text = this._formatTime(position);
+      if (label && label.textContent !== text) label.textContent = text;
     });
     this._updateLyricsOnly();
   }
@@ -1339,35 +1430,64 @@ class YaHomeHubPanel extends HTMLElement {
     const entity = this._hass.states[speaker.entity_id];
     if (!entity) return;
     const lyrics = this._lyricsFor(speaker);
-    const line = this._lyricLines(lyrics, this._currentPosition(entity));
+    const line = this._lyricLines(
+      lyrics,
+      this._currentPosition(entity) + this._lyricsOffset
+    );
     const current = player.querySelector("[data-lyrics-current]");
     const next = player.querySelector("[data-lyrics-next]");
-    if (current) current.textContent = line.current;
-    if (next) next.textContent = line.next;
+    if (current && current.textContent !== line.current) {
+      current.textContent = line.current;
+    }
+    if (next && next.textContent !== line.next) {
+      next.textContent = line.next;
+    }
+  }
+
+  _setLyricsOffset(value) {
+    this._lyricsOffset = Math.max(
+      -5,
+      Math.min(5, Math.round(Number(value) * 10) / 10)
+    );
+    try {
+      localStorage.setItem(
+        "yahome-hub-lyrics-offset",
+        String(this._lyricsOffset)
+      );
+    } catch (err) {
+      /* ignore */
+    }
+    const label = this.shadowRoot
+      ? this.shadowRoot.querySelector("[data-lyrics-offset-label]")
+      : null;
+    if (label) label.textContent = `${this._lyricsOffset.toFixed(1)} с`;
+    if (this._hass) {
+      this._hass
+        .callWS({
+          type: "yahome_hub/lyrics_offset",
+          offset: this._lyricsOffset,
+        })
+        .catch(() => {});
+    }
+    this._updatePlayerDom();
   }
 
   async _callService(domain, service, data) {
     if (!this._hass) return;
     try {
       await this._hass.callService(domain, service, data);
-      this._renderSoon();
     } catch (err) {
       this._showToast("Ошибка команды: " + this._message(err));
     }
   }
 
-  _renderSoon() {
-    clearTimeout(this._stateTimer);
-    this._stateTimer = setTimeout(() => this._render(), 350);
-  }
-
   _attachEvents() {
     const root = this.shadowRoot;
     if (!root) return;
-    root.querySelectorAll("[data-expand-player]").forEach((el) => {
+    root.querySelectorAll("[data-open-player]").forEach((el) => {
       el.addEventListener("click", (event) => {
         event.stopPropagation();
-        this._fullPlayer = el.getAttribute("data-expand-player");
+        this._fullPlayer = el.getAttribute("data-open-player");
         this._showLyrics = true;
         this._render();
       });
@@ -1464,6 +1584,12 @@ class YaHomeHubPanel extends HTMLElement {
         });
       });
     });
+    root.querySelectorAll("[data-lyrics-offset]").forEach((el) => {
+      el.addEventListener("click", () => {
+        const delta = Number(el.getAttribute("data-lyrics-offset")) || 0;
+        this._setLyricsOffset(this._lyricsOffset + delta);
+      });
+    });
     root.querySelectorAll("[data-volume-entity]").forEach((el) => {
       el.addEventListener("input", () => {
         const label = root.querySelector(
@@ -1492,6 +1618,9 @@ class YaHomeHubPanel extends HTMLElement {
         const action = el.getAttribute("data-action");
         if (action === "refresh") this._refresh();
         if (action === "export") this._export();
+        if (action === "demo") {
+          window.open("/yahome_hub/integrations-demo.html", "_blank");
+        }
         if (action === "back") {
           this._selected = null;
           this._render();
@@ -1997,6 +2126,24 @@ class YaHomeHubPanel extends HTMLElement {
         padding: 0; border: 0; background: none; color: inherit; cursor: pointer;
       }
       .volume-toggle:hover { color: var(--primary-color, #5b6cff); }
+      .lyrics-sync {
+        display: flex; align-items: center; justify-content: center; gap: 8px;
+        margin-top: 10px; color: var(--secondary-text-color, #667085);
+        font-size: 12px; flex-wrap: wrap;
+      }
+      .lyrics-sync b {
+        min-width: 48px; text-align: center;
+        color: var(--primary-text-color, #101828); font-weight: 600;
+      }
+      .sync-btn {
+        min-width: 46px; height: 28px; padding: 0 8px; border-radius: 9px;
+        border: 1px solid var(--divider-color, #e4e7ec);
+        background: transparent; color: inherit; cursor: pointer; font-size: 11px;
+      }
+      .sync-btn:hover {
+        border-color: var(--primary-color, #5b6cff);
+        color: var(--primary-color, #5b6cff);
+      }
       .eq-select { height: 36px; max-width: 165px; font-size: 12px; }
       .compact-speakers { margin-top: 2px; }
       .player.compact { display: flex; align-items: center; gap: 14px; padding: 14px; }
