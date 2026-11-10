@@ -50,6 +50,22 @@ class YaHomeHubPanel extends HTMLElement {
     this._fullPlayer = null;
     this._showLyrics = true;
     this._tickCount = 0;
+    this._quickDevice = null;
+    this._viewFilter = "all";
+    this._favorites = [];
+    try {
+      const stored = JSON.parse(
+        localStorage.getItem("yahome-hub-favorites") || "[]"
+      );
+      if (Array.isArray(stored)) {
+        this._favorites = stored.filter((id) => typeof id === "string");
+      }
+    } catch (err) {
+      this._favorites = [];
+    }
+    this._beatTimer = null;
+    this._beatLastLabel = 0;
+    this._beatAnchors = {};
     this._lyricsOffset = 0;
     try {
       const stored = Number(localStorage.getItem("yahome-hub-lyrics-offset"));
@@ -101,6 +117,10 @@ class YaHomeHubPanel extends HTMLElement {
       clearInterval(this._ticker);
       this._ticker = null;
     }
+    if (this._beatTimer) {
+      clearInterval(this._beatTimer);
+      this._beatTimer = null;
+    }
     if (this._stateTimer) {
       clearTimeout(this._stateTimer);
       this._stateTimer = null;
@@ -138,12 +158,17 @@ class YaHomeHubPanel extends HTMLElement {
       !entityId ||
       (!entityId.startsWith("media_player.") &&
         !entityId.startsWith("select.") &&
-        !entityId.startsWith("camera."))
+        !entityId.startsWith("camera.") &&
+        !entityId.startsWith("switch.") &&
+        !entityId.startsWith("light."))
     ) {
       return;
     }
     clearTimeout(this._stateTimer);
-    this._stateTimer = setTimeout(() => this._updatePlayerDom(), 180);
+    this._stateTimer = setTimeout(() => {
+      this._updatePlayerDom();
+      this._syncExtras();
+    }, 180);
   }
 
   async _load(silent = false) {
@@ -406,6 +431,7 @@ class YaHomeHubPanel extends HTMLElement {
         (this._room === "none" && !device.room_name) ||
         device.room_name === this._room;
       if (!roomOk) return false;
+      if (!this._matchesViewFilter(device)) return false;
       if (!query) return true;
       return (
         device.name.toLowerCase().includes(query) ||
@@ -413,6 +439,69 @@ class YaHomeHubPanel extends HTMLElement {
         (device.room_name || "").toLowerCase().includes(query)
       );
     });
+  }
+
+  _matchesViewFilter(device) {
+    const filter = this._viewFilter;
+    if (!filter || filter === "all") return true;
+    if (filter === "online") return Boolean(device.online);
+    if (filter === "offline") return !device.online;
+    const domain = device.primary_domain || "";
+    const type = (device.type || "").toLowerCase();
+    if (filter === "light") {
+      return (
+        domain === "light" ||
+        domain === "cover" ||
+        /light|lamp|strip|sensor_switch/.test(type)
+      );
+    }
+    if (filter === "climate") {
+      return (
+        domain === "climate" ||
+        domain === "fan" ||
+        domain === "humidifier" ||
+        /climate|conditioner|heater|humidifier|fan/.test(type)
+      );
+    }
+    if (filter === "media") {
+      return domain === "media_player" || /media|tv|speaker/.test(type);
+    }
+    if (filter === "sensors") {
+      return (
+        domain === "sensor" ||
+        domain === "binary_sensor" ||
+        domain === "camera"
+      );
+    }
+    if (filter === "switches") {
+      return domain === "switch" || domain === "vacuum";
+    }
+    return true;
+  }
+
+  _filterCounts(devices) {
+    return {
+      all: devices.length,
+      online: devices.filter((device) => device.online).length,
+      light: devices.filter((device) => this._matchesViewFilterFor(device, "light"))
+        .length,
+      climate: devices.filter((device) =>
+        this._matchesViewFilterFor(device, "climate")
+      ).length,
+      media: devices.filter((device) => this._matchesViewFilterFor(device, "media"))
+        .length,
+      sensors: devices.filter((device) =>
+        this._matchesViewFilterFor(device, "sensors")
+      ).length,
+    };
+  }
+
+  _matchesViewFilterFor(device, filter) {
+    const previous = this._viewFilter;
+    this._viewFilter = filter;
+    const result = this._matchesViewFilter(device);
+    this._viewFilter = previous;
+    return result;
   }
 
   _render() {
@@ -438,17 +527,58 @@ class YaHomeHubPanel extends HTMLElement {
               : this._renderTabContent(data, devices)
             : ""
         }
-        ${
-          data && !selected && this._tab === "devices"
-            ? this._renderScenarios(data.scenarios)
-            : ""
-        }
         ${this._toast ? `<div class="toast">${this._esc(this._toast)}</div>` : ""}
       </div>
+      ${data ? this._renderQuickSheet(data) : ""}
       ${data && this._fullPlayer ? this._renderFullPlayer(data) : ""}
     `;
     this._attachEvents();
     this._startTicker();
+    this._startBeatClock();
+  }
+
+  _renderSpeakerExtras(speaker, entity) {
+    const attrs = entity.attributes || {};
+    const hdmiSupported = Boolean(speaker.hdmi_supported);
+    const ledSupported = Boolean(speaker.led_supported);
+    if (!hdmiSupported && !ledSupported) return "";
+    const source = attrs.source || "Станция";
+    const autoEntity = speaker.led_auto_entity
+      ? this._hass.states[speaker.led_auto_entity]
+      : null;
+    const ledAuto = autoEntity ? autoEntity.state === "on" : true;
+    return `<div class="speaker-extras">
+      ${
+        hdmiSupported
+          ? `<div class="source-switch" title="Звук колонки">
+              <span>Звук</span>
+              <button class="${source !== "HDMI" ? "active" : ""}" data-source-select="${
+              speaker.id
+            }" data-entity="${this._esc(entity.entity_id)}" data-source="Станция">
+                <ha-icon icon="mdi:speaker"></ha-icon> Станция
+              </button>
+              <button class="${source === "HDMI" ? "active" : ""}" data-source-select="${
+              speaker.id
+            }" data-entity="${this._esc(entity.entity_id)}" data-source="HDMI">
+                <ha-icon icon="mdi:television-speaker"></ha-icon> HDMI
+              </button>
+            </div>`
+          : ""
+      }
+      ${
+        ledSupported
+          ? `<button class="extra-pill ${ledAuto ? "active" : ""}" data-led-auto="${
+              speaker.id
+            }" data-entity="${this._esc(
+              entity.entity_id
+            )}" data-auto-entity="${this._esc(
+              speaker.led_auto_entity || ""
+            )}" title="Автоматическая яркость подсветки">
+              <ha-icon icon="mdi:brightness-auto"></ha-icon> LED авто
+            </button>`
+          : ""
+      }
+    </div>`;
   }
 
   _renderFullPlayer(data) {
@@ -504,15 +634,17 @@ class YaHomeHubPanel extends HTMLElement {
       playing ? "playing" : ""
     } ${paused ? "paused" : ""}" data-player="${this._esc(
       speaker.id
-    )}" data-player-entity="${this._esc(entityId)}" ${
-      cover ? `style="--cover:url('${this._esc(cover)}')"` : ""
-    }>
+    )}" data-player-entity="${this._esc(entityId)}" style="--beat-dur:${(
+      60 / this._trackBpm(entity)
+    ).toFixed(3)}s;--beat:0;${
+      cover ? `--cover:url('${this._esc(cover)}')` : ""
+    }">
       <div class="full-bg"></div>
       <div class="full-shade"></div>
       <div class="full-content">
         <header class="full-header">
           <div class="full-title">
-            <span class="full-kicker" data-player-kicker>${kicker}</span>
+            <span class="full-kicker" data-player-kicker><span class="beat-dot" data-beat-dot></span>${kicker}</span>
             <h2 data-player-title>${this._esc(title)}</h2>
             <p data-player-meta>${this._esc(artist)}${
       album ? ` · ${this._esc(album)}` : ""
@@ -564,6 +696,11 @@ class YaHomeHubPanel extends HTMLElement {
             </div>
           </div>
           <div class="full-side">
+            <div class="beat-strip">
+              <span class="beat-dot" data-beat-dot></span>
+              <b data-bpm-label>${this._trackBpm(entity)} BPM</b>
+              <span>ритм-синхронизация</span>
+            </div>
             <div class="full-viz">${this._renderViz(playing)}</div>
             <div class="viz-switch full-viz-switch">
               ${this._vizOptions()
@@ -592,6 +729,29 @@ class YaHomeHubPanel extends HTMLElement {
                   attrs.repeat === "one" ? "selected" : ""
                 }>Повторять трек</option>
               </select>
+            </div>
+            ${this._renderSpeakerExtras(speaker, entity)}
+            <div class="full-skin-row">
+              <span>Вид плеера</span>
+              <div class="full-skin-grid">${[
+                [1, "Классика"],
+                [2, "Полночь"],
+                [3, "Винил"],
+                [4, "Стекло"],
+                [5, "Неон"],
+                [6, "Минимал"],
+                [7, "Аврора"],
+                [8, "Студия"],
+              ]
+                .map(
+                  ([skin, name]) =>
+                    `<button class="skin-swatch skin-${skin} ${
+                      this._playerSkin === skin ? "active" : ""
+                    }" data-player-skin="${skin}" title="${name}">
+                      <span></span><small>${name}</small>
+                    </button>`
+                )
+                .join("")}</div>
             </div>
           </div>
         </div>
@@ -789,9 +949,6 @@ class YaHomeHubPanel extends HTMLElement {
           <button class="icon-btn" data-action="export" title="Экспорт базы">
             <ha-icon icon="mdi:database-export"></ha-icon>
           </button>
-          <button class="icon-btn" data-action="demo" title="Тест интеграций">
-            <ha-icon icon="mdi:flask-outline"></ha-icon>
-          </button>
         </div>
       </header>
       ${
@@ -814,6 +971,19 @@ class YaHomeHubPanel extends HTMLElement {
   _renderDashboard(devices) {
     const data = this._data;
     const rooms = (data.rooms || []).filter((room) => room.count > 0);
+    const allDevices = data.devices || [];
+    const counts = this._filterCounts(allDevices);
+    const filters = [
+      ["all", "Все", "mdi:view-grid-outline", counts.all],
+      ["online", "В сети", "mdi:wifi", counts.online],
+      ["light", "Свет", "mdi:lightbulb-group-outline", counts.light],
+      ["climate", "Климат", "mdi:thermostat", counts.climate],
+      ["media", "Медиа", "mdi:play-circle-outline", counts.media],
+      ["sensors", "Датчики", "mdi:gauge", counts.sensors],
+    ];
+    const favorites = allDevices.filter((device) =>
+      this._favorites.includes(device.id)
+    );
     return `
       <div class="toolbar">
         <div class="search">
@@ -821,9 +991,24 @@ class YaHomeHubPanel extends HTMLElement {
           <input id="search" type="search" placeholder="Поиск устройства…" value="${this._esc(
             this._query
           )}" />
+          <span class="search-count">${devices.length}</span>
+        </div>
+        <div class="quick-filters">
+          ${filters
+            .map(
+              ([id, label, icon, count]) =>
+                `<button class="filter-pill ${
+                  this._viewFilter === id ? "active" : ""
+                }" data-view-filter="${id}">
+                  <ha-icon icon="${icon}"></ha-icon>
+                  <span>${label}</span>
+                  <b>${count}</b>
+                </button>`
+            )
+            .join("")}
         </div>
         <div class="chips">
-          <button class="chip ${this._room === "all" ? "active" : ""}" data-room="all">Все</button>
+          <button class="chip ${this._room === "all" ? "active" : ""}" data-room="all">Все комнаты</button>
           ${rooms
             .map(
               (room) =>
@@ -839,6 +1024,12 @@ class YaHomeHubPanel extends HTMLElement {
           }" data-room="none">Без комнаты</button>
         </div>
       </div>
+      ${this._renderScenesStrip(data.scenarios)}
+      ${
+        this._room === "all" && !this._query.trim() && favorites.length
+          ? this._renderFavorites(favorites)
+          : ""
+      }
       <div class="grid">
         ${devices.map((device) => this._renderCard(device)).join("")}
       </div>
@@ -850,35 +1041,241 @@ class YaHomeHubPanel extends HTMLElement {
     `;
   }
 
+  _renderScenesStrip(scenarios) {
+    if (!scenarios || !scenarios.length) return "";
+    return `<section class="scenes-strip">
+      <div class="section-title">
+        <div><h3>Сценарии</h3><p class="muted">Быстрый запуск одним касанием</p></div>
+      </div>
+      <div class="scenes-row">${scenarios
+        .map(
+          (scenario) =>
+            `<button class="scene-pill" data-scenario="${this._esc(
+              scenario.id
+            )}">
+              <span class="scene-icon"><ha-icon icon="mdi:play"></ha-icon></span>
+              <span>${this._esc(scenario.name)}</span>
+            </button>`
+        )
+        .join("")}</div>
+    </section>`;
+  }
+
+  _renderFavorites(devices) {
+    return `<section class="favorites-strip">
+      <div class="section-title">
+        <div><h3>Избранное</h3><p class="muted">Закреплённые устройства и быстрый доступ</p></div>
+      </div>
+      <div class="favorites-row">${devices
+        .map((device) => {
+          const color = this._deviceColor(device);
+          const on = this._isOn(device);
+          return `<button class="favorite-tile ${
+            on ? "on" : ""
+          }" data-device="${this._esc(device.id)}" style="--accent:${color}">
+            <span class="favorite-icon"><ha-icon icon="${this._esc(
+              device.icon || "mdi:home-automation"
+            )}"></ha-icon></span>
+            <span class="favorite-meta">
+              <b>${this._esc(device.name)}</b>
+              <small>${this._esc(this._stateText(device))}</small>
+            </span>
+            <span class="status ${device.online ? "online" : "offline"}"></span>
+          </button>`;
+        })
+        .join("")}</div>
+    </section>`;
+  }
+
   _renderCard(device) {
     const color = this._deviceColor(device);
     const on = this._isOn(device);
+    const favorite = this._favorites.includes(device.id);
+    const hasPower = device.capabilities.some(
+      (cap) => cap.type === "devices.capabilities.on_off"
+    );
     return `
-      <article class="card" data-device="${this._esc(device.id)}">
-        <div class="card-head">
-          <div class="device-icon" style="--accent:${color}">
-            <ha-icon icon="${this._esc(device.icon || "mdi:home-automation")}"></ha-icon>
-          </div>
-          <span class="status ${device.online ? "online" : "offline"}"></span>
+      <div class="card-shell ${favorite ? "is-favorite" : ""}" data-card-shell="${this._esc(
+      device.id
+    )}">
+        <div class="card-rail card-rail-left">
+          <button class="rail-btn ${favorite ? "active" : ""}" data-fav="${this._esc(
+      device.id
+    )}" title="${favorite ? "Убрать из избранного" : "В избранное"}">
+            <ha-icon icon="${favorite ? "mdi:star" : "mdi:star-outline"}"></ha-icon>
+            <span>${favorite ? "В избранном" : "Избранное"}</span>
+          </button>
         </div>
-        <h3>${this._esc(device.name)}</h3>
-        <p class="muted">${this._esc(device.type_label)} · ${this._esc(
-          device.room_name || "Без комнаты"
-        )}</p>
-        <div class="card-foot">
-          <span class="state">${this._esc(this._stateText(device))}</span>
+        <div class="card-rail card-rail-right">
+          <button class="rail-btn" data-quick="${this._esc(
+            device.id
+          )}" title="Быстрое управление">
+            <ha-icon icon="mdi:tune-variant"></ha-icon>
+            <span>Быстро</span>
+          </button>
           ${
-            device.capabilities.some(
-              (cap) => cap.type === "devices.capabilities.on_off"
-            )
-              ? `<button class="power ${on ? "on" : ""}" data-toggle="${
-                  device.id
-                }" title="Вкл/выкл"><ha-icon icon="mdi:power"></ha-icon></button>`
+            hasPower
+              ? `<button class="rail-btn rail-power ${
+                  on ? "active" : ""
+                }" data-toggle="${this._esc(device.id)}" title="Вкл/выкл">
+                  <ha-icon icon="mdi:power"></ha-icon><span>Питание</span>
+                </button>`
               : ""
           }
         </div>
-      </article>
+        <article class="card ${on ? "is-on" : ""} ${
+      favorite ? "favorite" : ""
+    }" data-device="${this._esc(device.id)}" data-card="${this._esc(
+      device.id
+    )}">
+          <div class="card-glow"></div>
+          <div class="card-head">
+            <div class="device-icon" style="--accent:${color}">
+              <ha-icon icon="${this._esc(device.icon || "mdi:home-automation")}"></ha-icon>
+            </div>
+            <div class="card-head-right">
+              ${
+                favorite
+                  ? `<ha-icon class="fav-mark" icon="mdi:star"></ha-icon>`
+                  : ""
+              }
+              <span class="status ${device.online ? "online" : "offline"}"></span>
+            </div>
+          </div>
+          <h3>${this._esc(device.name)}</h3>
+          <p class="muted">${this._esc(device.type_label)} · ${this._esc(
+      device.room_name || "Без комнаты"
+    )}</p>
+          ${this._renderMiniControl(device)}
+          <div class="card-foot">
+            <span class="state">${this._esc(this._stateText(device))}</span>
+            <div class="card-actions-row">
+              <button class="mini-action" data-quick="${this._esc(
+                device.id
+              )}" title="Быстрое управление"><ha-icon icon="mdi:tune-variant"></ha-icon></button>
+              ${
+                hasPower
+                  ? `<button class="power ${on ? "on" : ""}" data-toggle="${
+                      device.id
+                    }" title="Вкл/выкл"><ha-icon icon="mdi:power"></ha-icon></button>`
+                  : ""
+              }
+            </div>
+          </div>
+        </article>
+      </div>
     `;
+  }
+
+  _renderMiniControl(device) {
+    const caps = device.capabilities || [];
+    const brightness = caps.find(
+      (cap) =>
+        cap.kind === "range" &&
+        ["brightness", "brightness_percent"].includes(cap.instance)
+    );
+    if (brightness) {
+      const value = Number(brightness.value);
+      const min = Number(brightness.min ?? 0);
+      const max = Number(brightness.max ?? 100);
+      const safeValue = Number.isFinite(value)
+        ? Math.max(min, Math.min(max, value))
+        : min;
+      return `<div class="mini-slider">
+        <ha-icon icon="mdi:brightness-6"></ha-icon>
+        <input type="range" min="${min}" max="${max}" step="${
+        brightness.step || 1
+      }" value="${safeValue}" data-mini-brightness="${this._esc(
+        device.id
+      )}" data-mini-type="${this._esc(brightness.type)}" data-mini-instance="${this._esc(
+        brightness.instance
+      )}" data-mini-unit="${this._esc(brightness.unit || "")}" />
+        <span>${Math.round(safeValue)}${this._esc(
+        brightness.unit || "%"
+      )}</span>
+      </div>`;
+    }
+    const target = caps.find(
+      (cap) =>
+        cap.kind === "range" &&
+        ["temperature", "target_temperature"].includes(cap.instance)
+    );
+    if (target) {
+      return `<div class="mini-chip"><ha-icon icon="mdi:thermometer"></ha-icon>${
+        target.value ?? "—"
+      }${this._esc(target.unit || "°C")}</div>`;
+    }
+    const sensor = (device.properties || []).find(
+      (prop) => prop.instance && prop.value !== undefined
+    );
+    if (sensor) {
+      return `<div class="mini-chip"><ha-icon icon="mdi:gauge"></ha-icon>${
+        sensor.value
+      }${this._esc(sensor.unit || "")}</div>`;
+    }
+    return "";
+  }
+
+  _renderQuickSheet(data) {
+    if (!this._quickDevice) return "";
+    const device = (data.devices || []).find(
+      (item) => item.id === this._quickDevice
+    );
+    if (!device) return "";
+    const color = this._deviceColor(device);
+    const on = this._isOn(device);
+    const favorite = this._favorites.includes(device.id);
+    const hasPower = device.capabilities.some(
+      (cap) => cap.type === "devices.capabilities.on_off"
+    );
+    return `<div class="sheet-backdrop" data-close-sheet>
+      <section class="quick-sheet" role="dialog" aria-modal="true">
+        <div class="sheet-grabber"></div>
+        <header class="sheet-head">
+          <div class="device-icon big" style="--accent:${color}">
+            <ha-icon icon="${this._esc(device.icon || "mdi:home-automation")}"></ha-icon>
+          </div>
+          <div class="sheet-title">
+            <h2>${this._esc(device.name)}</h2>
+            <p class="muted">${this._esc(device.type_label)} · ${this._esc(
+      device.room_name || "Без комнаты"
+    )} · ${device.online ? "в сети" : "не в сети"}</p>
+          </div>
+          <button class="sheet-close" data-close-sheet title="Закрыть"><ha-icon icon="mdi:close"></ha-icon></button>
+        </header>
+        <div class="sheet-quick-actions">
+          ${
+            hasPower
+              ? `<button class="sheet-power ${on ? "on" : ""}" data-toggle="${this._esc(
+                  device.id
+                )}"><ha-icon icon="mdi:power"></ha-icon><span>${
+                  on ? "Выключить" : "Включить"
+                }</span></button>`
+              : `<div class="sheet-power ghost"><ha-icon icon="mdi:information-outline"></ha-icon><span>Только датчик</span></div>`
+          }
+          <button class="sheet-action ${favorite ? "active" : ""}" data-fav="${this._esc(
+      device.id
+    )}"><ha-icon icon="${
+      favorite ? "mdi:star" : "mdi:star-outline"
+    }"></ha-icon><span>${favorite ? "В избранном" : "В избранное"}</span></button>
+          <button class="sheet-action" data-sheet-open="${this._esc(
+            device.id
+          )}"><ha-icon icon="mdi:arrow-expand"></ha-icon><span>Открыть</span></button>
+        </div>
+        ${
+          device.capabilities.length
+            ? `<div class="sheet-section"><h3>Управление</h3><div class="controls">${device.capabilities
+                .map((cap) => this._renderControl(device, cap))
+                .join("")}</div></div>`
+            : ""
+        }
+        ${
+          (device.properties || []).length
+            ? `<div class="sheet-section">${this._renderProperties(device)}</div>`
+            : ""
+        }
+      </section>
+    </div>`;
   }
 
   _renderDetail(device) {
@@ -1199,26 +1596,6 @@ class YaHomeHubPanel extends HTMLElement {
         target,
         entityId
       )}</div>
-      <div class="skin-picker">
-        <span>Вид плеера: <b>${this._skinName(this._playerSkin)}</b></span>
-        ${[
-          [1, "Классика"],
-          [2, "Полночь"],
-          [3, "Винил"],
-          [4, "Стекло"],
-          [5, "Неон"],
-          [6, "Минимал"],
-          [7, "Аврора"],
-          [8, "Студия"],
-        ]
-          .map(
-            ([skin, name]) =>
-              `<button class="${
-                this._playerSkin === skin ? "active" : ""
-              }" data-music-action="skin" data-skin="${skin}" title="${name}">${skin}</button>`
-          )
-          .join("")}
-      </div>
     </section>`;
   }
 
@@ -1484,6 +1861,39 @@ class YaHomeHubPanel extends HTMLElement {
       </div>`;
   }
 
+  _renderLedAutoButton(speaker, entityId) {
+    const autoEntity = speaker.led_auto_entity
+      ? this._hass.states[speaker.led_auto_entity]
+      : null;
+    const active = autoEntity ? autoEntity.state === "on" : true;
+    return `<button class="auto-mode-btn ${active ? "active" : ""}" data-led-auto="${
+      speaker.id
+    }" data-entity="${this._esc(entityId)}" data-auto-entity="${this._esc(
+      speaker.led_auto_entity || ""
+    )}">
+      <ha-icon icon="mdi:brightness-auto"></ha-icon>
+      <span>Авто-яркость</span>
+      <b>${active ? "вкл" : "выкл"}</b>
+    </button>`;
+  }
+
+  _renderSourceButtons(speaker, entityId) {
+    const entity = this._hass.states[entityId];
+    const source = entity?.attributes?.source || "Станция";
+    return `<div class="source-switch wide">
+      <button class="${source !== "HDMI" ? "active" : ""}" data-source-select="${
+      speaker.id
+    }" data-entity="${this._esc(entityId)}" data-source="Станция">
+        <ha-icon icon="mdi:speaker"></ha-icon> Станция
+      </button>
+      <button class="${source === "HDMI" ? "active" : ""}" data-source-select="${
+      speaker.id
+    }" data-entity="${this._esc(entityId)}" data-source="HDMI">
+        <ha-icon icon="mdi:television-speaker"></ha-icon> HDMI
+      </button>
+    </div>`;
+  }
+
   _renderSpeakerControlsCard(speaker) {
     const entityId = speaker.entity_id;
     const entity = this._hass.states[entityId];
@@ -1497,6 +1907,16 @@ class YaHomeHubPanel extends HTMLElement {
       : null;
     const token = this._hass.auth?.data?.access_token || "";
     const sensors = speaker.sensors || [];
+    const ledState = speaker.led_entity
+      ? this._hass.states[speaker.led_entity]
+      : null;
+    const ledValue = ledState?.attributes?.brightness
+      ? Math.round((Number(ledState.attributes.brightness) / 255) * 100)
+      : 60;
+    const screenState = speaker.screen_entity
+      ? this._hass.states[speaker.screen_entity]
+      : null;
+    const screenValue = screenState?.state === "Эквалайзер" ? "equalizer" : "clock";
     return `<article class="speaker-control">
       <div class="speaker-control-head">
         <div class="device-icon" style="--accent:#5b6cff"><ha-icon icon="mdi:speaker-wireless"></ha-icon></div>
@@ -1524,15 +1944,29 @@ class YaHomeHubPanel extends HTMLElement {
           speaker.led_supported
             ? `<div class="control-block">
                 <h4>Подсветка</h4>
-                <label>Яркость <input type="range" min="0" max="100" value="60" data-led-brightness="${this._esc(
+                ${this._renderLedAutoButton(speaker, entityId)}
+                <label>Яркость <input type="range" min="0" max="100" value="${ledValue}" data-led-brightness="${this._esc(
                   speaker.id
                 )}"></label>
                 <label>Экран <select data-led-visualization="${this._esc(
                   speaker.id
-                )}"><option value="clock">Часы</option><option value="equalizer">Эквалайзер</option></select></label>
+                )}"><option value="clock" ${
+                  screenValue === "clock" ? "selected" : ""
+                }>Часы</option><option value="equalizer" ${
+                  screenValue === "equalizer" ? "selected" : ""
+                }>Эквалайзер</option></select></label>
                 <button class="action-btn" data-led-apply="${this._esc(
                   speaker.id
                 )}" data-entity="${this._esc(entityId)}">Применить</button>
+              </div>`
+            : ""
+        }
+        ${
+          speaker.hdmi_supported
+            ? `<div class="control-block">
+                <h4>Звук HDMI</h4>
+                <p class="muted">Выведите звук видео на телевизор. Музыка и голос Алисы останутся на колонке.</p>
+                ${this._renderSourceButtons(speaker, entityId)}
               </div>`
             : ""
         }
@@ -1785,11 +2219,11 @@ class YaHomeHubPanel extends HTMLElement {
       playing ? "playing" : ""
     } ${paused ? "paused" : ""}" data-player="${this._esc(
       speaker.id
-    )}" data-player-entity="${this._esc(
-      entityId
-    )}" ${
-      cover ? `style="--cover:url('${this._esc(cover)}')"` : ""
-    }>
+    )}" data-player-entity="${this._esc(entityId)}" style="--beat-dur:${(
+      60 / this._trackBpm(entity)
+    ).toFixed(3)}s;--beat:0;${
+      cover ? `--cover:url('${this._esc(cover)}')` : ""
+    }">
         <div class="player-bg"></div>
         <div class="player-glow"></div>
         <div class="player-content">
@@ -1824,7 +2258,7 @@ class YaHomeHubPanel extends HTMLElement {
               }
             </div>
             <div class="player-meta">
-              <span class="player-kicker" data-player-kicker>${
+              <span class="player-kicker" data-player-kicker><span class="beat-dot" data-beat-dot></span>${
                 playing
                   ? "Сейчас играет"
                   : paused
@@ -1897,6 +2331,7 @@ class YaHomeHubPanel extends HTMLElement {
               )}" data-player-volume-label>${volume}%</span>
             </div>
           </div>
+          ${this._renderSpeakerExtras(speaker, entity)}
           ${
             full && this._showLyrics
               ? `<div class="lyrics-sync">
@@ -2118,7 +2553,31 @@ class YaHomeHubPanel extends HTMLElement {
         }
       }
     });
+    this._syncExtras();
     if (restartTicker) this._startTicker();
+  }
+
+  _syncExtras() {
+    const root = this.shadowRoot;
+    if (!root || !this._hass) return;
+    root.querySelectorAll("[data-source-select]").forEach((button) => {
+      const state = this._hass.states[button.getAttribute("data-entity")];
+      const source = state?.attributes?.source;
+      if (!source) return;
+      button.classList.toggle(
+        "active",
+        source === button.getAttribute("data-source")
+      );
+    });
+    root.querySelectorAll("[data-led-auto]").forEach((button) => {
+      const autoEntity = button.getAttribute("data-auto-entity");
+      const state = autoEntity ? this._hass.states[autoEntity] : null;
+      if (!state) return;
+      const active = state.state === "on";
+      button.classList.toggle("active", active);
+      const label = button.querySelector("b");
+      if (label) label.textContent = active ? "вкл" : "выкл";
+    });
   }
 
   _renderViz(playing) {
@@ -2252,6 +2711,104 @@ class YaHomeHubPanel extends HTMLElement {
       lesshigh: "Меньше высоких",
     };
     return labels[value] || value;
+  }
+
+  _trackBpm(entity) {
+    const trackId = String(entity?.attributes?.media_content_id || "");
+    const info = /^\d+$/.test(trackId) ? this._trackInfo(trackId) : null;
+    const direct = Number(
+      info?.bpm || info?.tempo || info?.beats_per_minute || 0
+    );
+    if (Number.isFinite(direct) && direct >= 50 && direct <= 200) {
+      return Math.round(direct);
+    }
+    if (!trackId) return 120;
+    let hash = 0;
+    for (let i = 0; i < trackId.length; i += 1) {
+      hash = (hash * 31 + trackId.charCodeAt(i)) >>> 0;
+    }
+    const tempos = [96, 100, 104, 108, 112, 116, 120, 124, 128, 132];
+    return tempos[hash % tempos.length];
+  }
+
+  _startBeatClock() {
+    if (this._beatTimer) return;
+    const tick = () => {
+      const timestamp = performance.now();
+      const root = this.shadowRoot;
+      if (!root || !this._hass) return;
+      const players = root.querySelectorAll(".player[data-player-entity]");
+      if (!players.length) return;
+      players.forEach((player) => {
+        const entityId = player.getAttribute("data-player-entity");
+        const entity = this._hass.states[entityId];
+        if (!entity) return;
+        const bpm = this._trackBpm(entity);
+        const beatDuration = 60 / bpm;
+        const playing = entity.state === "playing";
+        const now = timestamp / 1000;
+        const trackId = String(entity.attributes.media_content_id || "");
+        const position = Math.max(0, this._currentPosition(entity));
+        let anchor = this._beatAnchors[entityId];
+        let beat = 0;
+        if (playing) {
+          if (
+            !anchor ||
+            anchor.trackId !== trackId ||
+            anchor.position === null
+          ) {
+            anchor = {
+              trackId,
+              start: now,
+              position,
+              updated: now,
+            };
+            this._beatAnchors[entityId] = anchor;
+          }
+          const expected = anchor.position + (now - anchor.start);
+          const updated = entity.attributes.media_position_updated_at;
+          const updatedAt = updated ? new Date(updated).getTime() : 0;
+          const stale = !updatedAt || Date.now() - updatedAt > 8000;
+          const duration = Number(entity.attributes.media_duration) || 0;
+          const atEnd = duration > 0 && position >= duration - 1;
+          if (!stale && !atEnd && Math.abs(expected - position) > 3) {
+            anchor.start = now;
+            anchor.position = position;
+          }
+          beat = (anchor.position + (now - anchor.start)) / beatDuration;
+        } else {
+          delete this._beatAnchors[entityId];
+        }
+        const phase = playing ? beat % 1 : 0;
+        const pulse = playing ? Math.pow(1 - phase, 2.2) : 0;
+        const bar = playing ? Math.floor(beat) % 4 : -1;
+        player.style.setProperty("--beat-dur", `${beatDuration.toFixed(3)}s`);
+        player.style.setProperty("--beat", pulse.toFixed(3));
+        player.style.setProperty("--beat-phase", phase.toFixed(3));
+        player.style.setProperty("--beat-bpm", String(bpm));
+        player.classList.toggle(
+          "beat-accent",
+          playing && bar === 0 && phase < 0.2
+        );
+        if (timestamp - this._beatLastLabel > 260) {
+          player.querySelectorAll("[data-bpm-label]").forEach((label) => {
+            const text = `${bpm} BPM`;
+            if (label.textContent !== text) label.textContent = text;
+          });
+          player.querySelectorAll("[data-beat-dot]").forEach((dot) => {
+            dot.style.opacity = playing
+              ? String(0.35 + pulse * 0.65)
+              : "0.25";
+            dot.style.transform = `scale(${1 + pulse * 0.55})`;
+          });
+        }
+      });
+      if (timestamp - this._beatLastLabel > 260) {
+        this._beatLastLabel = timestamp;
+      }
+    };
+    this._beatTimer = setInterval(tick, 50);
+    tick();
   }
 
   _startTicker() {
@@ -2725,6 +3282,11 @@ class YaHomeHubPanel extends HTMLElement {
     const root = this.shadowRoot;
     if (!root) return;
     root.addEventListener("click", (event) => this._onMusicAction(event));
+    root.addEventListener("click", (event) => {
+      if (!event.target.closest("[data-card-shell]")) {
+        this._closeCardSwipes(null);
+      }
+    });
     root.addEventListener("change", (event) => this._onMusicChange(event));
     root.addEventListener("keydown", (event) => this._onMusicKeydown(event));
     root.querySelectorAll("[data-open-player]").forEach((el) => {
@@ -3003,9 +3565,6 @@ class YaHomeHubPanel extends HTMLElement {
         const action = el.getAttribute("data-action");
         if (action === "refresh") this._refresh();
         if (action === "export") this._export();
-        if (action === "demo") {
-          window.open("/yahome_hub/integrations-demo.html", "_blank");
-        }
         if (action === "back") {
           this._selected = null;
           this._render();
@@ -3016,6 +3575,127 @@ class YaHomeHubPanel extends HTMLElement {
       el.addEventListener("click", () => {
         this._room = el.getAttribute("data-room");
         this._render();
+      });
+    });
+    root.querySelectorAll("[data-view-filter]").forEach((el) => {
+      el.addEventListener("click", () => {
+        this._viewFilter = el.getAttribute("data-view-filter") || "all";
+        this._render();
+      });
+    });
+    root.querySelectorAll("[data-fav]").forEach((el) => {
+      el.addEventListener("click", (event) => {
+        event.stopPropagation();
+        this._toggleFavorite(el.getAttribute("data-fav"));
+      });
+    });
+    root.querySelectorAll("[data-quick]").forEach((el) => {
+      el.addEventListener("click", (event) => {
+        event.stopPropagation();
+        this._openQuickSheet(el.getAttribute("data-quick"));
+      });
+    });
+    root.querySelectorAll("[data-close-sheet]").forEach((el) => {
+      el.addEventListener("click", (event) => {
+        if (
+          event.target.closest(".quick-sheet") &&
+          !event.target.closest(".sheet-close")
+        ) {
+          return;
+        }
+        this._quickDevice = null;
+        this._render();
+      });
+    });
+    root.querySelectorAll("[data-sheet-open]").forEach((el) => {
+      el.addEventListener("click", () => {
+        this._selected = el.getAttribute("data-sheet-open");
+        this._quickDevice = null;
+        this._render();
+      });
+    });
+    root.querySelectorAll("[data-player-skin]").forEach((el) => {
+      el.addEventListener("click", (event) => {
+        event.stopPropagation();
+        this._setPlayerSkin(el.getAttribute("data-player-skin"));
+      });
+    });
+    root.querySelectorAll("[data-source-select]").forEach((el) => {
+      el.addEventListener("click", async (event) => {
+        event.stopPropagation();
+        const entityId = el.getAttribute("data-entity");
+        const source = el.getAttribute("data-source");
+        try {
+          await this._hass.callService("media_player", "select_source", {
+            entity_id: entityId,
+            source,
+          });
+          const group = el.parentElement;
+          group
+            ?.querySelectorAll("[data-source-select]")
+            .forEach((item) =>
+              item.classList.toggle("active", item === el)
+            );
+          this._showToast(
+            source === "HDMI" ? "Звук переключён на HDMI" : "Звук на колонке"
+          );
+        } catch (err) {
+          this._showToast("Ошибка HDMI: " + this._message(err));
+        }
+      });
+    });
+    root.querySelectorAll("[data-led-auto]").forEach((el) => {
+      el.addEventListener("click", async (event) => {
+        event.stopPropagation();
+        const autoEntity = el.getAttribute("data-auto-entity");
+        const entityId = el.getAttribute("data-entity");
+        const current = el.classList.contains("active");
+        try {
+          if (autoEntity) {
+            await this._hass.callService(
+              "switch",
+              current ? "turn_off" : "turn_on",
+              { entity_id: autoEntity }
+            );
+          } else {
+            await this._hass.callService("yahome_hub", "set_led", {
+              entity_id: entityId,
+              auto: !current,
+            });
+          }
+          el.classList.toggle("active", !current);
+          const label = el.querySelector("b");
+          if (label) label.textContent = current ? "выкл" : "вкл";
+          this._showToast(
+            current ? "Авто-яркость выключена" : "Авто-яркость включена"
+          );
+        } catch (err) {
+          this._showToast("Ошибка подсветки: " + this._message(err));
+        }
+      });
+    });
+    root.querySelectorAll("[data-mini-brightness]").forEach((el) => {
+      el.addEventListener("click", (event) => event.stopPropagation());
+      el.addEventListener("input", () => {
+        const label = el.parentElement?.querySelector("span");
+        if (label) {
+          label.textContent = `${el.value}${el.getAttribute("data-mini-unit") || "%"}`;
+        }
+      });
+      el.addEventListener("change", (event) => {
+        event.stopPropagation();
+        const device = this._data.devices.find(
+          (item) => item.id === el.getAttribute("data-mini-brightness")
+        );
+        if (!device) return;
+        this._action(
+          device,
+          {
+            type: el.getAttribute("data-mini-type"),
+            instance: el.getAttribute("data-mini-instance"),
+          },
+          Number(el.value)
+        );
       });
     });
     const search = root.querySelector("#search");
@@ -3155,14 +3835,186 @@ class YaHomeHubPanel extends HTMLElement {
     });
   }
 
+  _toggleFavorite(deviceId) {
+    if (!deviceId) return;
+    if (navigator.vibrate) navigator.vibrate(10);
+    const index = this._favorites.indexOf(deviceId);
+    if (index >= 0) {
+      this._favorites.splice(index, 1);
+      this._showToast("Удалено из избранного");
+    } else {
+      this._favorites.push(deviceId);
+      this._showToast("Добавлено в избранное");
+    }
+    try {
+      localStorage.setItem(
+        "yahome-hub-favorites",
+        JSON.stringify(this._favorites)
+      );
+    } catch (err) {
+      /* ignore */
+    }
+    this._render();
+  }
+
+  _openQuickSheet(deviceId) {
+    this._quickDevice = deviceId;
+    this._render();
+  }
+
+  _setPlayerSkin(value) {
+    this._playerSkin = Math.max(1, Math.min(8, Number(value) || 2));
+    try {
+      localStorage.setItem(
+        "yahome-hub-player-skin",
+        String(this._playerSkin)
+      );
+    } catch (err) {
+      /* ignore */
+    }
+    this._render();
+  }
+
   _attachCardEvents() {
     const root = this.shadowRoot;
     if (!root) return;
     root.querySelectorAll("[data-device]").forEach((el) => {
       el.addEventListener("click", (event) => {
-        if (event.target.closest("button")) return;
+        if (el._suppressClick) {
+          event.preventDefault();
+          event.stopPropagation();
+          return;
+        }
+        const action = event.target.closest("button, input, select, textarea, a");
+        if (
+          action &&
+          action !== el &&
+          !action.hasAttribute("data-device")
+        ) {
+          return;
+        }
+        if (action === el && el.tagName !== "BUTTON") return;
         this._selected = el.getAttribute("data-device");
+        this._quickDevice = null;
         this._render();
+      });
+    });
+    root.querySelectorAll("[data-card]").forEach((el) => {
+      if (el.dataset.gesturesReady === "1") return;
+      el.dataset.gesturesReady = "1";
+      el.addEventListener("pointerdown", (event) => {
+        if (event.pointerType === "mouse" && event.button !== 0) return;
+        if (event.target.closest("button, input, select, textarea, a")) return;
+        const shell = el.closest("[data-card-shell]");
+        if (!shell) return;
+        this._closeCardSwipes(shell);
+        const gesture = {
+          startX: event.clientX,
+          startY: event.clientY,
+          shell,
+          horizontal: false,
+          long: false,
+          timer: null,
+        };
+        el._gesture = gesture;
+        el._suppressClick = false;
+        try {
+          el.setPointerCapture(event.pointerId);
+        } catch (err) {
+          /* ignore */
+        }
+        gesture.timer = setTimeout(() => {
+          if (!el._gesture || el._gesture !== gesture) return;
+          gesture.long = true;
+          el._suppressClick = true;
+          el.style.transform = "";
+          el.classList.remove("dragging");
+          shell.classList.remove("swipe-left", "swipe-right");
+          if (navigator.vibrate) navigator.vibrate(12);
+          this._openQuickSheet(el.getAttribute("data-card"));
+        }, 520);
+      });
+      el.addEventListener("pointermove", (event) => {
+        const gesture = el._gesture;
+        if (!gesture) return;
+        const dx = event.clientX - gesture.startX;
+        const dy = event.clientY - gesture.startY;
+        if (Math.abs(dx) > 7 || Math.abs(dy) > 7) {
+          clearTimeout(gesture.timer);
+        }
+        if (Math.abs(dx) < Math.abs(dy) + 4) return;
+        gesture.horizontal = true;
+        gesture.dx = dx;
+        const shift = Math.max(-108, Math.min(108, dx));
+        el.classList.add("dragging");
+        el.style.transform = `translateX(${shift}px)`;
+        gesture.shell.classList.toggle("swipe-left", shift < -26);
+        gesture.shell.classList.toggle("swipe-right", shift > 26);
+        if (event.cancelable) event.preventDefault();
+      });
+      const finish = (event) => {
+        const gesture = el._gesture;
+        if (!gesture) return;
+        clearTimeout(gesture.timer);
+        el._gesture = null;
+        try {
+          el.releasePointerCapture(event.pointerId);
+        } catch (err) {
+          /* ignore */
+        }
+        el.classList.remove("dragging");
+        el.style.transform = "";
+        if (gesture.long) {
+          gesture.shell.classList.remove("swipe-left", "swipe-right");
+          return;
+        }
+        const dx = event.clientX - gesture.startX;
+        if (gesture.horizontal && dx > 58) {
+          gesture.shell.classList.remove("swipe-left", "swipe-right");
+          this._toggleFavorite(el.getAttribute("data-card"));
+          el._suppressClick = true;
+          setTimeout(() => {
+            el._suppressClick = false;
+          }, 350);
+          return;
+        }
+        if (gesture.horizontal && dx < -52) {
+          gesture.shell.classList.remove("swipe-right");
+          gesture.shell.classList.add("open-left");
+          el._suppressClick = true;
+          setTimeout(() => {
+            el._suppressClick = false;
+          }, 280);
+          return;
+        }
+        gesture.shell.classList.remove("swipe-left", "swipe-right");
+        if (gesture.horizontal) {
+          el._suppressClick = true;
+          setTimeout(() => {
+            el._suppressClick = false;
+          }, 220);
+        }
+      };
+      el.addEventListener("pointerup", finish);
+      el.addEventListener("pointercancel", (event) => {
+        const gesture = el._gesture;
+        if (!gesture) return;
+        clearTimeout(gesture.timer);
+        el._gesture = null;
+        try {
+          el.releasePointerCapture(event.pointerId);
+        } catch (err) {
+          /* ignore */
+        }
+        el.classList.remove("dragging");
+        el.style.transform = "";
+        gesture.shell.classList.remove("swipe-left", "swipe-right");
+      });
+    });
+    root.querySelectorAll("[data-card-shell]").forEach((shell) => {
+      shell.addEventListener("click", (event) => {
+        if (!event.target.closest(".card-rail")) return;
+        shell.classList.remove("open-left");
       });
     });
     root.querySelectorAll("[data-toggle]").forEach((el) => {
@@ -3172,12 +4024,21 @@ class YaHomeHubPanel extends HTMLElement {
           (item) => item.id === el.getAttribute("data-toggle")
         );
         if (!device) return;
+        if (navigator.vibrate) navigator.vibrate(8);
         this._action(
           device,
           { type: "devices.capabilities.on_off", instance: "on" },
           !this._isOn(device)
         );
       });
+    });
+  }
+
+  _closeCardSwipes(except) {
+    const root = this.shadowRoot;
+    if (!root) return;
+    root.querySelectorAll("[data-card-shell].open-left").forEach((shell) => {
+      if (shell !== except) shell.classList.remove("open-left");
     });
   }
 
@@ -4025,6 +4886,23 @@ class YaHomeHubPanel extends HTMLElement {
       .full-player.skin-6 .times { color: rgba(17,24,39,.65); }
       .full-player.skin-6 .lyrics-sync b { color: #111827; }
       .full-player.skin-6 .player-cover.big { border-radius: 6px; }
+      .full-player.skin-6 .beat-strip,
+      .full-player.skin-6 .beat-strip b,
+      .full-player.skin-6 .full-skin-row > span,
+      .full-player.skin-6 .skin-swatch,
+      .full-player.skin-6 .source-switch,
+      .full-player.skin-6 .source-switch button,
+      .full-player.skin-6 .extra-pill {
+        color: rgba(17,24,39,.66);
+        border-color: rgba(17,24,39,.16);
+        background: rgba(17,24,39,.04);
+      }
+      .full-player.skin-6 .skin-swatch.active,
+      .full-player.skin-6 .source-switch button.active,
+      .full-player.skin-6 .extra-pill.active {
+        color: #fff; background: linear-gradient(135deg, #111827, #6b7280);
+      }
+      .full-player.skin-6 .beat-dot { box-shadow: 0 0 0 4px rgba(17,24,39,.08), 0 0 12px rgba(17,24,39,.35); }
       .full-player.skin-7 {
         --skin-accent: #37d39a; --skin-accent-2: #6c7cff;
         --skin-text: #f2fff9; --skin-muted: rgba(242,255,249,.62);
@@ -4182,6 +5060,261 @@ class YaHomeHubPanel extends HTMLElement {
       .full-viz .viz-radial b { width: 16px; height: 16px; }
       .full-viz .viz-tunnel { perspective: 400px; }
       .full-viz .viz-blocks { gap: 5px; }
+      .quick-filters { display: flex; gap: 8px; overflow-x: auto; padding-bottom: 2px; }
+      .filter-pill {
+        display: inline-flex; align-items: center; gap: 7px; flex: none;
+        border: 1px solid var(--divider-color, #e4e7ec);
+        background: var(--card-background-color, #fff);
+        color: var(--secondary-text-color, #667085); border-radius: 12px;
+        padding: 8px 11px; font: inherit; font-size: 12px; cursor: pointer;
+        transition: transform .15s ease, border-color .15s ease, background .15s ease;
+      }
+      .filter-pill ha-icon { --mdc-icon-size: 17px; }
+      .filter-pill b {
+        min-width: 20px; height: 20px; padding: 0 6px; border-radius: 999px;
+        display: inline-grid; place-items: center; font-size: 10px;
+        background: var(--secondary-background-color, #f2f4f7);
+      }
+      .filter-pill:hover { transform: translateY(-1px); border-color: var(--primary-color, #5b6cff); }
+      .filter-pill.active {
+        background: linear-gradient(135deg, #5b6cff, #8f43ff 60%, #ff4f9a);
+        color: #fff; border-color: transparent;
+        box-shadow: 0 8px 18px rgba(91,108,255,.22);
+      }
+      .filter-pill.active b { background: rgba(255,255,255,.22); color: #fff; }
+      .search-count {
+        flex: none; min-width: 30px; height: 24px; padding: 0 8px;
+        border-radius: 999px; display: inline-grid; place-items: center;
+        background: var(--secondary-background-color, #f2f4f7);
+        color: var(--secondary-text-color, #667085); font-size: 11px; font-weight: 700;
+      }
+      .section-title {
+        display: flex; align-items: flex-end; justify-content: space-between;
+        gap: 12px; margin-bottom: 10px;
+      }
+      .section-title h3 { margin: 0 0 3px; font-size: 17px; }
+      .scenes-strip { margin: 4px 0 18px; }
+      .scenes-row { display: flex; gap: 9px; overflow-x: auto; padding-bottom: 4px; }
+      .scene-pill {
+        display: inline-flex; align-items: center; gap: 9px; flex: none;
+        border: 1px solid var(--divider-color, #e4e7ec); border-radius: 999px;
+        background: var(--card-background-color, #fff); color: var(--primary-text-color, #1f2430);
+        padding: 7px 13px 7px 7px; font: inherit; font-size: 12px; font-weight: 600; cursor: pointer;
+        transition: transform .15s ease, box-shadow .15s ease;
+      }
+      .scene-pill:hover { transform: translateY(-1px); box-shadow: 0 10px 22px rgba(16,24,40,.08); }
+      .scene-icon {
+        width: 28px; height: 28px; border-radius: 50%; display: grid; place-items: center;
+        color: #fff; background: linear-gradient(135deg, #5b6cff, #ff4f9a);
+      }
+      .scene-icon ha-icon { --mdc-icon-size: 15px; }
+      .favorites-strip { margin: 4px 0 18px; }
+      .favorites-row { display: flex; gap: 10px; overflow-x: auto; padding-bottom: 4px; }
+      .favorite-tile {
+        position: relative; display: flex; align-items: center; gap: 10px; flex: none;
+        min-width: 220px; max-width: 280px; text-align: left;
+        border: 1px solid var(--divider-color, #e4e7ec); border-radius: 16px;
+        background: var(--card-background-color, #fff); color: inherit; padding: 10px 12px;
+        font: inherit; cursor: pointer; overflow: hidden;
+      }
+      .favorite-tile::after {
+        content: ""; position: absolute; inset: auto 0 0; height: 3px;
+        background: linear-gradient(90deg, var(--accent, #5b6cff), transparent);
+        opacity: .55;
+      }
+      .favorite-tile:hover { border-color: var(--accent, #5b6cff); }
+      .favorite-icon {
+        width: 38px; height: 38px; border-radius: 12px; display: grid; place-items: center;
+        color: var(--accent, #5b6cff); background: color-mix(in srgb, var(--accent, #5b6cff) 14%, transparent);
+        font-size: 20px; flex: none;
+      }
+      .favorite-meta { display: flex; flex-direction: column; gap: 2px; min-width: 0; flex: 1; }
+      .favorite-meta b { font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+      .favorite-meta small { font-size: 10px; color: var(--secondary-text-color, #667085); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+      .card-shell { position: relative; border-radius: 20px; }
+      .card-rail {
+        position: absolute; top: 0; bottom: 0; display: flex; align-items: center;
+        gap: 6px; padding: 10px; z-index: 0;
+      }
+      .card-rail-left { left: 0; flex-direction: row; }
+      .card-rail-right { right: 0; }
+      .rail-btn {
+        width: 58px; height: 100%; max-height: 96px; border: 0; border-radius: 14px;
+        display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 5px;
+        background: var(--secondary-background-color, #eef1f7); color: var(--secondary-text-color, #667085);
+        font: inherit; font-size: 9px; cursor: pointer;
+      }
+      .rail-btn ha-icon { --mdc-icon-size: 21px; }
+      .rail-btn.active, .rail-power.active {
+        background: linear-gradient(135deg, #5b6cff, #ff4f9a); color: #fff;
+      }
+      .card-shell .card {
+        z-index: 1; touch-action: pan-y; user-select: none;
+        transition: transform .22s ease, box-shadow .15s ease, border-color .15s ease;
+      }
+      .card.dragging { transition: none; cursor: grabbing; }
+      .card-shell.open-left .card { transform: translateX(-122px); }
+      .card-shell.open-left .card-rail-right { z-index: 2; }
+      .card.is-on { border-color: color-mix(in srgb, var(--primary-color, #5b6cff) 35%, var(--divider-color, #e4e7ec)); }
+      .card.favorite { box-shadow: inset 0 0 0 1px rgba(245, 158, 11, .25); }
+      .card-head-right { display: flex; align-items: center; gap: 8px; }
+      .fav-mark { color: #f59e0b; --mdc-icon-size: 18px; }
+      .card-actions-row { display: flex; align-items: center; gap: 6px; }
+      .mini-action {
+        width: 32px; height: 32px; border-radius: 10px; border: 1px solid var(--divider-color, #e4e7ec);
+        background: transparent; color: var(--secondary-text-color, #667085);
+        display: grid; place-items: center; cursor: pointer;
+      }
+      .mini-action:hover { color: var(--primary-color, #5b6cff); border-color: var(--primary-color, #5b6cff); }
+      .mini-slider {
+        display: flex; align-items: center; gap: 8px; margin-top: 11px;
+        padding: 7px 9px; border-radius: 11px; background: var(--secondary-background-color, #f7f8fa);
+        color: var(--secondary-text-color, #667085);
+      }
+      .mini-slider ha-icon { --mdc-icon-size: 16px; flex: none; }
+      .mini-slider input { flex: 1; min-width: 0; }
+      .mini-slider span { min-width: 36px; text-align: right; font-size: 10px; font-weight: 600; }
+      .mini-chip {
+        display: inline-flex; align-items: center; gap: 6px; margin-top: 11px;
+        padding: 6px 9px; border-radius: 10px; background: var(--secondary-background-color, #f7f8fa);
+        color: var(--secondary-text-color, #667085); font-size: 11px; font-weight: 600;
+      }
+      .mini-chip ha-icon { --mdc-icon-size: 16px; }
+      .sheet-backdrop {
+        position: fixed; inset: 0; z-index: 40; display: flex; align-items: flex-end;
+        justify-content: center; padding: 18px; background: rgba(9, 12, 24, .48);
+        backdrop-filter: blur(5px); animation: sheetFade .18s ease both;
+      }
+      @keyframes sheetFade { from { opacity: 0; } to { opacity: 1; } }
+      .quick-sheet {
+        width: min(720px, 100%); max-height: 88vh; overflow: auto;
+        border-radius: 26px; background: var(--card-background-color, #fff);
+        color: var(--primary-text-color, #1f2430); padding: 16px 20px 24px;
+        box-shadow: 0 30px 80px rgba(0,0,0,.35); animation: sheetUp .22s ease both;
+      }
+      @keyframes sheetUp { from { transform: translateY(24px); opacity: .6; } to { transform: translateY(0); opacity: 1; } }
+      .sheet-grabber { width: 44px; height: 4px; border-radius: 99px; background: var(--divider-color, #dfe3ea); margin: 0 auto 12px; }
+      .sheet-head { display: flex; align-items: center; gap: 14px; }
+      .sheet-title { flex: 1; min-width: 0; }
+      .sheet-title h2 { margin: 0 0 4px; font-size: 21px; }
+      .sheet-close {
+        width: 38px; height: 38px; border-radius: 50%; border: 1px solid var(--divider-color, #e4e7ec);
+        background: transparent; color: inherit; cursor: pointer; display: grid; place-items: center;
+      }
+      .sheet-quick-actions { display: flex; gap: 8px; flex-wrap: wrap; margin: 16px 0; }
+      .sheet-power, .sheet-action {
+        display: inline-flex; align-items: center; gap: 7px; border-radius: 12px;
+        padding: 10px 13px; font: inherit; font-size: 12px; font-weight: 600; cursor: pointer;
+        border: 1px solid var(--divider-color, #e4e7ec); background: transparent; color: inherit;
+      }
+      .sheet-power { min-width: 140px; justify-content: center; }
+      .sheet-power.on { background: linear-gradient(135deg, #5b6cff, #ff4f9a); color: #fff; border-color: transparent; }
+      .sheet-power.ghost { color: var(--secondary-text-color, #667085); }
+      .sheet-action.active { color: #b45309; border-color: rgba(245,158,11,.4); background: rgba(245,158,11,.08); }
+      .sheet-section { border-top: 1px solid var(--divider-color, #eef0f4); padding-top: 14px; margin-top: 14px; }
+      .sheet-section h3 { margin: 0 0 8px; font-size: 13px; }
+      .sheet-section .section { border: 0; padding: 0; background: transparent; }
+      .speaker-extras { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+      .source-switch {
+        display: inline-flex; align-items: center; gap: 3px; padding: 3px;
+        border-radius: 11px; border: 1px solid rgba(255,255,255,.14);
+        background: rgba(255,255,255,.06);
+      }
+      .source-switch > span { font-size: 9px; color: rgba(255,255,255,.46); padding: 0 5px; }
+      .source-switch button {
+        display: inline-flex; align-items: center; gap: 5px; border: 0; border-radius: 8px;
+        background: transparent; color: rgba(255,255,255,.66); padding: 5px 8px;
+        font: inherit; font-size: 10px; cursor: pointer;
+      }
+      .source-switch button ha-icon { --mdc-icon-size: 14px; }
+      .source-switch button.active {
+        background: linear-gradient(135deg, var(--skin-accent, #5b6cff), var(--skin-accent-2, #ff4f9a));
+        color: #fff;
+      }
+      .source-switch.wide { background: rgba(255,255,255,.06); width: 100%; }
+      .source-switch.wide button { flex: 1; justify-content: center; padding: 8px; font-size: 11px; }
+      .extra-pill {
+        display: inline-flex; align-items: center; gap: 6px; border-radius: 10px;
+        border: 1px solid rgba(255,255,255,.14); background: rgba(255,255,255,.06);
+        color: rgba(255,255,255,.7); padding: 6px 9px; font: inherit; font-size: 10px; cursor: pointer;
+      }
+      .extra-pill ha-icon { --mdc-icon-size: 15px; }
+      .extra-pill.active { color: #fff; border-color: rgba(143,155,255,.7); background: rgba(108,124,255,.22); }
+      .auto-mode-btn {
+        display: flex; align-items: center; gap: 7px; width: 100%;
+        border: 1px solid var(--divider-color, #e4e7ec); border-radius: 10px;
+        background: transparent; color: inherit; padding: 7px 9px; font: inherit; font-size: 11px; cursor: pointer;
+      }
+      .auto-mode-btn b { margin-left: auto; font-size: 10px; opacity: .6; }
+      .auto-mode-btn.active { color: #fff; border-color: transparent; background: linear-gradient(135deg, #5b6cff, #ff4f9a); }
+      .auto-mode-btn.active b { opacity: .9; }
+      .player-kicker, .full-kicker { display: inline-flex; align-items: center; gap: 6px; }
+      .player-kicker .beat-dot { width: 6px; height: 6px; }
+      .beat-strip {
+        display: flex; align-items: center; gap: 8px; color: rgba(255,255,255,.55);
+        font-size: 9px; letter-spacing: .08em; text-transform: uppercase;
+      }
+      .beat-strip b { color: rgba(255,255,255,.82); font-size: 10px; letter-spacing: .02em; }
+      .beat-dot {
+        width: 8px; height: 8px; border-radius: 50%; flex: none;
+        background: var(--skin-accent-2, #ff4f9a);
+        box-shadow: 0 0 0 4px rgba(255,79,154,.12), 0 0 14px var(--skin-accent-2, #ff4f9a);
+        transition: transform .07s linear, opacity .07s linear;
+      }
+      .full-skin-row {
+        display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+        padding-top: 4px; border-top: 1px solid rgba(255,255,255,.09);
+      }
+      .full-skin-row > span { font-size: 9px; letter-spacing: .08em; text-transform: uppercase; color: rgba(255,255,255,.48); }
+      .full-skin-grid { display: flex; gap: 6px; flex-wrap: wrap; }
+      .skin-swatch {
+        display: inline-flex; align-items: center; gap: 5px; border: 1px solid rgba(255,255,255,.14);
+        border-radius: 999px; background: rgba(255,255,255,.05); color: rgba(255,255,255,.62);
+        padding: 4px 8px 4px 4px; font: inherit; font-size: 9px; cursor: pointer;
+      }
+      .skin-swatch > span {
+        width: 15px; height: 15px; border-radius: 50%;
+        background: linear-gradient(135deg, #6c7cff, #ff4f9a);
+      }
+      .skin-swatch.skin-2 > span { background: linear-gradient(135deg, #7c8cff, #4fd1ff); }
+      .skin-swatch.skin-3 > span { background: linear-gradient(135deg, #f2b35e, #ff7a59); }
+      .skin-swatch.skin-4 > span { background: linear-gradient(135deg, #8be9fd, #c084fc); }
+      .skin-swatch.skin-5 > span { background: linear-gradient(135deg, #ff3df2, #39e7ff); }
+      .skin-swatch.skin-6 > span { background: linear-gradient(135deg, #111827, #6b7280); }
+      .skin-swatch.skin-7 > span { background: linear-gradient(135deg, #37d39a, #6c7cff); }
+      .skin-swatch.skin-8 > span { background: linear-gradient(135deg, #d6b36a, #b08b46); }
+      .skin-swatch.active { color: #fff; border-color: rgba(143,155,255,.9); background: rgba(108,124,255,.22); }
+      .player .viz {
+        transform: scale(calc(1 + var(--beat, 0) * .028));
+        filter: brightness(calc(1 + var(--beat, 0) * .32));
+        transition: transform .06s linear, filter .06s linear;
+      }
+      .player:not(.playing) .viz { transform: none; filter: none; }
+      .viz-bars span { animation-duration: calc(var(--beat-dur, 1.15s) * .5); }
+      .viz-wave span { animation-duration: calc(var(--beat-dur, 1.6s) * .8); }
+      .viz-orbit i { animation-duration: calc(var(--beat-dur, 3s) * 2.4); }
+      .viz-orbit i:nth-child(2) { animation-duration: calc(var(--beat-dur, 3s) * 3.2); }
+      .viz-orbit i:nth-child(3) { animation-duration: calc(var(--beat-dur, 3s) * 4.2); }
+      .wave-a, .wave-b { animation-duration: calc(var(--beat-dur, 3.2s) * 2.4); }
+      .viz-ekg path { animation-duration: calc(var(--beat-dur, 2.6s) * 2); }
+      .viz-dots span { animation-duration: calc(var(--beat-dur, 1.1s) * .55); }
+      .radial-ring span { animation-duration: calc(var(--beat-dur, 1.15s) * .6); }
+      .tunnel-row span { animation-duration: calc(var(--beat-dur, 1.2s) * .65); }
+      .viz-rings i { animation-duration: calc(var(--beat-dur, 2.8s) * 2.2); }
+      .viz-rings i:nth-child(2) { animation-duration: calc(var(--beat-dur, 2.8s) * 3.4); }
+      .viz-rings i:nth-child(3) { animation-duration: calc(var(--beat-dur, 2.8s) * 4.6); }
+      .viz-rain span { animation-duration: calc(var(--beat-dur, 1.45s) * 1.1); }
+      .viz-blocks span { animation-duration: calc(var(--beat-dur, .9s) * .55); }
+      .full-player.beat-accent .beat-dot { box-shadow: 0 0 0 7px rgba(255,79,154,.16), 0 0 20px var(--skin-accent-2, #ff4f9a); }
+      @media (max-width: 720px) {
+        .quick-sheet { padding: 14px 14px 22px; border-radius: 20px; }
+        .favorite-tile { min-width: 190px; }
+        .beat-strip { font-size: 8px; }
+        .full-skin-row > span { display: none; }
+        .full-skin-grid { gap: 4px; }
+        .skin-swatch { padding: 3px; }
+        .skin-swatch small { display: none; }
+      }
       @media (max-width: 720px) {
         .shell { padding: 18px 14px 50px; }
         .stats { grid-template-columns: repeat(2, minmax(0, 1fr)); }
