@@ -80,6 +80,8 @@ class YahomeDataUpdateCoordinator(DataUpdateCoordinator[YahomeData]):
         self._glagol_states: dict[str, dict[str, Any]] = {}
         self._glagol_state_ts: dict[str, Any] = {}
         self._track_meta: dict[str, dict[str, Any]] = {}
+        self._lyrics_offset = 0.0
+        self._suppress_panel_event = False
         self._discovery = YahomeLocalDiscovery(hass, self._async_local_found)
         self._store = YahomeDeviceStore(hass)
 
@@ -151,7 +153,7 @@ class YahomeDataUpdateCoordinator(DataUpdateCoordinator[YahomeData]):
 
     def _async_data_updated(self) -> None:
         """Persist the catalog and notify the panel."""
-        if self.data is None:
+        if self.data is None or self._suppress_panel_event:
             return
         self._store.async_delay_save(self.data, 30)
         self.hass.bus.async_fire(
@@ -215,12 +217,20 @@ class YahomeDataUpdateCoordinator(DataUpdateCoordinator[YahomeData]):
             self.hass.async_create_task(
                 self._async_enrich_track(str(track_id))
             )
-        self.async_update_listeners()
+        self._suppress_panel_event = True
+        try:
+            self.async_update_listeners()
+        finally:
+            self._suppress_panel_event = False
 
     async def _async_enrich_track(self, track_id: str) -> None:
         info = await async_get_music_track(self._session, track_id)
         self._track_meta[track_id] = info or {}
-        self.async_update_listeners()
+        self._suppress_panel_event = True
+        try:
+            self.async_update_listeners()
+        finally:
+            self._suppress_panel_event = False
 
     def track_meta(self, track_id: str | None) -> dict[str, Any]:
         """Return cached public Yandex Music metadata for a track."""
@@ -245,6 +255,16 @@ class YahomeDataUpdateCoordinator(DataUpdateCoordinator[YahomeData]):
     def glagol_state_updated_at(self, speaker_id: str):
         """Return when the local playback state was received."""
         return self._glagol_state_ts.get(speaker_id)
+
+    @property
+    def lyrics_offset(self) -> float:
+        """Return the manual lyrics sync offset in seconds."""
+        return self._lyrics_offset
+
+    @lyrics_offset.setter
+    def lyrics_offset(self, value: float) -> None:
+        """Set the manual lyrics sync offset in seconds."""
+        self._lyrics_offset = max(-5.0, min(5.0, float(value)))
 
     async def async_live_quasar(self) -> YandexQuasarClient | None:
         """Return a Quasar client built from the freshest available cookies."""

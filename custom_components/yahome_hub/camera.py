@@ -197,7 +197,7 @@ class YahomeSpeakerLyricsCamera(YahomeSpeakerEntity, Camera):
                     + b"\r\n"
                 )
                 await response.write(data)
-                await asyncio.sleep(1)
+                await asyncio.sleep(0.5)
         except (ConnectionResetError, asyncio.CancelledError):
             pass
         finally:
@@ -220,6 +220,8 @@ class YahomeSpeakerLyricsCamera(YahomeSpeakerEntity, Camera):
                 )
             except (TypeError, ValueError):
                 pass
+        if position is not None:
+            position += self.coordinator.lyrics_offset
         current = parse_lyrics_line(self._lyrics, position)
         next_line = _next_lyric_line(self._lyrics, position)
         cover = await self._async_cover()
@@ -249,12 +251,15 @@ class YahomeSpeakerLyricsCamera(YahomeSpeakerEntity, Camera):
                 )
             except (TypeError, ValueError):
                 pass
+        if position is not None:
+            position += self.coordinator.lyrics_offset
         return {
             "media_title": attrs.get("media_title"),
             "media_artist": attrs.get("media_artist"),
             "media_content_id": attrs.get("media_content_id"),
             "lyrics": self._lyrics,
             "current_line": parse_lyrics_line(self._lyrics, position),
+            "lyrics_offset": self.coordinator.lyrics_offset,
         }
 
 

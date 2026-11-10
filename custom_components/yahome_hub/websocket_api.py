@@ -196,9 +196,32 @@ async def websocket_lyrics(
     connection.send_result(msg["id"], {"lyrics": lyrics or ""})
 
 
+@websocket_api.websocket_command(
+    {
+        vol.Required("type"): f"{DOMAIN}/lyrics_offset",
+        vol.Required("offset"): vol.Coerce(float),
+    }
+)
+@websocket_api.require_admin
+@websocket_api.async_response
+async def websocket_lyrics_offset(
+    hass: HomeAssistant,
+    connection: websocket_api.ActiveConnection,
+    msg: dict[str, Any],
+) -> None:
+    """Set the manual lyrics sync offset."""
+    coordinator = get_coordinator(hass)
+    if coordinator is None:
+        connection.send_error(msg["id"], "not_configured", NOT_CONFIGURED)
+        return
+    coordinator.lyrics_offset = msg["offset"]
+    connection.send_result(msg["id"], {"offset": coordinator.lyrics_offset})
+
+
 def async_register_websocket_commands(hass: HomeAssistant) -> None:
     """Register panel WebSocket commands."""
     websocket_api.async_register_command(hass, websocket_lyrics)
+    websocket_api.async_register_command(hass, websocket_lyrics_offset)
     websocket_api.async_register_command(hass, websocket_devices)
     websocket_api.async_register_command(hass, websocket_action)
     websocket_api.async_register_command(hass, websocket_scenario)
