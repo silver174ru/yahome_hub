@@ -218,10 +218,34 @@ async def websocket_lyrics_offset(
     connection.send_result(msg["id"], {"offset": coordinator.lyrics_offset})
 
 
+@websocket_api.websocket_command(
+    {
+        vol.Required("type"): f"{DOMAIN}/music_search",
+        vol.Required("query"): str,
+        vol.Optional("limit", default=10): vol.Coerce(int),
+    }
+)
+@websocket_api.require_admin
+@websocket_api.async_response
+async def websocket_music_search(
+    hass: HomeAssistant,
+    connection: websocket_api.ActiveConnection,
+    msg: dict[str, Any],
+) -> None:
+    """Search Yandex Music tracks for the player."""
+    coordinator = get_coordinator(hass)
+    if coordinator is None:
+        connection.send_error(msg["id"], "not_configured", NOT_CONFIGURED)
+        return
+    tracks = await coordinator.async_search_music(msg["query"], msg["limit"])
+    connection.send_result(msg["id"], {"tracks": tracks})
+
+
 def async_register_websocket_commands(hass: HomeAssistant) -> None:
     """Register panel WebSocket commands."""
     websocket_api.async_register_command(hass, websocket_lyrics)
     websocket_api.async_register_command(hass, websocket_lyrics_offset)
+    websocket_api.async_register_command(hass, websocket_music_search)
     websocket_api.async_register_command(hass, websocket_devices)
     websocket_api.async_register_command(hass, websocket_action)
     websocket_api.async_register_command(hass, websocket_scenario)

@@ -193,6 +193,25 @@ def _speaker_view(
         "entity_id": speaker.get("entity_id"),
         "equalizer_entity": speaker.get("equalizer_entity"),
         "lyrics_entity": speaker.get("lyrics_entity"),
+        "calendar_entity": speaker.get("calendar_entity"),
+        "conversation_entity": speaker.get("conversation_entity"),
+        "led_supported": speaker.get("platform")
+        in (
+            "yandexstation_2",
+            "yandexmini_2",
+            "orion",
+            "cucumber",
+            "plum",
+            "bergamot",
+        ),
+        "sensors": [
+            {
+                "instance": (prop.get("state") or {}).get("instance"),
+                "value": (prop.get("state") or {}).get("value"),
+            }
+            for prop in (iot_device or {}).get("properties") or []
+            if (prop.get("state") or {}).get("instance")
+        ],
         "volume": (
             get_capability_state(iot_device, CAP_VOLUME, "volume")
             if iot_device
