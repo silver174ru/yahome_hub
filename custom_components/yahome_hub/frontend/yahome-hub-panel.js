@@ -867,7 +867,7 @@ class YaHomeHubPanel extends HTMLElement {
     ) {
       return "/yahome_hub/station-max.svg";
     }
-    return "/yahome_hub/station-max.svg";
+    return "";
   }
 
   _lyricLines(lyrics, position) {
@@ -958,6 +958,7 @@ class YaHomeHubPanel extends HTMLElement {
         : speaker.volume !== null && speaker.volume !== undefined
         ? Number(speaker.volume)
         : 0;
+    const muted = Boolean(attrs.is_volume_muted) || volume === 0;
     const eqEntity = speaker.equalizer_entity
       ? this._hass.states[speaker.equalizer_entity]
       : null;
@@ -980,9 +981,13 @@ class YaHomeHubPanel extends HTMLElement {
         <div class="player-content">
           <div class="player-head">
             <div class="player-cover ${full ? "big" : ""}">
-              <img data-player-cover src="${this._esc(
+              ${
                 cover
-              )}" alt="" loading="lazy" />
+                  ? `<img data-player-cover src="${this._esc(
+                      cover
+                    )}" alt="" loading="lazy" />`
+                  : `<ha-icon data-cover-fallback icon="mdi:speaker"></ha-icon>`
+              }
               ${
                 full && this._showLyrics
                   ? `<div class="lyrics-overlay">
@@ -1059,7 +1064,11 @@ class YaHomeHubPanel extends HTMLElement {
               )}" title="Следующий трек"><ha-icon icon="mdi:skip-next"></ha-icon></button>
             </div>
             <div class="volume-control">
-              <ha-icon icon="mdi:volume-high"></ha-icon>
+              <button class="volume-toggle" data-player-mute="${this._esc(
+                entityId
+              )}" title="${muted ? "Включить звук" : "Выключить звук"}">
+                <ha-icon icon="${muted ? "mdi:volume-off" : "mdi:volume-high"}"></ha-icon>
+              </button>
               <input type="range" min="0" max="100" step="1" value="${volume}"
                 data-volume-entity="${this._esc(
                   entityId
@@ -1104,14 +1113,40 @@ class YaHomeHubPanel extends HTMLElement {
       const paused = entity.state === "paused";
       el.classList.toggle("playing", playing);
       el.classList.toggle("paused", paused);
+      const trackId = String(attrs.media_content_id || "");
+      const trackInfo = /^\d+$/.test(trackId) ? this._trackInfo(trackId) : null;
       const cover =
         attrs.entity_picture ||
+        (trackInfo && trackInfo.cover) ||
         this._speakerImage(speaker) ||
         "";
-      const image = el.querySelector("[data-player-cover]");
-      if (image && cover && image.getAttribute("src") !== cover) {
-        image.setAttribute("src", cover);
+      const coverBox = el.querySelector(".player-cover");
+      let image = el.querySelector("[data-player-cover]");
+      if (cover) {
+        const fallback = coverBox
+          ? coverBox.querySelector("[data-cover-fallback]")
+          : null;
+        if (fallback) fallback.remove();
+        if (!image && coverBox) {
+          image = document.createElement("img");
+          image.setAttribute("data-player-cover", "");
+          image.alt = "";
+          image.loading = "lazy";
+          coverBox.insertBefore(image, coverBox.firstChild);
+        }
+        if (image && image.getAttribute("src") !== cover) {
+          image.setAttribute("src", cover);
+        }
         el.style.setProperty("--cover", `url('${cover}')`);
+      } else {
+        if (image) image.remove();
+        if (coverBox && !coverBox.querySelector("[data-cover-fallback]")) {
+          const fallback = document.createElement("ha-icon");
+          fallback.setAttribute("data-cover-fallback", "");
+          fallback.setAttribute("icon", "mdi:speaker");
+          coverBox.insertBefore(fallback, coverBox.firstChild);
+        }
+        el.style.removeProperty("--cover");
       }
       const title = attrs.media_title || "Готов к воспроизведению";
       const artist = attrs.media_artist || speaker.name;
@@ -1155,6 +1190,15 @@ class YaHomeHubPanel extends HTMLElement {
       }
       const volumeLabel = el.querySelector("[data-player-volume-label]");
       if (volumeLabel) volumeLabel.textContent = `${volume}%`;
+      const muted = Boolean(attrs.is_volume_muted) || volume === 0;
+      const muteButton = el.querySelector("[data-player-mute]");
+      if (muteButton) {
+        muteButton.title = muted ? "Включить звук" : "Выключить звук";
+        const icon = muteButton.querySelector("ha-icon");
+        if (icon) {
+          icon.setAttribute("icon", muted ? "mdi:volume-off" : "mdi:volume-high");
+        }
+      }
       const eq = el.querySelector("[data-eq-entity]");
       if (eq && speaker.equalizer_entity) {
         const eqState = this._hass.states[speaker.equalizer_entity];
@@ -1404,6 +1448,19 @@ class YaHomeHubPanel extends HTMLElement {
         this._callService("media_player", "media_seek", {
           entity_id: el.getAttribute("data-seek-entity"),
           seek_position: Number(el.value),
+        });
+      });
+    });
+    root.querySelectorAll("[data-player-mute]").forEach((el) => {
+      el.addEventListener("click", () => {
+        const entityId = el.getAttribute("data-player-mute");
+        const state = this._hass.states[entityId];
+        const muted = Boolean(
+          state && state.attributes && state.attributes.is_volume_muted
+        );
+        this._callService("media_player", "volume_mute", {
+          entity_id: entityId,
+          is_volume_muted: !muted,
         });
       });
     });
@@ -1935,6 +1992,11 @@ class YaHomeHubPanel extends HTMLElement {
       }
       .volume-control input { flex: 1; accent-color: var(--primary-color, #5b6cff); }
       .volume-control span { width: 34px; text-align: right; font-size: 11px; }
+      .volume-toggle {
+        display: grid; place-items: center; width: 28px; height: 28px;
+        padding: 0; border: 0; background: none; color: inherit; cursor: pointer;
+      }
+      .volume-toggle:hover { color: var(--primary-color, #5b6cff); }
       .eq-select { height: 36px; max-width: 165px; font-size: 12px; }
       .compact-speakers { margin-top: 2px; }
       .player.compact { display: flex; align-items: center; gap: 14px; padding: 14px; }
