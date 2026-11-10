@@ -16,6 +16,7 @@ from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.intent import IntentResponse, IntentResponseErrorCode
 from homeassistant.util import ulid
 
+from .const import MUSIC_SPEAKER_PLATFORMS
 from .coordinator import YahomeDataUpdateCoordinator
 from .speaker_entity import YahomeSpeakerEntity
 
@@ -31,6 +32,7 @@ async def async_setup_entry(
         YahomeSpeakerConversation(coordinator, speaker_id)
         for speaker_id, speaker in coordinator.data.speakers.items()
         if speaker.get("entity_id")
+        and speaker.get("platform") in MUSIC_SPEAKER_PLATFORMS
     )
 
 
@@ -52,18 +54,9 @@ class YahomeSpeakerConversation(YahomeSpeakerEntity, ConversationEntity):
         return ["ru"]
 
     def _local_glagol(self) -> Any | None:
-        """Find the live glagol connection of Yandex.Station, when present."""
-        data = self.hass.data.get("yandex_station")
-        if not isinstance(data, dict):
-            return None
-        for quasar in data.values():
-            for device in getattr(quasar, "speakers", []):
-                info = device.get("quasar_info") or {}
-                if info.get("device_id") != self._speaker_id:
-                    continue
-                entity = device.get("entity")
-                return getattr(entity, "glagol", None)
-        return None
+        """Return our own local connection, when it is online."""
+        glagol = self.coordinator.glagol(self._speaker_id)
+        return glagol if glagol and glagol.connected else None
 
     async def async_process(
         self, user_input: ConversationInput

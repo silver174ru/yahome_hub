@@ -9,19 +9,22 @@ from datetime import timedelta
 from typing import Any
 
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.core import HomeAssistant
+from homeassistant.core import HomeAssistant, callback
 from homeassistant.exceptions import ConfigEntryAuthFailed, HomeAssistantError
 from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
+from homeassistant.util import dt as dt_util
 
 from .api import (
     YahomeApiError,
     YahomeAuthError,
     YandexIoTClient,
     YandexQuasarClient,
+    async_get_music_track,
 )
 from .cookies import async_find_cookies
+from .glagol import YahomeGlagol, YahomeLocalDiscovery
 from .const import (
     CONF_COOKIES,
     CONF_MUSIC_TOKEN,
@@ -71,6 +74,12 @@ class YahomeDataUpdateCoordinator(DataUpdateCoordinator[YahomeData]):
         self._speaker_cache: dict[str, dict[str, Any]] = {}
         self._speaker_cache_until = 0.0
         self._excluded_speaker_ids: set[str] = set()
+        self._local_speakers: dict[str, dict[str, Any]] = {}
+        self._glagols: dict[str, YahomeGlagol] = {}
+        self._glagol_states: dict[str, dict[str, Any]] = {}
+        self._glagol_state_ts: dict[str, Any] = {}
+        self._track_meta: dict[str, dict[str, Any]] = {}
+        self._discovery = YahomeLocalDiscovery(hass, self._async_local_found)
         self._store = YahomeDeviceStore(hass)
 
         super().__init__(
@@ -103,6 +112,28 @@ class YahomeDataUpdateCoordinator(DataUpdateCoordinator[YahomeData]):
             if excluded or any(slug in entry.entity_id for slug in slugs):
                 registry.async_remove(entry.entity_id)
 
+    def _remove_non_music_speaker_entities(
+        self, speakers: dict[str, dict[str, Any]]
+    ) -> None:
+        """Remove music-only entities from speakers that do not support music."""
+        from .const import MUSIC_SPEAKER_PLATFORMS
+
+        registry = er.async_get(self.hass)
+        for speaker_id, speaker in speakers.items():
+            if speaker.get("platform") in MUSIC_SPEAKER_PLATFORMS:
+                continue
+            for domain, key in (
+                ("calendar", "calendar"),
+                ("camera", "lyrics"),
+                ("conversation", "conversation"),
+                ("select", "equalizer"),
+            ):
+                entity_id = registry.async_get_entity_id(
+                    domain, DOMAIN, f"{speaker_id}_{key}"
+                )
+                if entity_id:
+                    registry.async_remove(entity_id)
+
     def _async_data_updated(self) -> None:
         """Persist the catalog and notify the panel."""
         if self.data is None:
@@ -116,6 +147,89 @@ class YahomeDataUpdateCoordinator(DataUpdateCoordinator[YahomeData]):
                 "speakers": len(self.data.speakers),
             },
         )
+
+    async def async_start_local(self) -> None:
+        """Start mDNS discovery and local speaker connections."""
+        try:
+            await self._discovery.async_start()
+        except Exception as err:  # noqa: BLE001
+            _LOGGER.debug("Local speaker discovery failed: %s", err)
+
+    async def async_stop_local(self) -> None:
+        """Stop discovery and all local connections."""
+        self._discovery.stop()
+        for glagol in list(self._glagols.values()):
+            await glagol.stop()
+        self._glagols.clear()
+        self._glagol_states.clear()
+        self._glagol_state_ts.clear()
+
+    @callback
+    def _async_local_found(self, info: dict[str, Any]) -> None:
+        self._local_speakers[info["device_id"]] = info
+        self.hass.async_create_task(self._async_start_glagol(info))
+
+    async def _async_start_glagol(self, info: dict[str, Any]) -> None:
+        device_id = info["device_id"]
+        if device_id in self._glagols:
+            return
+        quasar = await self.async_live_quasar()
+        if quasar is None:
+            return
+        glagol = YahomeGlagol(
+            self._session,
+            quasar,
+            device_id,
+            info.get("platform") or "",
+            info["host"],
+            info["port"],
+            lambda state: self._async_glagol_state(device_id, state),
+        )
+        self._glagols[device_id] = glagol
+        await glagol.start()
+
+    @callback
+    def _async_glagol_state(
+        self, speaker_id: str, state: dict[str, Any]
+    ) -> None:
+        self._glagol_states[speaker_id] = state
+        self._glagol_state_ts[speaker_id] = dt_util.utcnow()
+        player = state.get("playerState") or {}
+        track_id = player.get("id")
+        if track_id and str(track_id) not in self._track_meta:
+            self.hass.async_create_task(
+                self._async_enrich_track(str(track_id))
+            )
+        self.async_update_listeners()
+
+    async def _async_enrich_track(self, track_id: str) -> None:
+        info = await async_get_music_track(self._session, track_id)
+        self._track_meta[track_id] = info or {}
+        self.async_update_listeners()
+
+    def track_meta(self, track_id: str | None) -> dict[str, Any]:
+        """Return cached public Yandex Music metadata for a track."""
+        return self._track_meta.get(str(track_id), {}) if track_id else {}
+
+    async def _async_sync_glagols(
+        self, speakers: dict[str, dict[str, Any]]
+    ) -> None:
+        for speaker_id in speakers:
+            info = self._local_speakers.get(speaker_id)
+            if info and speaker_id not in self._glagols:
+                await self._async_start_glagol(info)
+
+    def glagol(self, speaker_id: str) -> YahomeGlagol | None:
+        """Return the local glagol connection for a speaker."""
+        return self._glagols.get(speaker_id)
+
+    def glagol_state(self, speaker_id: str) -> dict[str, Any]:
+        """Return the latest local playback state for a speaker."""
+        return self._glagol_states.get(speaker_id, {})
+
+    def glagol_state_updated_at(self, speaker_id: str):
+        """Return when the local playback state was received."""
+        return self._glagol_state_ts.get(speaker_id)
 
     async def async_live_quasar(self) -> YandexQuasarClient | None:
         """Return a Quasar client built from the freshest available cookies."""
@@ -271,17 +385,22 @@ class YahomeDataUpdateCoordinator(DataUpdateCoordinator[YahomeData]):
                         "type", devices.get(iot_id, {}).get("type")
                     )
                 media_entity = registry.async_get_entity_id(
+                    "media_player", DOMAIN, f"speaker_{speaker_id}_media_player"
+                ) or registry.async_get_entity_id(
                     "media_player", "yandex_station", speaker_id
                 )
                 if media_entity:
                     speaker["entity_id"] = media_entity
                 equalizer_entity = registry.async_get_entity_id(
+                    "select", DOMAIN, f"{speaker_id}_equalizer"
+                ) or registry.async_get_entity_id(
                     "select", "yandex_station", f"{speaker_id}_equalizer"
                 )
                 if equalizer_entity:
                     speaker["equalizer_entity"] = equalizer_entity
 
             self._remove_excluded_speaker_entities()
+            self._remove_non_music_speaker_entities(speakers)
 
             if (
                 self._quasar.can_read_configuration
@@ -330,6 +449,7 @@ class YahomeDataUpdateCoordinator(DataUpdateCoordinator[YahomeData]):
         self._station_iot_ids = {
             quasar_to_iot.get(speaker_id, speaker_id) for speaker_id in speakers
         }
+        await self._async_sync_glagols(speakers)
 
         return YahomeData(
             devices=devices,
