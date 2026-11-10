@@ -1153,7 +1153,7 @@ class YaHomeHubPanel extends HTMLElement {
         ${tabs
           .map(
             ([id, label]) =>
-              `<button class="${this._musicTab === id ? "active" : ""}" data-music-action="tab" data-tab="${id}">${label}${
+              `<button class="${this._musicTab === id ? "active" : ""}" data-music-action="tab" data-music-tab="${id}">${label}${
                 id === "queue" && queue.tracks.length
                   ? ` <b>${queue.tracks.length}</b>`
                   : ""
@@ -2281,6 +2281,8 @@ class YaHomeHubPanel extends HTMLElement {
   _onMusicAction(event) {
     const el = event.target.closest("[data-music-action]");
     if (!el) return;
+    event.preventDefault();
+    event.stopPropagation();
     const action = el.getAttribute("data-music-action");
     const hub = el.closest("[data-music-hub]");
     const targetId =
@@ -2296,7 +2298,7 @@ class YaHomeHubPanel extends HTMLElement {
       return;
     }
     if (action === "tab") {
-      this._musicTab = el.getAttribute("data-tab");
+      this._musicTab = el.getAttribute("data-music-tab");
       this._musicError = null;
       this._musicNotice = null;
       if (this._musicTab === "likes" && !this._musicLikes.length) {
@@ -2795,7 +2797,7 @@ class YaHomeHubPanel extends HTMLElement {
         this._render();
       });
     });
-    root.querySelectorAll("[data-tab]").forEach((el) => {
+    root.querySelectorAll(".tabs [data-tab]").forEach((el) => {
       el.addEventListener("click", () => {
         this._tab = el.getAttribute("data-tab");
         this._selected = null;
@@ -3872,6 +3874,11 @@ class YaHomeHubPanel extends HTMLElement {
       .full-player .viz-blocks span {
         background: linear-gradient(to top, var(--skin-accent), var(--skin-accent-2));
       }
+      .full-viz .viz-pulse i { width: 84px; height: 84px; }
+      .full-viz .viz-rings i { width: 112px; height: 112px; }
+      .full-viz .viz-rings i:nth-child(2) { width: 86px; height: 86px; }
+      .full-viz .viz-rings i:nth-child(3) { width: 60px; height: 60px; }
+      .full-viz .viz-pulse b, .full-viz .viz-rings b { width: 16px; height: 16px; }
       .full-player.skin-1 { --skin-accent: #6c7cff; --skin-accent-2: #ff4f9a; }
       .full-player.skin-2 { --skin-accent: #7c8cff; --skin-accent-2: #4fd1ff; }
       .full-player.skin-2 .full-shade {
@@ -3987,7 +3994,7 @@ class YaHomeHubPanel extends HTMLElement {
       .viz-pulse, .viz-rings { align-items: center; justify-content: center; }
       .viz-pulse i, .viz-rings i {
         position: absolute; border-radius: 50%; border: 2px solid rgba(108,124,255,.55);
-        width: 22%; aspect-ratio: 1; left: 50%; top: 50%;
+        width: 56px; height: 56px; left: 50%; top: 50%;
         transform: translate(-50%, -50%);
         animation: ringPulse 2.2s ease-out infinite;
       }
@@ -3995,7 +4002,7 @@ class YaHomeHubPanel extends HTMLElement {
       .viz-pulse i:nth-child(3) { animation-delay: .9s; }
       .viz-pulse i:nth-child(4) { animation-delay: 1.35s; border-color: rgba(255,79,154,.3); }
       .viz-pulse b, .viz-rings b {
-        width: 9%; aspect-ratio: 1; border-radius: 50%;
+        width: 12px; height: 12px; border-radius: 50%;
         background: linear-gradient(135deg, #6c7cff, #ff4f9a);
       }
       @keyframes ringPulse {
@@ -4005,14 +4012,14 @@ class YaHomeHubPanel extends HTMLElement {
       .viz-rings i {
         border-color: transparent; border-top-color: #6c7cff;
         animation: ringSpin 2.8s linear infinite;
-        width: 36%; aspect-ratio: 1;
+        width: 70px; height: 70px;
       }
-      .viz-rings i:nth-child(2) { width: 58%; border-top-color: #ff4f9a; animation-duration: 4.2s; animation-direction: reverse; }
-      .viz-rings i:nth-child(3) { width: 80%; border-top-color: #37d39a; animation-duration: 5.6s; }
+      .viz-rings i:nth-child(2) { width: 54px; height: 54px; border-top-color: #ff4f9a; animation-duration: 4.2s; animation-direction: reverse; }
+      .viz-rings i:nth-child(3) { width: 38px; height: 38px; border-top-color: #37d39a; animation-duration: 5.6s; }
       @keyframes ringSpin { to { transform: translate(-50%, -50%) rotate(360deg); } }
       .viz-spectrum, .viz-mirror { display: flex; flex-direction: column; gap: 3px; }
       .viz-spectrum > div, .viz-mirror > div {
-        display: flex; align-items: flex-end; gap: 3px; height: 50%;
+        display: flex; align-items: flex-end; gap: 3px; height: 50%; width: 100%;
       }
       .viz-spectrum .mirror, .viz-mirror .flip { transform: scaleY(-1); }
       .viz-spectrum span, .viz-mirror span {
