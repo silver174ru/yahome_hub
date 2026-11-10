@@ -126,7 +126,13 @@ class YaHomeHubPanel extends HTMLElement {
   }
 
   _onStateChanged(event) {
-    if (this._tab !== "speakers" && !this._fullPlayer) return;
+    if (
+      this._tab !== "speakers" &&
+      this._tab !== "devices" &&
+      !this._fullPlayer
+    ) {
+      return;
+    }
     const entityId = event && event.data ? event.data.entity_id : "";
     if (
       !entityId ||
@@ -513,6 +519,9 @@ class YaHomeHubPanel extends HTMLElement {
     }</p>
           </div>
           <div class="full-actions">
+            <button class="round-btn" data-music-scroll="${this._esc(
+              speaker.id
+            )}" title="Поиск музыки"><ha-icon icon="mdi:magnify"></ha-icon></button>
             <button class="round-btn" data-toggle-lyrics title="Текст песни"><ha-icon icon="mdi:text-box-music"></ha-icon></button>
             <button class="round-btn" data-close-player title="Закрыть"><ha-icon icon="mdi:close"></ha-icon></button>
             <button class="round-btn power ${
@@ -671,7 +680,25 @@ class YaHomeHubPanel extends HTMLElement {
     if (this._tab === "hub") {
       return this._renderHub(data);
     }
-    return this._renderDashboard(devices);
+    return `${this._renderMediaOverview()}${this._renderDashboard(devices)}`;
+  }
+
+  _renderMediaOverview() {
+    const speakers = this._musicSpeakers();
+    if (!speakers.length) return "";
+    const targetId = this._musicTargetId(speakers[0].id);
+    return `<section class="overview-media">
+      <div class="overview-media-head">
+        <div>
+          <h3>Медиа</h3>
+          <p>Яндекс Музыка и плееры колонок — поиск, очередь, лайки и плейлисты.</p>
+        </div>
+      </div>
+      ${this._renderMusicHub(targetId)}
+      <div class="players">${speakers
+        .map((speaker) => this._renderSpeakerPlayer(speaker))
+        .join("")}</div>
+    </section>`;
   }
 
   _renderHub(data) {
@@ -1358,14 +1385,15 @@ class YaHomeHubPanel extends HTMLElement {
   }
 
   _renderMusicHubDom(targetId) {
-    const container = this.shadowRoot
-      ? this.shadowRoot.querySelector(
+    const containers = this.shadowRoot
+      ? this.shadowRoot.querySelectorAll(
           `[data-music-hub="${targetId}"]`
         )
-      : null;
-    if (!container) return;
-    const compact = container.getAttribute("data-compact") === "1";
-    container.innerHTML = this._renderMusicHub(targetId, compact);
+      : [];
+    containers.forEach((container) => {
+      const compact = container.getAttribute("data-compact") === "1";
+      container.innerHTML = this._renderMusicHub(targetId, compact);
+    });
   }
 
   _vizOptions() {
@@ -1375,8 +1403,8 @@ class YaHomeHubPanel extends HTMLElement {
       ["orbit", "Орбита", "mdi:orbit"],
       ["dots", "Точки", "mdi:dots-hexagon"],
       ["pulse", "Пульс", "mdi:pulse"],
-      ["spectrum", "Спектр 2", "mdi:chart-bar"],
-      ["mirror", "Зеркало", "mdi:mirror"],
+      ["spectrum", "Радиус", "mdi:radar"],
+      ["mirror", "Тоннель", "mdi:image-filter-center-focus"],
       ["rings", "Кольца", "mdi:circle-double"],
       ["rain", "Дождь", "mdi:weather-rainy"],
       ["blocks", "Блоки", "mdi:view-grid"],
@@ -2102,29 +2130,43 @@ class YaHomeHubPanel extends HTMLElement {
       ).join("");
     switch (this._viz) {
       case "wave":
-        return `<div class="viz viz-wave">${Array.from(
-          { length: 24 },
-          (_, i) =>
-            `<span style="--i:${i};--h:${18 + ((i * 29) % 70)}%"></span>`
-        ).join("")}</div>`;
+        return `<div class="viz viz-wave-line"><svg viewBox="0 0 300 80" preserveAspectRatio="none">
+          <path class="wave-a" d="M0,40 C25,6 50,6 75,40 S125,74 150,40 S200,6 225,40 S275,74 300,40"/>
+          <path class="wave-b" d="M0,40 C25,74 50,74 75,40 S125,6 150,40 S200,74 225,40 S275,6 300,40"/>
+        </svg></div>`;
       case "orbit":
         return `<div class="viz viz-orbit"><i></i><i></i><i></i><b></b></div>`;
       case "dots":
         return `<div class="viz viz-dots">${Array.from(
-          { length: 28 },
+          { length: 60 },
           (_, i) =>
-            `<span style="--i:${i};--h:${20 + ((i * 23) % 70)}%"></span>`
+            `<span style="--i:${i};--d:${(i % 12) * 0.06}s"></span>`
         ).join("")}</div>`;
       case "pulse":
-        return `<div class="viz viz-pulse"><i></i><i></i><i></i><i></i><b></b></div>`;
+        return `<div class="viz viz-ekg"><svg viewBox="0 0 300 80" preserveAspectRatio="none">
+          <path d="M0,40 L70,40 L82,18 L94,62 L106,40 L150,40 L162,28 L174,52 L186,40 L300,40"/>
+        </svg></div>`;
       case "spectrum":
-        return `<div class="viz viz-spectrum"><div>${bars(
-          32
-        )}</div><div class="mirror">${bars(32)}</div></div>`;
+        return `<div class="viz viz-radial"><div class="radial-ring">${Array.from(
+          { length: 36 },
+          (_, i) =>
+            `<span style="--i:${i};--rot:${i * 10}deg;--h:${
+              20 + ((i * 37) % 60)
+            }"></span>`
+        ).join("")}</div><b></b></div>`;
       case "mirror":
-        return `<div class="viz viz-mirror"><div>${bars(
-          24
-        )}</div><div class="flip">${bars(24)}</div></div>`;
+        return `<div class="viz viz-tunnel">${[0, 1, 2, 3]
+          .map(
+            (row) =>
+              `<div class="tunnel-row" style="--row:${row}">${Array.from(
+                { length: 16 },
+                (_, i) =>
+                  `<span style="--i:${i};--h:${
+                    40 + ((i * 37) % 50)
+                  }%"></span>`
+              ).join("")}</div>`
+          )
+          .join("")}</div>`;
       case "rings":
         return `<div class="viz viz-rings"><i></i><i></i><i></i><b></b></div>`;
       case "rain":
@@ -2137,9 +2179,11 @@ class YaHomeHubPanel extends HTMLElement {
         ).join("")}</div>`;
       case "blocks":
         return `<div class="viz viz-blocks">${Array.from(
-          { length: 16 },
+          { length: 48 },
           (_, i) =>
-            `<span style="--i:${i};--h:${24 + ((i * 31) % 70)}%"></span>`
+            `<span style="--i:${i};--h:${
+              30 + ((i * 31) % 60)
+            }%;--d:${(i % 8) * 0.07}s"></span>`
         ).join("")}</div>`;
       default:
         return `<div class="viz viz-bars">${bars(42)}</div>`;
@@ -2215,7 +2259,14 @@ class YaHomeHubPanel extends HTMLElement {
       clearInterval(this._ticker);
       this._ticker = null;
     }
-    if ((this._tab !== "speakers" && !this._fullPlayer) || !this._data) return;
+    if (
+      (this._tab !== "speakers" &&
+        this._tab !== "devices" &&
+        !this._fullPlayer) ||
+      !this._data
+    ) {
+      return;
+    }
     this._ticker = setInterval(() => this._tick(), 100);
   }
 
@@ -2785,6 +2836,18 @@ class YaHomeHubPanel extends HTMLElement {
         }
       });
     });
+    root.querySelectorAll("[data-music-scroll]").forEach((el) => {
+      el.addEventListener("click", () => {
+        const speakerId = el.getAttribute("data-music-scroll");
+        const hub = root.querySelector(
+          `.full-player [data-music-hub="${speakerId}"]`
+        );
+        if (hub) {
+          hub.scrollIntoView({ behavior: "smooth", block: "center" });
+          hub.querySelector("[data-music-query]")?.focus();
+        }
+      });
+    });
     root.querySelectorAll("[data-close-player]").forEach((el) => {
       el.addEventListener("click", () => {
         this._fullPlayer = null;
@@ -3274,6 +3337,10 @@ class YaHomeHubPanel extends HTMLElement {
         box-shadow: 0 8px 18px rgba(91, 108, 255, .25);
       }
       .speakers-section { display: flex; flex-direction: column; gap: 16px; }
+      .overview-media { margin-bottom: 26px; }
+      .overview-media-head { margin-bottom: 12px; }
+      .overview-media-head h3 { margin: 0 0 4px; font-size: 20px; }
+      .overview-media-head p { margin: 0; color: var(--secondary-text-color, #667085); font-size: 12px; }
       .speaker-toolbar { display: flex; justify-content: space-between; align-items: flex-end; gap: 16px; flex-wrap: wrap; }
       .speaker-toolbar h3 { margin: 0 0 4px; font-size: 17px; }
       .viz-switch {
@@ -3869,16 +3936,21 @@ class YaHomeHubPanel extends HTMLElement {
       .full-player .viz-bars span,
       .full-player .viz-wave span,
       .full-player .viz-dots span,
-      .full-player .viz-spectrum span,
-      .full-player .viz-mirror span,
+      .full-player .viz-radial span,
+      .full-player .viz-tunnel span,
       .full-player .viz-blocks span {
         background: linear-gradient(to top, var(--skin-accent), var(--skin-accent-2));
       }
-      .full-viz .viz-pulse i { width: 84px; height: 84px; }
+      .full-player .viz-wave-line .wave-a { stroke: var(--skin-accent); }
+      .full-player .viz-wave-line .wave-b { stroke: var(--skin-accent-2); }
+      .full-player .viz-ekg path { stroke: var(--skin-accent-2); }
+      .full-player .viz-rain span {
+        background: linear-gradient(to bottom, transparent, var(--skin-accent));
+      }
       .full-viz .viz-rings i { width: 112px; height: 112px; }
       .full-viz .viz-rings i:nth-child(2) { width: 86px; height: 86px; }
       .full-viz .viz-rings i:nth-child(3) { width: 60px; height: 60px; }
-      .full-viz .viz-pulse b, .full-viz .viz-rings b { width: 16px; height: 16px; }
+      .full-viz .viz-rings b { width: 16px; height: 16px; }
       .full-player.skin-1 { --skin-accent: #6c7cff; --skin-accent-2: #ff4f9a; }
       .full-player.skin-2 { --skin-accent: #7c8cff; --skin-accent-2: #4fd1ff; }
       .full-player.skin-2 .full-shade {
@@ -3981,52 +4053,101 @@ class YaHomeHubPanel extends HTMLElement {
       .full-player.skin-8 .full-viz { border: 1px solid rgba(214,179,106,.35); }
 
       .viz { position: relative; }
-      .viz-dots { gap: 7px; align-items: center; }
+      .viz-wave-line, .viz-ekg { display: block; padding: 0; background: transparent; }
+      .viz-wave-line svg, .viz-ekg svg { width: 100%; height: 100%; overflow: visible; }
+      .viz-wave-line path {
+        fill: none; stroke-width: 3; stroke-linecap: round;
+        vector-effect: non-scaling-stroke;
+      }
+      .wave-a {
+        stroke: #6c7cff; stroke-dasharray: 620; stroke-dashoffset: 620;
+        animation: waveFlow 3.2s linear infinite;
+        filter: drop-shadow(0 0 6px rgba(108,124,255,.6));
+      }
+      .wave-b {
+        stroke: #ff4f9a; stroke-dasharray: 620; stroke-dashoffset: 620;
+        animation: waveFlow 3.2s linear infinite reverse; opacity: .8;
+      }
+      @keyframes waveFlow { to { stroke-dashoffset: 0; } }
+      .viz-ekg path {
+        fill: none; stroke: #ff4f9a; stroke-width: 2.5;
+        stroke-linecap: round; stroke-linejoin: round;
+        stroke-dasharray: 520; stroke-dashoffset: 520;
+        animation: ekgDraw 2.6s linear infinite;
+        filter: drop-shadow(0 0 7px rgba(255,79,154,.6));
+      }
+      @keyframes ekgDraw { to { stroke-dashoffset: 0; } }
+      .viz-dots {
+        display: grid; grid-template-columns: repeat(12, 1fr);
+        gap: 6px; align-items: center; justify-items: center;
+      }
       .viz-dots span {
-        width: 7px; height: 7px; border-radius: 50%;
+        width: 6px; height: 6px; border-radius: 50%;
+        background: linear-gradient(135deg, #6c7cff, #ff4f9a);
         animation: dotPulse 1.1s ease-in-out infinite alternate;
-        animation-delay: calc(var(--i) * -0.08s);
+        animation-delay: var(--d);
       }
       @keyframes dotPulse {
-        from { transform: scale(.55); opacity: .5; }
+        from { transform: scale(.45); opacity: .4; }
         to { transform: scale(1.35); opacity: 1; }
       }
-      .viz-pulse, .viz-rings { align-items: center; justify-content: center; }
-      .viz-pulse i, .viz-rings i {
-        position: absolute; border-radius: 50%; border: 2px solid rgba(108,124,255,.55);
-        width: 56px; height: 56px; left: 50%; top: 50%;
-        transform: translate(-50%, -50%);
-        animation: ringPulse 2.2s ease-out infinite;
+      .viz-radial { display: grid; place-items: center; }
+      .radial-ring { position: relative; width: 84px; height: 84px; }
+      .radial-ring span {
+        position: absolute; left: 50%; top: 50%; width: 3px;
+        height: calc(6px + var(--h) * 0.22px); border-radius: 2px;
+        transform-origin: 50% 0;
+        transform: translate(-50%, 0) rotate(var(--rot)) scaleY(.7);
+        background: linear-gradient(to bottom, #6c7cff, #ff4f9a);
+        animation: radialPulse 1.15s ease-in-out infinite alternate;
+        animation-delay: calc(var(--i) * -0.03s);
       }
-      .viz-pulse i:nth-child(2) { animation-delay: .45s; border-color: rgba(255,79,154,.45); }
-      .viz-pulse i:nth-child(3) { animation-delay: .9s; }
-      .viz-pulse i:nth-child(4) { animation-delay: 1.35s; border-color: rgba(255,79,154,.3); }
-      .viz-pulse b, .viz-rings b {
+      @keyframes radialPulse {
+        from { transform: translate(-50%, 0) rotate(var(--rot)) scaleY(.3); opacity: .45; }
+        to { transform: translate(-50%, 0) rotate(var(--rot)) scaleY(1); opacity: 1; }
+      }
+      .viz-radial b {
+        position: absolute; left: 50%; top: 50%;
         width: 12px; height: 12px; border-radius: 50%;
+        transform: translate(-50%, -50%);
         background: linear-gradient(135deg, #6c7cff, #ff4f9a);
+        box-shadow: 0 0 14px rgba(108,124,255,.6);
       }
-      @keyframes ringPulse {
-        0% { opacity: .8; transform: translate(-50%, -50%) scale(.35); }
-        80%, 100% { opacity: 0; transform: translate(-50%, -50%) scale(4.2); }
+      .viz-tunnel {
+        display: flex; flex-direction: column; justify-content: center;
+        gap: 2px; perspective: 260px;
       }
+      .tunnel-row {
+        display: flex; align-items: flex-end; gap: 3px; height: 24%;
+        width: 100%;
+        transform: scale(calc(1 - var(--row) * .12));
+        opacity: calc(1 - var(--row) * .18);
+      }
+      .tunnel-row span {
+        flex: 1; height: var(--h); border-radius: 3px;
+        background: linear-gradient(to top, #6c7cff, #ff4f9a);
+        transform-origin: bottom;
+        animation: tunnelPulse 1.2s ease-in-out infinite alternate;
+        animation-delay: calc(var(--i) * -0.04s);
+      }
+      @keyframes tunnelPulse {
+        from { transform: scaleY(.6); opacity: .6; }
+        to { transform: scaleY(1); opacity: 1; }
+      }
+      .viz-rings { align-items: center; justify-content: center; }
       .viz-rings i {
-        border-color: transparent; border-top-color: #6c7cff;
+        position: absolute; border-radius: 50%; border: 2px solid transparent;
+        border-top-color: #6c7cff; width: 70px; height: 70px;
+        left: 50%; top: 50%; transform: translate(-50%, -50%);
         animation: ringSpin 2.8s linear infinite;
-        width: 70px; height: 70px;
       }
       .viz-rings i:nth-child(2) { width: 54px; height: 54px; border-top-color: #ff4f9a; animation-duration: 4.2s; animation-direction: reverse; }
       .viz-rings i:nth-child(3) { width: 38px; height: 38px; border-top-color: #37d39a; animation-duration: 5.6s; }
+      .viz-rings b {
+        width: 12px; height: 12px; border-radius: 50%;
+        background: linear-gradient(135deg, #6c7cff, #ff4f9a);
+      }
       @keyframes ringSpin { to { transform: translate(-50%, -50%) rotate(360deg); } }
-      .viz-spectrum, .viz-mirror { display: flex; flex-direction: column; gap: 3px; }
-      .viz-spectrum > div, .viz-mirror > div {
-        display: flex; align-items: flex-end; gap: 3px; height: 50%; width: 100%;
-      }
-      .viz-spectrum .mirror, .viz-mirror .flip { transform: scaleY(-1); }
-      .viz-spectrum span, .viz-mirror span {
-        flex: 1; height: var(--h); border-radius: 3px;
-        transform-origin: bottom; animation: barDance 1.15s ease-in-out infinite alternate;
-        animation-delay: calc(var(--i) * -0.05s); opacity: .85;
-      }
       .viz-rain span {
         position: absolute; top: -22%; width: 3px; height: 18%;
         left: var(--x); border-radius: 2px;
@@ -4039,16 +4160,28 @@ class YaHomeHubPanel extends HTMLElement {
         20% { opacity: .9; }
         to { transform: translateY(760%); opacity: 0; }
       }
+      .viz-blocks {
+        display: grid; grid-template-columns: repeat(12, 1fr);
+        grid-auto-rows: 1fr; gap: 4px; align-items: end;
+      }
       .viz-blocks span {
-        flex: 1; height: var(--h); border-radius: 4px;
+        border-radius: 3px; height: var(--h);
+        background: linear-gradient(to top, #6c7cff, #ff4f9a);
         transform-origin: bottom;
         animation: blockJump .9s ease-in-out infinite alternate;
-        animation-delay: calc(var(--i) * -0.05s);
+        animation-delay: var(--d);
       }
       @keyframes blockJump {
-        from { transform: scaleY(.55); opacity: .55; }
+        from { transform: scaleY(.5); opacity: .5; }
         to { transform: scaleY(1); opacity: 1; }
       }
+      .full-viz .viz-dots { gap: 8px; }
+      .full-viz .viz-dots span { width: 8px; height: 8px; }
+      .full-viz .radial-ring { width: 124px; height: 124px; }
+      .full-viz .radial-ring span { height: calc(10px + var(--h) * 0.35px); }
+      .full-viz .viz-radial b { width: 16px; height: 16px; }
+      .full-viz .viz-tunnel { perspective: 400px; }
+      .full-viz .viz-blocks { gap: 5px; }
       @media (max-width: 720px) {
         .shell { padding: 18px 14px 50px; }
         .stats { grid-template-columns: repeat(2, minmax(0, 1fr)); }
