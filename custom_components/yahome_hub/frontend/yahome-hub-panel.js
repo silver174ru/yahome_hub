@@ -1869,7 +1869,9 @@ class YaHomeHubPanel extends HTMLElement {
             true
           );
           const speech =
+            result?.response?.response?.speech?.plain?.speech ||
             result?.response?.speech?.plain?.speech ||
+            result?.response?.response?.speech?.plain?.text ||
             result?.response?.speech?.plain?.text ||
             "Готово";
           if (responseEl) responseEl.textContent = speech;
