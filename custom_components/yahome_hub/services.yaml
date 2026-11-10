@@ -107,3 +107,9 @@ set_led:
           options:
             - clock
             - equalizer
+    auto:
+      name: Авто-яркость
+      description: Автоматически подстраивать яркость подсветки под освещение.
+      required: false
+      selector:
+        boolean:

@@ -40,6 +40,7 @@ LED_SCHEMA = vol.Schema(
         vol.Required("entity_id"): str,
         vol.Optional("brightness"): vol.Coerce(float),
         vol.Optional("visualization"): vol.In(["clock", "equalizer"]),
+        vol.Optional("auto"): bool,
     }
 )
 
@@ -97,6 +98,7 @@ async def async_setup_services(hass: HomeAssistant) -> None:
             call.data["entity_id"],
             call.data.get("brightness"),
             call.data.get("visualization"),
+            call.data.get("auto"),
         )
 
     hass.services.async_register(

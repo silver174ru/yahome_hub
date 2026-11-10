@@ -9,7 +9,12 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
-from .const import CAPABILITY_NAMES, CAP_ON_OFF, CAP_TOGGLE
+from .const import (
+    CAPABILITY_NAMES,
+    CAP_ON_OFF,
+    CAP_TOGGLE,
+    LED_SPEAKER_PLATFORMS,
+)
 from .coordinator import YahomeDataUpdateCoordinator
 from .entity import YahomeDeviceEntity
 from .helpers import (
@@ -20,6 +25,7 @@ from .helpers import (
     is_primary_capability,
     primary_domain,
 )
+from .speaker_entity import YahomeSpeakerEntity
 
 
 async def async_setup_entry(
@@ -48,6 +54,11 @@ async def async_setup_entry(
             entities.append(
                 YahomeToggleSwitch(coordinator, device_id, instance)
             )
+    entities.extend(
+        YahomeSpeakerLedAutoSwitch(coordinator, speaker_id)
+        for speaker_id, speaker in coordinator.data.speakers.items()
+        if speaker.get("platform") in LED_SPEAKER_PLATFORMS
+    )
     async_add_entities(entities)
 
 
@@ -116,3 +127,34 @@ class YahomeToggleSwitch(YahomeDeviceEntity, SwitchEntity):
         await self.coordinator.async_device_action(
             self._device_id, CAP_TOGGLE, self._instance, False
         )
+
+
+class YahomeSpeakerLedAutoSwitch(YahomeSpeakerEntity, SwitchEntity):
+    """Automatic brightness mode for a Yandex Station LED."""
+
+    _attr_name = "Подсветка: авто"
+    _attr_icon = "mdi:brightness-auto"
+
+    def __init__(
+        self, coordinator: YahomeDataUpdateCoordinator, speaker_id: str
+    ) -> None:
+        super().__init__(coordinator, speaker_id, "led_auto")
+
+    @property
+    def is_on(self) -> bool:
+        """Return True while the LED brightness is automatic."""
+        return self.coordinator.led_auto(self._speaker_id)
+
+    async def async_turn_on(self, **kwargs: Any) -> None:
+        """Enable automatic LED brightness."""
+        await self.coordinator.async_set_speaker_led_by_id(
+            self._speaker_id, auto=True
+        )
+        self.async_write_ha_state()
+
+    async def async_turn_off(self, **kwargs: Any) -> None:
+        """Switch the LED to manual brightness."""
+        await self.coordinator.async_set_speaker_led_by_id(
+            self._speaker_id, auto=False
+        )
+        self.async_write_ha_state()

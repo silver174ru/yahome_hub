@@ -36,6 +36,8 @@ from .const import (
     DEFAULT_SCAN_INTERVAL,
     DOMAIN,
     EXCLUDED_SPEAKER_PLATFORMS,
+    HDMI_SPEAKER_PLATFORMS,
+    LED_SPEAKER_PLATFORMS,
     MUSIC_SPEAKER_PLATFORMS,
 )
 from .store import YahomeDeviceStore, default_export_path
@@ -88,7 +90,11 @@ class YahomeDataUpdateCoordinator(DataUpdateCoordinator[YahomeData]):
         self._music_queue_tasks: dict[str, asyncio.Task] = {}
         self._led_brightness: dict[str, float] = {}
         self._led_visualization: dict[str, str] = {}
+        self._led_auto: dict[str, bool] = {}
+        self._hdmi_audio: dict[str, bool] = {}
         self._tts_messages: dict[str, str] = {}
+        self._hdmi_load_tasks: set[str] = set()
+        self._speaker_config_loaded: set[str] = set()
         self._discovery = YahomeLocalDiscovery(hass, self._async_local_found)
         self._store = YahomeDeviceStore(hass)
 
@@ -470,6 +476,21 @@ class YahomeDataUpdateCoordinator(DataUpdateCoordinator[YahomeData]):
                 )
                 if conversation_entity:
                     speaker["conversation_entity"] = conversation_entity
+                led_auto_entity = registry.async_get_entity_id(
+                    "switch", DOMAIN, f"{speaker_id}_led_auto"
+                )
+                if led_auto_entity:
+                    speaker["led_auto_entity"] = led_auto_entity
+                led_entity = registry.async_get_entity_id(
+                    "light", DOMAIN, f"{speaker_id}_led"
+                )
+                if led_entity:
+                    speaker["led_entity"] = led_entity
+                screen_entity = registry.async_get_entity_id(
+                    "select", DOMAIN, f"{speaker_id}_screen"
+                )
+                if screen_entity:
+                    speaker["screen_entity"] = screen_entity
 
             self._remove_excluded_speaker_entities()
             self._remove_non_music_speaker_entities(speakers)
@@ -522,6 +543,24 @@ class YahomeDataUpdateCoordinator(DataUpdateCoordinator[YahomeData]):
             quasar_to_iot.get(speaker_id, speaker_id) for speaker_id in speakers
         }
         await self._async_sync_glagols(speakers)
+        for speaker_id, speaker in speakers.items():
+            platform = speaker.get("platform")
+            if (
+                platform in HDMI_SPEAKER_PLATFORMS
+                or platform in LED_SPEAKER_PLATFORMS
+            ) and (
+                speaker_id not in self._speaker_config_loaded
+                and speaker_id not in self._hdmi_load_tasks
+            ):
+                self._hdmi_load_tasks.add(speaker_id)
+                self.hass.async_create_task(
+                    self._async_load_hdmi_state(
+                        speaker_id,
+                        quasar_to_iot.get(speaker_id, speaker_id),
+                        platform in HDMI_SPEAKER_PLATFORMS,
+                        platform in LED_SPEAKER_PLATFORMS,
+                    )
+                )
 
         return YahomeData(
             devices=devices,
@@ -689,13 +728,14 @@ class YahomeDataUpdateCoordinator(DataUpdateCoordinator[YahomeData]):
         entity_id: str,
         brightness: float | None = None,
         visualization: str | None = None,
+        auto: bool | None = None,
     ) -> None:
-        """Set the LED brightness or screen visualization."""
+        """Set the LED brightness, screen visualization or auto mode."""
         speaker_id = self.speaker_id_for_entity(entity_id)
         if not speaker_id:
             raise HomeAssistantError("Speaker not found")
         await self.async_set_speaker_led_by_id(
-            speaker_id, brightness, visualization
+            speaker_id, brightness, visualization, auto
         )
 
     async def async_set_speaker_led_by_id(
@@ -703,8 +743,9 @@ class YahomeDataUpdateCoordinator(DataUpdateCoordinator[YahomeData]):
         speaker_id: str,
         brightness: float | None = None,
         visualization: str | None = None,
+        auto: bool | None = None,
     ) -> None:
-        """Set the LED brightness or screen visualization by speaker ID."""
+        """Set the LED brightness, screen mode or auto mode by speaker ID."""
         quasar = await self.async_live_quasar()
         if quasar is None:
             raise HomeAssistantError("Yandex cookies are not available")
@@ -717,6 +758,11 @@ class YahomeDataUpdateCoordinator(DataUpdateCoordinator[YahomeData]):
             item["auto"] = False
             item["value"] = value
             self._led_brightness[speaker_id] = value
+            self._led_auto[speaker_id] = False
+        if auto is not None:
+            item = led.setdefault("brightness", {"auto": True, "value": 0.5})
+            item["auto"] = bool(auto)
+            self._led_auto[speaker_id] = bool(auto)
         if visualization is not None:
             item = led.setdefault(
                 "music_equalizer_visualization",
@@ -733,6 +779,77 @@ class YahomeDataUpdateCoordinator(DataUpdateCoordinator[YahomeData]):
     def led_visualization(self, speaker_id: str) -> str:
         """Return the last known screen mode."""
         return self._led_visualization.get(speaker_id, "clock")
+
+    def led_auto(self, speaker_id: str) -> bool:
+        """Return True while the LED brightness is managed automatically."""
+        return self._led_auto.get(speaker_id, True)
+
+    async def async_set_speaker_hdmi(
+        self, speaker_id: str, enabled: bool
+    ) -> None:
+        """Route the Station HDMI audio output on or off."""
+        quasar = await self.async_live_quasar()
+        if quasar is None:
+            raise HomeAssistantError("Yandex cookies are not available")
+        device_id = self.data.quasar_to_iot.get(speaker_id, speaker_id)
+        config, version = await quasar.get_device_config(device_id)
+        if enabled:
+            config["hdmiAudio"] = True
+        else:
+            config.pop("hdmiAudio", None)
+        await quasar.set_device_config(device_id, config, version)
+        self._hdmi_audio[speaker_id] = bool(enabled)
+
+    def hdmi_audio(self, speaker_id: str) -> bool:
+        """Return the last known HDMI audio switch state."""
+        return self._hdmi_audio.get(speaker_id, False)
+
+    def hdmi_audio_known(self, speaker_id: str) -> bool | None:
+        """Return the cached HDMI state, or None when it was never read."""
+        return self._hdmi_audio.get(speaker_id)
+
+    async def _async_load_hdmi_state(
+        self,
+        speaker_id: str,
+        device_id: str,
+        load_hdmi: bool,
+        load_led: bool,
+    ) -> None:
+        """Read initial HDMI and LED settings from the Quasar config."""
+        try:
+            quasar = await self.async_live_quasar()
+            if quasar is None:
+                return
+            config, _ = await quasar.get_device_config(device_id)
+            if load_hdmi:
+                self._hdmi_audio[speaker_id] = bool(
+                    config.get("hdmiAudio", False)
+                )
+            if load_led:
+                led = config.get("led") or {}
+                brightness = led.get("brightness") or {}
+                if isinstance(brightness, dict):
+                    self._led_auto[speaker_id] = bool(
+                        brightness.get("auto", True)
+                    )
+                    value = brightness.get("value")
+                    if isinstance(value, (int, float)):
+                        self._led_brightness[speaker_id] = max(
+                            0.0, min(1.0, float(value))
+                        )
+                visualization = (
+                    led.get("music_equalizer_visualization") or {}
+                )
+                if isinstance(visualization, dict):
+                    self._led_visualization[speaker_id] = (
+                        "equalizer" if visualization.get("auto") else "clock"
+                    )
+            self.async_update_listeners()
+        except Exception as err:  # noqa: BLE001
+            _LOGGER.debug("Speaker config read failed for %s: %s", speaker_id, err)
+        finally:
+            self._hdmi_load_tasks.discard(speaker_id)
+            self._speaker_config_loaded.add(speaker_id)
 
     def set_tts_message(self, speaker_id: str, message: str) -> None:
         """Store the pending TTS message for a speaker."""

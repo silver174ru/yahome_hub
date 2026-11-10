@@ -7,6 +7,7 @@ from typing import Any
 from homeassistant.components.media_player import (
     BrowseMedia,
     MediaClass,
+    MediaPlayerDeviceClass,
     MediaPlayerEntity,
     MediaPlayerEntityFeature,
     MediaPlayerState,
@@ -27,7 +28,10 @@ from .const import (
     CAP_VOLUME,
     CONF_MUSIC_TOKEN,
     DOMAIN,
+    HDMI_SPEAKER_PLATFORMS,
     MUSIC_SPEAKER_PLATFORMS,
+    SPEAKER_SOURCE_HDMI,
+    SPEAKER_SOURCE_STATION,
 )
 from .coordinator import YahomeDataUpdateCoordinator
 from .entity import YahomeDeviceEntity
@@ -92,6 +96,8 @@ class YahomeSpeaker(
         self._speaker_id = speaker_id
         self._speaker = speaker
         self._attr_unique_id = f"speaker_{speaker_id}_media_player"
+        if speaker.get("platform") in HDMI_SPEAKER_PLATFORMS:
+            self._attr_device_class = MediaPlayerDeviceClass.TV
 
     @property
     def _glagol_state(self) -> dict[str, Any]:
@@ -161,7 +167,33 @@ class YahomeSpeaker(
                 | MediaPlayerEntityFeature.BROWSE_MEDIA
                 | MediaPlayerEntityFeature.SEARCH_MEDIA
             )
+        if self.source_list:
+            features |= MediaPlayerEntityFeature.SELECT_SOURCE
         return features
+
+    @property
+    def source_list(self) -> list[str] | None:
+        """Return the available Station audio sources."""
+        if self._speaker.get("platform") not in HDMI_SPEAKER_PLATFORMS:
+            return None
+        return [SPEAKER_SOURCE_STATION, SPEAKER_SOURCE_HDMI]
+
+    @property
+    def source(self) -> str | None:
+        """Return the active audio source (Station speakers or HDMI)."""
+        if not self.source_list:
+            return None
+        known = self.coordinator.hdmi_audio_known(self._speaker_id)
+        if known is not None:
+            return SPEAKER_SOURCE_HDMI if known else SPEAKER_SOURCE_STATION
+        hdmi = self._glagol_state.get("hdmi")
+        if isinstance(hdmi, dict) and hdmi.get("present") is not None:
+            return (
+                SPEAKER_SOURCE_HDMI
+                if hdmi.get("present")
+                else SPEAKER_SOURCE_STATION
+            )
+        return SPEAKER_SOURCE_STATION
 
     @property
     def state(self) -> MediaPlayerState:
@@ -317,6 +349,15 @@ class YahomeSpeaker(
             )
             return
         await self.async_media_pause()
+
+    async def async_select_source(self, source: str) -> None:
+        """Switch audio between the Station speakers and HDMI."""
+        if source not in (self.source_list or []):
+            return
+        await self.coordinator.async_set_speaker_hdmi(
+            self._speaker_id, source == SPEAKER_SOURCE_HDMI
+        )
+        self.async_write_ha_state()
 
     async def async_set_volume_level(self, volume: float) -> None:
         """Set the speaker volume."""

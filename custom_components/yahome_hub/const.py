@@ -50,6 +50,14 @@ LED_SPEAKER_PLATFORMS = {
     "bergamot",
 }
 
+HDMI_SPEAKER_PLATFORMS = {
+    "yandexstation",
+    "yandexstation_2",
+}
+
+SPEAKER_SOURCE_STATION = "Станция"
+SPEAKER_SOURCE_HDMI = "HDMI"
+
 CONF_TOKEN = "token"
 CONF_COOKIES = "cookies"
 CONF_MUSIC_TOKEN = "music_token"

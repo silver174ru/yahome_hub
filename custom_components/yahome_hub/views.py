@@ -195,6 +195,9 @@ def _speaker_view(
         "lyrics_entity": speaker.get("lyrics_entity"),
         "calendar_entity": speaker.get("calendar_entity"),
         "conversation_entity": speaker.get("conversation_entity"),
+        "led_auto_entity": speaker.get("led_auto_entity"),
+        "led_entity": speaker.get("led_entity"),
+        "screen_entity": speaker.get("screen_entity"),
         "led_supported": speaker.get("platform")
         in (
             "yandexstation_2",
@@ -204,6 +207,8 @@ def _speaker_view(
             "plum",
             "bergamot",
         ),
+        "hdmi_supported": speaker.get("platform")
+        in ("yandexstation", "yandexstation_2"),
         "sensors": [
             {
                 "instance": (prop.get("state") or {}).get("instance"),
