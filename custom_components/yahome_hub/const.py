@@ -27,6 +27,20 @@ EXCLUDED_SPEAKER_PLATFORMS = {
     "ya360_mail_android",
 }
 
+MUSIC_SPEAKER_PLATFORMS = {
+    "yandexstation",
+    "yandexstation_2",
+    "yandexmini",
+    "yandexmini_2",
+    "yandexmicro",
+    "yandexmidi",
+    "cucumber",
+    "chiron",
+    "pickle",
+    "bergamot",
+    "orion",
+}
+
 CONF_TOKEN = "token"
 CONF_COOKIES = "cookies"
 CONF_MUSIC_TOKEN = "music_token"

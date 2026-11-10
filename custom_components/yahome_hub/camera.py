@@ -10,7 +10,7 @@ from homeassistant.core import HomeAssistant
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
-from .const import CAP_ON_OFF, CONF_MUSIC_TOKEN
+from .const import CAP_ON_OFF, CONF_MUSIC_TOKEN, MUSIC_SPEAKER_PLATFORMS
 from .coordinator import YahomeDataUpdateCoordinator
 from .entity import YahomeDeviceEntity
 from .helpers import get_capability_instance, get_capability_state, primary_domain
@@ -35,6 +35,7 @@ async def async_setup_entry(
         YahomeSpeakerLyricsCamera(coordinator, speaker_id)
         for speaker_id, speaker in coordinator.data.speakers.items()
         if speaker.get("entity_id")
+        and speaker.get("platform") in MUSIC_SPEAKER_PLATFORMS
     )
     async_add_entities(entities)
 

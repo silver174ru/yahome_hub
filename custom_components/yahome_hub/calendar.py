@@ -16,6 +16,7 @@ from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.util import dt as dt_util
 
+from .const import MUSIC_SPEAKER_PLATFORMS
 from .coordinator import YahomeDataUpdateCoordinator
 from .speaker_entity import YahomeSpeakerEntity
 
@@ -43,6 +44,7 @@ async def async_setup_entry(
         YahomeSpeakerCalendar(coordinator, speaker_id)
         for speaker_id, speaker in coordinator.data.speakers.items()
         if speaker.get("entity_id")
+        and speaker.get("platform") in MUSIC_SPEAKER_PLATFORMS
     ]
     async_add_entities(entities)
 

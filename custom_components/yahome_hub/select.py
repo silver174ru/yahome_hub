@@ -9,7 +9,12 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
-from .const import CAPABILITY_NAMES, CAP_MODE, CAP_WORK_SPEED
+from .const import (
+    CAPABILITY_NAMES,
+    CAP_MODE,
+    CAP_WORK_SPEED,
+    MUSIC_SPEAKER_PLATFORMS,
+)
 from .coordinator import YahomeDataUpdateCoordinator
 from .entity import YahomeDeviceEntity
 from .helpers import (
@@ -46,6 +51,7 @@ async def async_setup_entry(
         YahomeEqualizerSelect(coordinator, speaker_id)
         for speaker_id, speaker in coordinator.data.speakers.items()
         if speaker.get("entity_id")
+        and speaker.get("platform") in MUSIC_SPEAKER_PLATFORMS
     ]
     for device_id, device in coordinator.data.devices.items():
         if not coordinator.is_device_visible(device_id):
