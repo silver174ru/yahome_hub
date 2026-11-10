@@ -15,7 +15,7 @@ from homeassistant.const import CONTENT_TYPE_MULTIPART
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
-from PIL import Image, ImageDraw, ImageFilter, ImageFont
+from PIL import Image, ImageChops, ImageDraw, ImageFilter, ImageFont
 
 from .const import CAP_ON_OFF, CONF_MUSIC_TOKEN, MUSIC_SPEAKER_PLATFORMS
 from .coordinator import YahomeDataUpdateCoordinator
@@ -305,7 +305,11 @@ def _render_lyrics_frame(
         canvas.paste(background, (0, 0))
         size = 560
         square = cover_image.resize((size, size))
-        canvas.paste(square, (70, 80))
+        mask = Image.new("L", (size, size), 0)
+        ImageDraw.Draw(mask).rounded_rectangle(
+            (0, 0, size, size), radius=28, fill=255
+        )
+        canvas.paste(square, (70, 80), mask)
         draw.rounded_rectangle(
             (70, 80, 70 + size, 80 + size),
             radius=28,
@@ -334,35 +338,104 @@ def _render_lyrics_frame(
         fill=(220, 220, 230, 190),
     )
 
-    draw.rectangle((0, height - 170, width, height), fill=(8, 8, 14, 150))
-    if current:
-        draw.text(
-            (width // 2, height - 115),
-            current,
-            font=font_line,
-            fill=(255, 255, 255, 245),
-            anchor="mm",
-        )
-    if next_line:
-        draw.text(
-            (width // 2, height - 55),
-            next_line,
-            font=font_next,
-            fill=(200, 200, 215, 190),
-            anchor="mm",
-        )
-    if not current and not next_line:
-        draw.text(
-            (width // 2, height - 80),
-            "Текст песни недоступен",
-            font=font_artist,
-            fill=(200, 200, 215, 170),
-            anchor="mm",
-        )
+    if cover_image:
+        _draw_cover_lyrics(canvas, (70, 80, size, size), current, next_line)
+    else:
+        draw.rectangle((0, height - 170, width, height), fill=(8, 8, 14, 150))
+        if current:
+            draw.text(
+                (width // 2, height - 115),
+                current,
+                font=font_line,
+                fill=(255, 255, 255, 245),
+                anchor="mm",
+            )
+        if next_line:
+            draw.text(
+                (width // 2, height - 55),
+                next_line,
+                font=font_next,
+                fill=(200, 200, 215, 190),
+                anchor="mm",
+            )
+        if not current and not next_line:
+            draw.text(
+                (width // 2, height - 80),
+                "Текст песни недоступен",
+                font=font_artist,
+                fill=(200, 200, 215, 170),
+                anchor="mm",
+            )
 
     buffer = io.BytesIO()
     canvas.save(buffer, format="JPEG", quality=86)
     return buffer.getvalue()
+
+
+def _draw_cover_lyrics(
+    canvas: Image.Image,
+    box: tuple[int, int, int, int],
+    current: str | None,
+    next_line: str | None,
+) -> None:
+    """Draw the lyric stream over the bottom of the cover."""
+    x, y, width, height = box
+    overlay = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(overlay, "RGBA")
+    overlay_height = min(230, height // 2)
+    for offset in range(overlay_height):
+        alpha = int(240 * (offset / overlay_height) ** 1.4)
+        draw.line(
+            (
+                0,
+                height - overlay_height + offset,
+                width,
+                height - overlay_height + offset,
+            ),
+            fill=(5, 6, 15, alpha),
+        )
+
+    font_current = ImageFont.truetype(str(FONT_PATH), 34)
+    font_next = ImageFont.truetype(str(FONT_PATH), 21)
+    center_x = width // 2
+    if current:
+        text = _wrap_text(current, font_current, width - 56)
+        bbox = draw.multiline_textbbox(
+            (0, 0), text, font=font_current, spacing=6, align="center"
+        )
+        text_height = bbox[3] - bbox[1]
+        draw.multiline_text(
+            (center_x, height - 54 - text_height),
+            text,
+            font=font_current,
+            fill=(255, 255, 255, 245),
+            anchor="ma",
+            align="center",
+            spacing=6,
+        )
+    if next_line:
+        draw.text(
+            (center_x, height - 26),
+            next_line,
+            font=font_next,
+            fill=(210, 210, 225, 190),
+            anchor="ms",
+        )
+    if not current and not next_line:
+        draw.text(
+            (center_x, height - 38),
+            "Текст песни недоступен",
+            font=font_next,
+            fill=(210, 210, 225, 180),
+            anchor="ms",
+        )
+
+    mask = Image.new("L", (width, height), 0)
+    ImageDraw.Draw(mask).rounded_rectangle(
+        (0, 0, width, height), radius=28, fill=255
+    )
+    overlay.putalpha(ImageChops.multiply(overlay.getchannel("A"), mask))
+    canvas.paste(overlay, (x, y), overlay)
 
 
 def _wrap_text(text: str, font: ImageFont.FreeTypeFont, width: int) -> str:
