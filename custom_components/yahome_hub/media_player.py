@@ -8,6 +8,7 @@ from homeassistant.components.media_player import (
     MediaPlayerEntity,
     MediaPlayerEntityFeature,
     MediaPlayerState,
+    RepeatMode,
 )
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
@@ -142,6 +143,9 @@ class YahomeSpeaker(
                 MediaPlayerEntityFeature.PREVIOUS_TRACK
                 | MediaPlayerEntityFeature.NEXT_TRACK
                 | MediaPlayerEntityFeature.SEEK
+                | MediaPlayerEntityFeature.PLAY_MEDIA
+                | MediaPlayerEntityFeature.SHUFFLE_SET
+                | MediaPlayerEntityFeature.REPEAT_SET
             )
         return features
 
@@ -179,6 +183,24 @@ class YahomeSpeaker(
     @property
     def is_volume_muted(self) -> bool:
         return self.volume_level == 0
+
+    @property
+    def shuffle(self) -> bool | None:
+        """Return the current shuffle state."""
+        value = (self._player.get("entityInfo") or {}).get("shuffled")
+        return bool(value) if value is not None else None
+
+    @property
+    def repeat(self) -> RepeatMode | None:
+        """Return the current repeat mode."""
+        value = (self._player.get("entityInfo") or {}).get("repeatMode")
+        if value == "All":
+            return RepeatMode.ALL
+        if value == "One":
+            return RepeatMode.ONE
+        if value == "None":
+            return RepeatMode.OFF
+        return None
 
     @property
     def media_title(self) -> str | None:
@@ -338,6 +360,30 @@ class YahomeSpeaker(
         """Seek to a position in the current track."""
         await self._glagol_send(
             {"command": "rewind", "position": float(position)}
+        )
+
+    async def async_set_shuffle(self, shuffle: bool) -> None:
+        """Enable or disable shuffle."""
+        await self._glagol_send(
+            {"command": "shuffle", "enable": bool(shuffle)}
+        )
+
+    async def async_set_repeat(self, repeat: RepeatMode) -> None:
+        """Set the repeat mode."""
+        modes = {
+            RepeatMode.OFF: "None",
+            RepeatMode.ALL: "All",
+            RepeatMode.ONE: "One",
+        }
+        if mode := modes.get(repeat):
+            await self._glagol_send({"command": "repeat", "mode": mode})
+
+    async def async_play_media(
+        self, media_type: str, media_id: str, **kwargs: Any
+    ) -> None:
+        """Play a Yandex Music track, YouTube link or search query."""
+        await self.coordinator.async_play_speaker_media(
+            self.entity_id, media_id, media_type
         )
 
     async def _send_action(

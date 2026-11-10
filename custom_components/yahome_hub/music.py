@@ -22,6 +22,60 @@ def _sign(*parts: Any) -> str:
     return base64.b64encode(digest).decode()
 
 
+async def async_search_tracks(
+    session: ClientSession,
+    query: str,
+    music_token: str | None = None,
+    limit: int = 10,
+) -> list[dict[str, Any]]:
+    """Search Yandex Music tracks and return lightweight results."""
+    query = str(query or "").strip()
+    if not query:
+        return []
+    headers = dict(MUSIC_HEADERS)
+    if music_token:
+        headers["Authorization"] = f"OAuth {music_token}"
+    try:
+        async with session.get(
+            f"{MUSIC_API}/search",
+            params={
+                "text": query,
+                "type": "track",
+                "page": 0,
+                "nocorrect": "false",
+            },
+            headers=headers,
+        ) as response:
+            if response.status != 200:
+                return []
+            payload = await response.json(content_type=None)
+    except (ClientError, ValueError):
+        return []
+    result = payload.get("result") if isinstance(payload, dict) else None
+    tracks = ((result or {}).get("tracks") or {}).get("results") or []
+    items: list[dict[str, Any]] = []
+    for track in tracks[: max(1, int(limit))]:
+        artists = ", ".join(
+            artist.get("name", "") for artist in track.get("artists") or []
+        )
+        albums = track.get("albums") or []
+        album = albums[0].get("title", "") if albums else ""
+        cover = track.get("coverUri") or ""
+        if cover and "://" not in cover:
+            cover = "https://" + cover.replace("%%", "400x400")
+        items.append(
+            {
+                "id": str(track.get("id")),
+                "title": track.get("title") or "",
+                "artist": artists,
+                "album": album,
+                "duration": int((track.get("durationMs") or 0) / 1000),
+                "cover": cover,
+            }
+        )
+    return items
+
+
 async def async_get_lyrics(
     session: ClientSession,
     track_id: str,

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import re
 from http.cookies import SimpleCookie
 from typing import Any
@@ -42,13 +43,64 @@ class YahomeApiError(YahomeError):
     """Raised for non-auth API errors."""
 
 
+_IGNORED_COOKIE_ATTRS = {
+    "domain",
+    "path",
+    "expires",
+    "max-age",
+    "samesite",
+    "secure",
+    "httponly",
+    "version",
+    "comment",
+    "priority",
+}
+
+
 def _clean_cookies(cookies: str | None) -> str:
-    """Normalize a pasted Cookie header."""
+    """Normalize a Cookie header or a pasted Set-Cookie blob."""
     if not cookies:
         return ""
     value = cookies.strip()
     if value.lower().startswith("cookie:"):
         value = value.split(":", 1)[1].strip()
+
+    if value.startswith("["):
+        try:
+            items = json.loads(value)
+            parts = [
+                f"{item['name']}={item['value']}"
+                for item in items
+                if item.get("name") and item.get("value")
+            ]
+            if parts:
+                return "; ".join(parts)
+        except (TypeError, ValueError, KeyError):
+            pass
+
+    if "set-cookie:" in value.lower() or "domain=" in value.lower():
+        parts: list[str] = []
+        seen: set[str] = set()
+        for chunk in re.split(r"(?i)set-cookie:", value):
+            for part in chunk.split(";"):
+                part = part.strip()
+                if not part or "=" not in part:
+                    continue
+                name, item_value = part.split("=", 1)
+                name = name.strip()
+                item_value = item_value.strip()
+                if (
+                    not name
+                    or name.lower() in _IGNORED_COOKIE_ATTRS
+                    or name.startswith(("(", "'", '"'))
+                    or " " in name
+                    or name in seen
+                ):
+                    continue
+                seen.add(name)
+                parts.append(f"{name}={item_value}")
+        if parts:
+            return "; ".join(parts)
     return value
 
 

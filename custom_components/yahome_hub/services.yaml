@@ -51,3 +51,59 @@ export:
       required: false
       selector:
         text:
+
+say:
+  name: Озвучить текст
+  description: Алиса произнесёт текст на выбранной колонке.
+  fields:
+    entity_id:
+      name: Колонка
+      required: true
+      selector:
+        entity:
+          integration: yahome_hub
+          domain: media_player
+    message:
+      name: Текст
+      required: true
+      selector:
+        text:
+          multiline: true
+    volume_level:
+      name: Громкость
+      description: От 0 до 1.
+      required: false
+      selector:
+        number:
+          min: 0
+          max: 1
+          step: 0.05
+
+set_led:
+  name: Настроить подсветку
+  description: Яркость LED-кольца и режим экрана Станции.
+  fields:
+    entity_id:
+      name: Колонка
+      required: true
+      selector:
+        entity:
+          integration: yahome_hub
+          domain: media_player
+    brightness:
+      name: Яркость
+      description: От 0 до 1.
+      required: false
+      selector:
+        number:
+          min: 0
+          max: 1
+          step: 0.05
+    visualization:
+      name: Экран
+      required: false
+      selector:
+        select:
+          options:
+            - clock
+            - equalizer

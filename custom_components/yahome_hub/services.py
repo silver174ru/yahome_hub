@@ -14,6 +14,8 @@ SERVICE_SEND_ACTION = "send_action"
 SERVICE_EXECUTE_SCENARIO = "execute_scenario"
 SERVICE_REFRESH = "refresh"
 SERVICE_EXPORT = "export"
+SERVICE_SAY = "say"
+SERVICE_SET_LED = "set_led"
 
 SEND_ACTION_SCHEMA = vol.Schema(
     {
@@ -26,6 +28,20 @@ SEND_ACTION_SCHEMA = vol.Schema(
 
 SCENARIO_SCHEMA = vol.Schema({vol.Required("scenario_id"): str})
 EXPORT_SCHEMA = vol.Schema({vol.Optional("path"): str})
+SAY_SCHEMA = vol.Schema(
+    {
+        vol.Required("entity_id"): str,
+        vol.Required("message"): str,
+        vol.Optional("volume_level"): vol.Coerce(float),
+    }
+)
+LED_SCHEMA = vol.Schema(
+    {
+        vol.Required("entity_id"): str,
+        vol.Optional("brightness"): vol.Coerce(float),
+        vol.Optional("visualization"): vol.In(["clock", "equalizer"]),
+    }
+)
 
 
 async def async_setup_services(hass: HomeAssistant) -> None:
@@ -63,6 +79,26 @@ async def async_setup_services(hass: HomeAssistant) -> None:
         path = await coordinator.async_export(call.data.get("path"))
         return path
 
+    async def handle_say(call: ServiceCall) -> None:
+        coordinator = get_coordinator(hass)
+        if coordinator is None:
+            raise ValueError("YaHome Hub is not configured")
+        await coordinator.async_say(
+            call.data["entity_id"],
+            call.data["message"],
+            call.data.get("volume_level"),
+        )
+
+    async def handle_set_led(call: ServiceCall) -> None:
+        coordinator = get_coordinator(hass)
+        if coordinator is None:
+            raise ValueError("YaHome Hub is not configured")
+        await coordinator.async_set_speaker_led(
+            call.data["entity_id"],
+            call.data.get("brightness"),
+            call.data.get("visualization"),
+        )
+
     hass.services.async_register(
         DOMAIN, SERVICE_SEND_ACTION, handle_send_action, schema=SEND_ACTION_SCHEMA
     )
@@ -81,4 +117,10 @@ async def async_setup_services(hass: HomeAssistant) -> None:
         handle_export,
         schema=EXPORT_SCHEMA,
         supports_response=SupportsResponse.OPTIONAL,
+    )
+    hass.services.async_register(
+        DOMAIN, SERVICE_SAY, handle_say, schema=SAY_SCHEMA
+    )
+    hass.services.async_register(
+        DOMAIN, SERVICE_SET_LED, handle_set_led, schema=LED_SCHEMA
     )

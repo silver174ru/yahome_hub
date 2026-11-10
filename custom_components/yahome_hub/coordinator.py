@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import time
 from datetime import timedelta
 from typing import Any
@@ -39,6 +40,7 @@ from .const import (
 )
 from .store import YahomeDeviceStore, default_export_path
 from .models import YahomeData
+from .music import async_search_tracks
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -442,6 +444,22 @@ class YahomeDataUpdateCoordinator(DataUpdateCoordinator[YahomeData]):
                 )
                 if lyrics_entity:
                     speaker["lyrics_entity"] = lyrics_entity
+                calendar_entity = registry.async_get_entity_id(
+                    "calendar", DOMAIN, f"{speaker_id}_calendar"
+                ) or registry.async_get_entity_id(
+                    "calendar", "yandex_station", f"{speaker_id}_calendar"
+                )
+                if calendar_entity:
+                    speaker["calendar_entity"] = calendar_entity
+                conversation_entity = registry.async_get_entity_id(
+                    "conversation", DOMAIN, f"{speaker_id}_conversation"
+                ) or registry.async_get_entity_id(
+                    "conversation",
+                    "yandex_station",
+                    f"{speaker_id}_conversation",
+                )
+                if conversation_entity:
+                    speaker["conversation_entity"] = conversation_entity
 
             self._remove_excluded_speaker_entities()
             self._remove_non_music_speaker_entities(speakers)
@@ -599,6 +617,165 @@ class YahomeDataUpdateCoordinator(DataUpdateCoordinator[YahomeData]):
         except YahomeApiError as err:
             raise HomeAssistantError(str(err)) from err
         await self.async_request_refresh()
+
+    def speaker_id_for_entity(self, entity_id: str) -> str | None:
+        """Return the local speaker ID for a media_player entity."""
+        for speaker_id, speaker in self.data.speakers.items():
+            if speaker.get("entity_id") == entity_id:
+                return speaker_id
+        return None
+
+    async def async_say(
+        self,
+        entity_id: str,
+        message: str,
+        volume_level: float | None = None,
+    ) -> None:
+        """Announce a phrase through the local speaker connection."""
+        speaker_id = self.speaker_id_for_entity(entity_id)
+        if not speaker_id:
+            raise HomeAssistantError("Speaker not found")
+        glagol = self._glagols.get(speaker_id)
+        if glagol is None or not glagol.connected:
+            raise HomeAssistantError("Local speaker connection is not ready")
+        if volume_level is not None:
+            await glagol.send(
+                {
+                    "command": "setVolume",
+                    "volume": max(0.0, min(1.0, float(volume_level))),
+                }
+            )
+        payload = {
+            "command": "serverAction",
+            "serverActionEventPayload": {
+                "type": "server_action",
+                "name": "update_form",
+                "payload": {
+                    "form_update": {
+                        "name": (
+                            "personal_assistant.scenarios.quasar.iot.repeat_phrase"
+                        ),
+                        "slots": [
+                            {
+                                "type": "string",
+                                "name": "phrase_to_repeat",
+                                "value": str(message)[:500],
+                            }
+                        ],
+                    },
+                    "resubmit": True,
+                },
+            },
+        }
+        await glagol.send(payload, wait=False)
+
+    async def async_set_speaker_led(
+        self,
+        entity_id: str,
+        brightness: float | None = None,
+        visualization: str | None = None,
+    ) -> None:
+        """Set the LED brightness or screen visualization."""
+        speaker_id = self.speaker_id_for_entity(entity_id)
+        if not speaker_id:
+            raise HomeAssistantError("Speaker not found")
+        quasar = await self.async_live_quasar()
+        if quasar is None:
+            raise HomeAssistantError("Yandex cookies are not available")
+        device_id = self.data.quasar_to_iot.get(speaker_id, speaker_id)
+        config, version = await quasar.get_device_config(device_id)
+        led = config.setdefault("led", {})
+        if brightness is not None:
+            value = max(0.0, min(1.0, float(brightness)))
+            item = led.setdefault("brightness", {"auto": True, "value": 0.5})
+            item["auto"] = False
+            item["value"] = value
+        if visualization is not None:
+            item = led.setdefault(
+                "music_equalizer_visualization",
+                {"style": "showClock", "auto": False},
+            )
+            item["auto"] = visualization != "clock"
+        await quasar.set_device_config(device_id, config, version)
+
+    async def async_play_speaker_media(
+        self,
+        entity_id: str,
+        media_id: str,
+        media_type: str = "music",
+    ) -> None:
+        """Play a Yandex Music track, YouTube link or search query locally."""
+        speaker_id = self.speaker_id_for_entity(entity_id)
+        if not speaker_id:
+            raise HomeAssistantError("Speaker not found")
+        glagol = self._glagols.get(speaker_id)
+        if glagol is None or not glagol.connected:
+            raise HomeAssistantError("Local speaker connection is not ready")
+        value = str(media_id or "").strip()
+        if not value:
+            return
+        payload: dict[str, Any] | None = None
+        if value.isdigit():
+            payload = {"command": "playMusic", "id": value, "type": "track"}
+        elif "music.yandex" in value:
+            match = re.search(r"(track|album|artist|playlist)/(\d+)", value)
+            if match:
+                payload = {
+                    "command": "playMusic",
+                    "type": match.group(1),
+                    "id": match.group(2),
+                }
+        elif "youtu" in value:
+            match = re.search(
+                r"(?:youtu\.be/|v=)([0-9A-Za-z_-]{11})", value
+            )
+            if match:
+                payload = {
+                    "command": "serverAction",
+                    "serverActionEventPayload": {
+                        "type": "server_action",
+                        "name": "bass_action",
+                        "payload": {
+                            "data": {
+                                "video_descriptor": {
+                                    "provider_item_id": match.group(1),
+                                    "provider_name": "youtube",
+                                }
+                            },
+                            "name": "quasar.play_video_by_descriptor",
+                        },
+                    },
+                }
+        if payload is None:
+            tracks = await async_search_tracks(
+                self._session,
+                value,
+                self.entry.data.get(CONF_MUSIC_TOKEN),
+                1,
+            )
+            if tracks:
+                payload = {
+                    "command": "playMusic",
+                    "id": tracks[0]["id"],
+                    "type": "track",
+                }
+        if payload is None:
+            raise HomeAssistantError("Could not resolve media")
+        await glagol.send(payload, wait=False)
+        if payload.get("command") == "playMusic":
+            await asyncio.sleep(0.5)
+            await glagol.send({"command": "play"}, wait=False)
+
+    async def async_search_music(
+        self, query: str, limit: int = 10
+    ) -> list[dict[str, Any]]:
+        """Search Yandex Music tracks."""
+        return await async_search_tracks(
+            self._session,
+            query,
+            self.entry.data.get(CONF_MUSIC_TOKEN),
+            limit,
+        )
 
     async def async_export(self, path: str | None = None) -> dict[str, str]:
         """Export the full device database to JSON and SQLite."""

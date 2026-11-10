@@ -160,6 +160,7 @@ class YahomeGlagol:
                 async for message in self._ws:
                     if message.type != WSMsgType.TEXT:
                         continue
+                    fails = 0
                     try:
                         data = json.loads(message.data)
                     except (TypeError, ValueError):
@@ -198,7 +199,7 @@ class YahomeGlagol:
             if self._stop.is_set():
                 break
             fails += 1
-            await asyncio.sleep(min(30, 5 * fails))
+            await asyncio.sleep(min(10, 2 * fails))
 
     async def _send_raw(self, payload: dict[str, Any]) -> None:
         if not self._ws or self._ws.closed:
