@@ -771,6 +771,7 @@ class YahomeDataUpdateCoordinator(DataUpdateCoordinator[YahomeData]):
             item["auto"] = visualization != "clock"
             self._led_visualization[speaker_id] = visualization
         await quasar.set_device_config(device_id, config, version)
+        self.async_update_listeners()
 
     def led_brightness(self, speaker_id: str) -> float:
         """Return the last known LED brightness (0..1)."""
@@ -799,6 +800,7 @@ class YahomeDataUpdateCoordinator(DataUpdateCoordinator[YahomeData]):
             config.pop("hdmiAudio", None)
         await quasar.set_device_config(device_id, config, version)
         self._hdmi_audio[speaker_id] = bool(enabled)
+        self.async_update_listeners()
 
     def hdmi_audio(self, speaker_id: str) -> bool:
         """Return the last known HDMI audio switch state."""
