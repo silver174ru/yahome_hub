@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import io
-import re
 from pathlib import Path
 from typing import Any
 
@@ -21,7 +20,7 @@ from .const import CAP_ON_OFF, CONF_MUSIC_TOKEN, MUSIC_SPEAKER_PLATFORMS
 from .coordinator import YahomeDataUpdateCoordinator
 from .entity import YahomeDeviceEntity
 from .helpers import get_capability_instance, get_capability_state, primary_domain
-from .music import async_get_lyrics, parse_lyrics_line
+from .music import async_get_lyrics, parse_lyrics_triplet
 from .speaker_entity import YahomeSpeakerEntity
 
 
@@ -222,16 +221,21 @@ class YahomeSpeakerLyricsCamera(YahomeSpeakerEntity, Camera):
                 pass
         if position is not None:
             position += self.coordinator.lyrics_offset
-        current = parse_lyrics_line(self._lyrics, position)
-        next_line = _next_lyric_line(self._lyrics, position)
+        info = parse_lyrics_triplet(self._lyrics, position)
+        fade = 1.0
+        if info.get("start") is not None and position is not None:
+            fade = min(1.0, max(0.0, (position - info["start"]) / 0.5))
         cover = await self._async_cover()
         return await self.hass.async_add_executor_job(
             _render_lyrics_frame,
             cover,
             attrs.get("media_title"),
             attrs.get("media_artist"),
-            current,
-            next_line,
+            info.get("prev"),
+            info.get("current"),
+            info.get("next"),
+            info.get("remaining"),
+            fade,
         )
 
     @property
@@ -253,43 +257,32 @@ class YahomeSpeakerLyricsCamera(YahomeSpeakerEntity, Camera):
                 pass
         if position is not None:
             position += self.coordinator.lyrics_offset
+        info = parse_lyrics_triplet(self._lyrics, position)
         return {
             "media_title": attrs.get("media_title"),
             "media_artist": attrs.get("media_artist"),
             "media_content_id": attrs.get("media_content_id"),
             "lyrics": self._lyrics,
-            "current_line": parse_lyrics_line(self._lyrics, position),
+            "prev_line": info.get("prev"),
+            "current_line": info.get("current"),
+            "next_line": info.get("next"),
+            "remaining": info.get("remaining"),
             "lyrics_offset": self.coordinator.lyrics_offset,
         }
 
 
 FONT_PATH = Path(__file__).parent / "fonts" / "DejaVuSans.ttf"
-LYRIC_RE = re.compile(r"^\[([0-9]{2}):([0-9]{2})(?:\.([0-9]{2,3}))?\]\s*(.*)$")
-
-
-def _next_lyric_line(lyrics: str | None, position: float | None) -> str | None:
-    if not lyrics:
-        return None
-    next_line = None
-    for raw in lyrics.splitlines():
-        match = LYRIC_RE.match(raw.strip())
-        if not match:
-            continue
-        seconds = int(match.group(1)) * 60 + int(match.group(2))
-        if match.group(3):
-            seconds += int(match.group(3)) / (100 if len(match.group(3)) == 2 else 1000)
-        if position is not None and seconds > position:
-            next_line = match.group(4).strip()
-            break
-    return next_line or None
 
 
 def _render_lyrics_frame(
     cover: bytes | None,
     title: str | None,
     artist: str | None,
+    prev_line: str | None,
     current: str | None,
     next_line: str | None,
+    remaining: float | None,
+    fade: float,
 ) -> bytes:
     width, height = 1280, 720
     canvas = Image.new("RGB", (width, height), "#101018")
@@ -344,23 +337,47 @@ def _render_lyrics_frame(
     )
 
     if cover_image:
-        _draw_cover_lyrics(canvas, (70, 80, size, size), current, next_line)
+        _draw_cover_lyrics(
+            canvas,
+            (70, 80, size, size),
+            prev_line,
+            current,
+            next_line,
+            remaining,
+            fade,
+        )
     else:
-        draw.rectangle((0, height - 170, width, height), fill=(8, 8, 14, 150))
+        draw.rectangle((0, height - 230, width, height), fill=(8, 8, 14, 170))
+        if prev_line:
+            draw.text(
+                (width // 2, height - 190),
+                prev_line,
+                font=font_next,
+                fill=(190, 190, 205, 150),
+                anchor="mm",
+            )
         if current:
             draw.text(
-                (width // 2, height - 115),
+                (width // 2, height - 120),
                 current,
                 font=font_line,
                 fill=(255, 255, 255, 245),
                 anchor="mm",
             )
+            if remaining is not None:
+                draw.text(
+                    (32, height - 120),
+                    f"{remaining:.1f}",
+                    font=font_next,
+                    fill=(210, 210, 225, 200),
+                    anchor="lm",
+                )
         if next_line:
             draw.text(
                 (width // 2, height - 55),
                 next_line,
                 font=font_next,
-                fill=(200, 200, 215, 190),
+                fill=(200, 200, 215, 170),
                 anchor="mm",
             )
         if not current and not next_line:
@@ -380,16 +397,19 @@ def _render_lyrics_frame(
 def _draw_cover_lyrics(
     canvas: Image.Image,
     box: tuple[int, int, int, int],
+    prev_line: str | None,
     current: str | None,
     next_line: str | None,
+    remaining: float | None,
+    fade: float,
 ) -> None:
-    """Draw the lyric stream over the bottom of the cover."""
+    """Draw three lyric lines with a countdown over the cover."""
     x, y, width, height = box
     overlay = Image.new("RGBA", (width, height), (0, 0, 0, 0))
     draw = ImageDraw.Draw(overlay, "RGBA")
-    overlay_height = min(230, height // 2)
+    overlay_height = min(310, int(height * 0.58))
     for offset in range(overlay_height):
-        alpha = int(240 * (offset / overlay_height) ** 1.4)
+        alpha = int(245 * (offset / overlay_height) ** 1.35)
         draw.line(
             (
                 0,
@@ -400,35 +420,67 @@ def _draw_cover_lyrics(
             fill=(5, 6, 15, alpha),
         )
 
-    font_current = ImageFont.truetype(str(FONT_PATH), 34)
-    font_next = ImageFont.truetype(str(FONT_PATH), 21)
+    font_prev = ImageFont.truetype(str(FONT_PATH), 20)
+    font_current = ImageFont.truetype(str(FONT_PATH), 31)
+    font_next = ImageFont.truetype(str(FONT_PATH), 20)
+    font_count = ImageFont.truetype(str(FONT_PATH), 19)
+    fade = max(0.0, min(1.0, float(fade)))
     center_x = width // 2
+    overlay_top = height - overlay_height
+    prev_alpha = int(125 + 70 * (1.0 - fade))
+
+    if prev_line:
+        text = _wrap_text(prev_line, font_prev, width - 48)
+        draw.multiline_text(
+            (center_x, overlay_top + 24),
+            text,
+            font=font_prev,
+            fill=(215, 215, 230, prev_alpha),
+            anchor="ma",
+            align="center",
+            spacing=4,
+        )
+
     if current:
-        text = _wrap_text(current, font_current, width - 56)
+        text = _wrap_text(current, font_current, width - 104)
         bbox = draw.multiline_textbbox(
             (0, 0), text, font=font_current, spacing=6, align="center"
         )
         text_height = bbox[3] - bbox[1]
+        current_y = height - 72 - text_height
         draw.multiline_text(
-            (center_x, height - 54 - text_height),
+            (70 + (width - 90) // 2, current_y),
             text,
             font=font_current,
-            fill=(255, 255, 255, 245),
+            fill=(255, 255, 255, int(245 * fade)),
             anchor="ma",
             align="center",
             spacing=6,
         )
+        if remaining is not None:
+            draw.text(
+                (24, current_y + 10),
+                f"{remaining:.1f}",
+                font=font_count,
+                fill=(220, 220, 235, int(210 * fade)),
+                anchor="la",
+            )
+
     if next_line:
-        draw.text(
-            (center_x, height - 26),
-            next_line,
+        text = _wrap_text(next_line, font_next, width - 48)
+        draw.multiline_text(
+            (center_x, height - 30),
+            text,
             font=font_next,
-            fill=(210, 210, 225, 190),
+            fill=(205, 205, 220, 185),
             anchor="ms",
+            align="center",
+            spacing=4,
         )
-    if not current and not next_line:
+
+    if not current and not next_line and not prev_line:
         draw.text(
-            (center_x, height - 38),
+            (center_x, height - 40),
             "Текст песни недоступен",
             font=font_next,
             fill=(210, 210, 225, 180),

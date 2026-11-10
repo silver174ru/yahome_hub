@@ -84,6 +84,8 @@ class YahomeDataUpdateCoordinator(DataUpdateCoordinator[YahomeData]):
         self._track_meta: dict[str, dict[str, Any]] = {}
         self._lyrics_offset = 0.0
         self._suppress_panel_event = False
+        self._music_queues: dict[str, dict[str, Any]] = {}
+        self._music_queue_tasks: dict[str, asyncio.Task] = {}
         self._discovery = YahomeLocalDiscovery(hass, self._async_local_found)
         self._store = YahomeDeviceStore(hass)
 
@@ -625,6 +627,11 @@ class YahomeDataUpdateCoordinator(DataUpdateCoordinator[YahomeData]):
                 return speaker_id
         return None
 
+    def speaker_entity_id(self, speaker_id: str) -> str | None:
+        """Return the media_player entity ID for a local speaker."""
+        speaker = self.data.speakers.get(speaker_id)
+        return speaker.get("entity_id") if speaker else None
+
     async def async_say(
         self,
         entity_id: str,
@@ -716,10 +723,14 @@ class YahomeDataUpdateCoordinator(DataUpdateCoordinator[YahomeData]):
             return
         payload: dict[str, Any] | None = None
         if value.isdigit():
-            payload = {"command": "playMusic", "id": value, "type": "track"}
-        elif "music.yandex" in value:
+            await self.async_play_track(entity_id, value)
+            return
+        if "music.yandex" in value:
             match = re.search(r"(track|album|artist|playlist)/(\d+)", value)
             if match:
+                if match.group(1) == "track":
+                    await self.async_play_track(entity_id, match.group(2))
+                    return
                 payload = {
                     "command": "playMusic",
                     "type": match.group(1),
@@ -754,11 +765,8 @@ class YahomeDataUpdateCoordinator(DataUpdateCoordinator[YahomeData]):
                 1,
             )
             if tracks:
-                payload = {
-                    "command": "playMusic",
-                    "id": tracks[0]["id"],
-                    "type": "track",
-                }
+                await self.async_play_track(entity_id, tracks[0]["id"])
+                return
         if payload is None:
             raise HomeAssistantError("Could not resolve media")
         await glagol.send(payload, wait=False)
@@ -776,6 +784,162 @@ class YahomeDataUpdateCoordinator(DataUpdateCoordinator[YahomeData]):
             self.entry.data.get(CONF_MUSIC_TOKEN),
             limit,
         )
+
+    def music_queue(self, speaker_id: str) -> dict[str, Any]:
+        """Return a copy of the local music queue for a speaker."""
+        queue = self._music_queues.get(speaker_id)
+        if not queue:
+            return {"tracks": [], "index": -1, "current": None}
+        tracks = list(queue.get("tracks") or [])
+        index = int(queue.get("index", -1))
+        current = tracks[index] if 0 <= index < len(tracks) else None
+        return {"tracks": tracks, "index": index, "current": current}
+
+    async def _play_music_id(self, speaker_id: str, track_id: str) -> None:
+        glagol = self._glagols.get(speaker_id)
+        if glagol is None or not glagol.connected:
+            raise HomeAssistantError("Local speaker connection is not ready")
+        await glagol.send(
+            {"command": "playMusic", "id": str(track_id), "type": "track"},
+            wait=False,
+        )
+        await asyncio.sleep(0.5)
+        await glagol.send({"command": "play"}, wait=False)
+
+    async def async_play_track(
+        self,
+        entity_id: str,
+        track_id: str,
+        queue: list[dict[str, Any]] | None = None,
+        index: int = 0,
+    ) -> None:
+        """Play a track and optionally replace the local queue."""
+        speaker_id = self.speaker_id_for_entity(entity_id)
+        if not speaker_id:
+            raise HomeAssistantError("Speaker not found")
+        if queue is not None:
+            index = max(0, min(len(queue) - 1, int(index))) if queue else -1
+            self._music_queues[speaker_id] = {
+                "tracks": list(queue),
+                "index": index,
+            }
+            self._start_queue_monitor(speaker_id)
+        await self._play_music_id(speaker_id, track_id)
+
+    async def async_queue_add(
+        self, entity_id: str, track: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Append a track to the local queue."""
+        speaker_id = self.speaker_id_for_entity(entity_id)
+        if not speaker_id:
+            raise HomeAssistantError("Speaker not found")
+        queue = self._music_queues.setdefault(
+            speaker_id, {"tracks": [], "index": -1}
+        )
+        queue["tracks"].append(track)
+        if queue["index"] < 0:
+            queue["index"] = 0
+        return self.music_queue(speaker_id)
+
+    async def async_queue_remove(
+        self, entity_id: str, index: int
+    ) -> dict[str, Any]:
+        """Remove one track from the local queue."""
+        speaker_id = self.speaker_id_for_entity(entity_id)
+        if not speaker_id:
+            raise HomeAssistantError("Speaker not found")
+        queue = self._music_queues.get(speaker_id)
+        if not queue:
+            return self.music_queue(speaker_id)
+        tracks = queue.get("tracks") or []
+        if 0 <= int(index) < len(tracks):
+            tracks.pop(int(index))
+            if queue["index"] >= len(tracks):
+                queue["index"] = len(tracks) - 1
+            if queue["index"] < 0:
+                queue["index"] = 0 if tracks else -1
+        return self.music_queue(speaker_id)
+
+    async def async_queue_clear(self, entity_id: str) -> None:
+        """Clear the local queue."""
+        speaker_id = self.speaker_id_for_entity(entity_id)
+        if not speaker_id:
+            raise HomeAssistantError("Speaker not found")
+        self._music_queues.pop(speaker_id, None)
+        task = self._music_queue_tasks.pop(speaker_id, None)
+        if task and not task.done():
+            task.cancel()
+
+    async def async_queue_play_index(
+        self, entity_id: str, index: int
+    ) -> None:
+        """Play a track from the local queue."""
+        speaker_id = self.speaker_id_for_entity(entity_id)
+        if not speaker_id:
+            raise HomeAssistantError("Speaker not found")
+        queue = self._music_queues.get(speaker_id)
+        tracks = (queue or {}).get("tracks") or []
+        if not tracks:
+            return
+        index = max(0, min(len(tracks) - 1, int(index)))
+        queue["index"] = index
+        await self._play_music_id(speaker_id, tracks[index]["id"])
+        self._start_queue_monitor(speaker_id)
+
+    async def async_queue_next(self, entity_id: str, delta: int = 1) -> None:
+        """Play the next or previous track from the local queue."""
+        speaker_id = self.speaker_id_for_entity(entity_id)
+        queue = self._music_queues.get(speaker_id or "")
+        if not queue:
+            return
+        tracks = queue.get("tracks") or []
+        if not tracks:
+            return
+        index = int(queue.get("index", 0)) + int(delta)
+        await self.async_queue_play_index(entity_id, index)
+
+    def _start_queue_monitor(self, speaker_id: str) -> None:
+        task = self._music_queue_tasks.get(speaker_id)
+        if task and not task.done():
+            return
+        self._music_queue_tasks[speaker_id] = self.hass.async_create_task(
+            self._queue_monitor(speaker_id)
+        )
+
+    async def _queue_monitor(self, speaker_id: str) -> None:
+        """Advance the local queue when the speaker stops at the end."""
+        try:
+            while speaker_id in self._music_queues:
+                queue = self._music_queues.get(speaker_id)
+                tracks = (queue or {}).get("tracks") or []
+                index = int((queue or {}).get("index", -1))
+                if not tracks or index < 0 or index >= len(tracks):
+                    break
+                state = self._glagol_states.get(speaker_id, {})
+                player = state.get("playerState") or {}
+                current_id = str(player.get("id") or "")
+                expected = str(tracks[index].get("id") or "")
+                if current_id and current_id != expected:
+                    for i, track in enumerate(tracks):
+                        if str(track.get("id")) == current_id:
+                            queue["index"] = i
+                            break
+                progress = player.get("progress")
+                duration = player.get("duration")
+                playing = bool(state.get("playing"))
+                if (
+                    current_id == expected
+                    and progress is not None
+                    and duration
+                    and progress >= duration - 1
+                    and not playing
+                ):
+                    entity_id = self.speaker_entity_id(speaker_id)
+                    if entity_id:
+                        await self.async_queue_next(entity_id, 1)
+                await asyncio.sleep(2)
+        finally:
+            self._music_queue_tasks.pop(speaker_id, None)
 
     async def async_export(self, path: str | None = None) -> dict[str, str]:
         """Export the full device database to JSON and SQLite."""

@@ -12,7 +12,12 @@ from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from .api import async_get_music_track
 from .const import DOMAIN
 from .coordinator import YahomeDataUpdateCoordinator
-from .music import async_get_lyrics
+from .music import (
+    async_get_liked_tracks,
+    async_get_lyrics,
+    async_get_playlist_tracks,
+    async_get_playlists,
+)
 from .views import serialize_data
 
 NOT_CONFIGURED = "YaHome Hub is not configured"
@@ -241,11 +246,290 @@ async def websocket_music_search(
     connection.send_result(msg["id"], {"tracks": tracks})
 
 
+TRACK_SCHEMA = vol.Schema(
+    {
+        vol.Required("id"): str,
+        vol.Optional("title"): str,
+        vol.Optional("artist"): str,
+        vol.Optional("album"): str,
+        vol.Optional("cover"): str,
+        vol.Optional("duration"): vol.Coerce(int),
+    },
+    extra=vol.ALLOW_EXTRA,
+)
+
+
+@websocket_api.websocket_command(
+    {
+        vol.Required("type"): f"{DOMAIN}/music_play",
+        vol.Required("entity_id"): str,
+        vol.Required("track_id"): str,
+        vol.Optional("queue"): [TRACK_SCHEMA],
+        vol.Optional("index", default=0): vol.Coerce(int),
+    }
+)
+@websocket_api.require_admin
+@websocket_api.async_response
+async def websocket_music_play(
+    hass: HomeAssistant,
+    connection: websocket_api.ActiveConnection,
+    msg: dict[str, Any],
+) -> None:
+    """Play a track and optionally set the local queue."""
+    coordinator = get_coordinator(hass)
+    if coordinator is None:
+        connection.send_error(msg["id"], "not_configured", NOT_CONFIGURED)
+        return
+    try:
+        await coordinator.async_play_track(
+            msg["entity_id"],
+            msg["track_id"],
+            msg.get("queue"),
+            msg.get("index", 0),
+        )
+    except Exception as err:  # noqa: BLE001
+        connection.send_error(msg["id"], "play_failed", str(err))
+        return
+    connection.send_result(msg["id"], {"ok": True})
+
+
+@websocket_api.websocket_command(
+    {
+        vol.Required("type"): f"{DOMAIN}/music_queue",
+        vol.Required("entity_id"): str,
+    }
+)
+@websocket_api.require_admin
+@websocket_api.async_response
+async def websocket_music_queue(
+    hass: HomeAssistant,
+    connection: websocket_api.ActiveConnection,
+    msg: dict[str, Any],
+) -> None:
+    """Return the local queue for a speaker."""
+    coordinator = get_coordinator(hass)
+    if coordinator is None:
+        connection.send_error(msg["id"], "not_configured", NOT_CONFIGURED)
+        return
+    speaker_id = coordinator.speaker_id_for_entity(msg["entity_id"])
+    connection.send_result(
+        msg["id"],
+        (
+            coordinator.music_queue(speaker_id)
+            if speaker_id
+            else {"tracks": [], "index": -1}
+        ),
+    )
+
+
+@websocket_api.websocket_command(
+    {
+        vol.Required("type"): f"{DOMAIN}/music_queue_add",
+        vol.Required("entity_id"): str,
+        vol.Required("track"): TRACK_SCHEMA,
+    }
+)
+@websocket_api.require_admin
+@websocket_api.async_response
+async def websocket_music_queue_add(
+    hass: HomeAssistant,
+    connection: websocket_api.ActiveConnection,
+    msg: dict[str, Any],
+) -> None:
+    """Add a track to the local queue."""
+    coordinator = get_coordinator(hass)
+    if coordinator is None:
+        connection.send_error(msg["id"], "not_configured", NOT_CONFIGURED)
+        return
+    queue = await coordinator.async_queue_add(msg["entity_id"], msg["track"])
+    connection.send_result(msg["id"], queue)
+
+
+@websocket_api.websocket_command(
+    {
+        vol.Required("type"): f"{DOMAIN}/music_queue_remove",
+        vol.Required("entity_id"): str,
+        vol.Required("index"): vol.Coerce(int),
+    }
+)
+@websocket_api.require_admin
+@websocket_api.async_response
+async def websocket_music_queue_remove(
+    hass: HomeAssistant,
+    connection: websocket_api.ActiveConnection,
+    msg: dict[str, Any],
+) -> None:
+    """Remove a track from the local queue."""
+    coordinator = get_coordinator(hass)
+    if coordinator is None:
+        connection.send_error(msg["id"], "not_configured", NOT_CONFIGURED)
+        return
+    queue = await coordinator.async_queue_remove(
+        msg["entity_id"], msg["index"]
+    )
+    connection.send_result(msg["id"], queue)
+
+
+@websocket_api.websocket_command(
+    {
+        vol.Required("type"): f"{DOMAIN}/music_queue_clear",
+        vol.Required("entity_id"): str,
+    }
+)
+@websocket_api.require_admin
+@websocket_api.async_response
+async def websocket_music_queue_clear(
+    hass: HomeAssistant,
+    connection: websocket_api.ActiveConnection,
+    msg: dict[str, Any],
+) -> None:
+    """Clear the local queue."""
+    coordinator = get_coordinator(hass)
+    if coordinator is None:
+        connection.send_error(msg["id"], "not_configured", NOT_CONFIGURED)
+        return
+    await coordinator.async_queue_clear(msg["entity_id"])
+    connection.send_result(msg["id"], {"ok": True})
+
+
+@websocket_api.websocket_command(
+    {
+        vol.Required("type"): f"{DOMAIN}/music_queue_play",
+        vol.Required("entity_id"): str,
+        vol.Required("index"): vol.Coerce(int),
+    }
+)
+@websocket_api.require_admin
+@websocket_api.async_response
+async def websocket_music_queue_play(
+    hass: HomeAssistant,
+    connection: websocket_api.ActiveConnection,
+    msg: dict[str, Any],
+) -> None:
+    """Play a queue item by index."""
+    coordinator = get_coordinator(hass)
+    if coordinator is None:
+        connection.send_error(msg["id"], "not_configured", NOT_CONFIGURED)
+        return
+    await coordinator.async_queue_play_index(msg["entity_id"], msg["index"])
+    connection.send_result(msg["id"], {"ok": True})
+
+
+@websocket_api.websocket_command(
+    {
+        vol.Required("type"): f"{DOMAIN}/music_next",
+        vol.Required("entity_id"): str,
+        vol.Optional("delta", default=1): vol.Coerce(int),
+    }
+)
+@websocket_api.require_admin
+@websocket_api.async_response
+async def websocket_music_next(
+    hass: HomeAssistant,
+    connection: websocket_api.ActiveConnection,
+    msg: dict[str, Any],
+) -> None:
+    """Play the next/previous local queue item."""
+    coordinator = get_coordinator(hass)
+    if coordinator is None:
+        connection.send_error(msg["id"], "not_configured", NOT_CONFIGURED)
+        return
+    await coordinator.async_queue_next(msg["entity_id"], msg.get("delta", 1))
+    connection.send_result(msg["id"], {"ok": True})
+
+
+@websocket_api.websocket_command(
+    {
+        vol.Required("type"): f"{DOMAIN}/music_likes",
+        vol.Optional("limit", default=100): vol.Coerce(int),
+    }
+)
+@websocket_api.require_admin
+@websocket_api.async_response
+async def websocket_music_likes(
+    hass: HomeAssistant,
+    connection: websocket_api.ActiveConnection,
+    msg: dict[str, Any],
+) -> None:
+    """Return the user's liked Yandex Music tracks."""
+    coordinator = get_coordinator(hass)
+    token = (
+        coordinator.entry.data.get("music_token")
+        if coordinator is not None
+        else None
+    )
+    tracks = await async_get_liked_tracks(
+        async_get_clientsession(hass), token, msg.get("limit", 100)
+    )
+    connection.send_result(msg["id"], {"tracks": tracks})
+
+
+@websocket_api.websocket_command(
+    {
+        vol.Required("type"): f"{DOMAIN}/music_playlists",
+    }
+)
+@websocket_api.require_admin
+@websocket_api.async_response
+async def websocket_music_playlists(
+    hass: HomeAssistant,
+    connection: websocket_api.ActiveConnection,
+    msg: dict[str, Any],
+) -> None:
+    """Return the user's Yandex Music playlists."""
+    coordinator = get_coordinator(hass)
+    token = (
+        coordinator.entry.data.get("music_token")
+        if coordinator is not None
+        else None
+    )
+    playlists = await async_get_playlists(
+        async_get_clientsession(hass), token
+    )
+    connection.send_result(msg["id"], {"playlists": playlists})
+
+
+@websocket_api.websocket_command(
+    {
+        vol.Required("type"): f"{DOMAIN}/music_playlist",
+        vol.Required("kind"): str,
+    }
+)
+@websocket_api.require_admin
+@websocket_api.async_response
+async def websocket_music_playlist(
+    hass: HomeAssistant,
+    connection: websocket_api.ActiveConnection,
+    msg: dict[str, Any],
+) -> None:
+    """Return the tracks of one Yandex Music playlist."""
+    coordinator = get_coordinator(hass)
+    token = (
+        coordinator.entry.data.get("music_token")
+        if coordinator is not None
+        else None
+    )
+    tracks = await async_get_playlist_tracks(
+        async_get_clientsession(hass), token, msg["kind"]
+    )
+    connection.send_result(msg["id"], {"tracks": tracks})
+
+
 def async_register_websocket_commands(hass: HomeAssistant) -> None:
     """Register panel WebSocket commands."""
     websocket_api.async_register_command(hass, websocket_lyrics)
     websocket_api.async_register_command(hass, websocket_lyrics_offset)
     websocket_api.async_register_command(hass, websocket_music_search)
+    websocket_api.async_register_command(hass, websocket_music_play)
+    websocket_api.async_register_command(hass, websocket_music_queue)
+    websocket_api.async_register_command(hass, websocket_music_queue_add)
+    websocket_api.async_register_command(hass, websocket_music_queue_remove)
+    websocket_api.async_register_command(hass, websocket_music_queue_clear)
+    websocket_api.async_register_command(hass, websocket_music_queue_play)
+    websocket_api.async_register_command(hass, websocket_music_next)
+    websocket_api.async_register_command(hass, websocket_music_likes)
+    websocket_api.async_register_command(hass, websocket_music_playlists)
+    websocket_api.async_register_command(hass, websocket_music_playlist)
     websocket_api.async_register_command(hass, websocket_devices)
     websocket_api.async_register_command(hass, websocket_action)
     websocket_api.async_register_command(hass, websocket_scenario)
