@@ -113,3 +113,21 @@ set_led:
       required: false
       selector:
         boolean:
+
+set_speaker_config:
+  name: Тестовые настройки колонки
+  description: Экспериментально изменить настройки Станции (DND, качество музыки, язык, звонки и другие).
+  fields:
+    entity_id:
+      name: Колонка
+      required: true
+      selector:
+        entity:
+          integration: yahome_hub
+          domain: media_player
+    config:
+      name: Конфигурация
+      description: 'Объект с настройками, например {"dndMode": {"enabled": true}}.'
+      required: true
+      selector:
+        object:

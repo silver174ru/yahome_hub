@@ -114,6 +114,181 @@ class YahomeSpeaker(
         return extra if isinstance(extra, dict) else {}
 
     @property
+    def _local_video(self) -> dict[str, Any]:
+        """Return metadata for a video started from the panel."""
+        return self.coordinator.local_video(self._speaker_id) or {}
+
+    VIDEO_TYPES = {
+        "video",
+        "youtube",
+        "episode",
+        "movie",
+        "tvshow",
+        "tv_show",
+        "clip",
+        "trailer",
+        "film",
+    }
+    VIDEO_PROVIDERS = {"youtube", "kinopoisk", "yavideo", "strm"}
+
+    @property
+    def _is_video(self) -> bool:
+        """Return True when the current media is video/TV content."""
+        player = self._player
+        if not player:
+            return False
+        kind = str(player.get("type") or "").strip().lower()
+        if kind in self.VIDEO_TYPES:
+            return True
+        extra = self._extra
+        item = extra.get("item")
+        if isinstance(item, dict):
+            item_type = str(item.get("type") or "").strip().lower()
+            if item_type in self.VIDEO_TYPES:
+                return True
+        player_type = str(player.get("playerType") or "").strip().lower()
+        if player_type == "video":
+            return True
+        if player.get("playerType") == "ru.yandex.quasar.app":
+            return bool(player.get("title") or player.get("duration"))
+        if player.get("liveStreamText") == "Прямой эфир":
+            return True
+        for key in ("providerName", "provider", "videoProvider"):
+            if str(extra.get(key) or "").lower() in self.VIDEO_PROVIDERS:
+                return True
+        descriptor = extra.get("videoDescriptor")
+        if isinstance(descriptor, dict) and descriptor:
+            return True
+        marker = self._local_video
+        if marker and player:
+            if str(player.get("type") or "") == "FmRadio":
+                return False
+            if str(player.get("id") or "").isdigit():
+                return False
+            return True
+        return False
+
+    @property
+    def _video_provider(self) -> str | None:
+        """Return the detected video provider name."""
+        extra = self._extra
+        for key in ("providerName", "provider", "videoProvider"):
+            value = extra.get(key)
+            if value:
+                return str(value).lower()
+        descriptor = extra.get("videoDescriptor")
+        if isinstance(descriptor, dict):
+            value = descriptor.get("providerName") or descriptor.get("provider")
+            if value:
+                return str(value).lower()
+        item = extra.get("item")
+        if isinstance(item, dict):
+            for key in ("provider", "providerName", "service"):
+                value = item.get(key)
+                if value:
+                    return str(value).lower()
+        marker = self._local_video
+        if marker.get("provider"):
+            return str(marker["provider"]).lower()
+        content = str(self.media_content_id or "")
+        if "youtu" in content:
+            return "youtube"
+        if "kinopoisk" in content:
+            return "kinopoisk"
+        if "vk.com" in content or "ok.ru" in content:
+            return "yavideo"
+        return None
+
+    @property
+    def _video_id(self) -> str | None:
+        """Return the provider item id for the current video."""
+        extra = self._extra
+        descriptor = extra.get("videoDescriptor")
+        if isinstance(descriptor, dict):
+            value = descriptor.get("providerItemId") or descriptor.get(
+                "provider_item_id"
+            )
+            if value:
+                return str(value)
+        item = extra.get("item")
+        if isinstance(item, dict):
+            value = item.get("id") or item.get("providerItemId")
+            if value:
+                return str(value)
+        marker = self._local_video
+        if marker.get("video_id"):
+            return str(marker["video_id"])
+        value = self._player.get("id")
+        return str(value) if value else None
+
+    @property
+    def _video_thumbnail(self) -> str | None:
+        """Return a 16:9 thumbnail for video content."""
+        cover = self._extra.get("coverURI")
+        if cover:
+            cover = str(cover)
+            if "://" not in cover:
+                cover = "https://" + cover
+            if "%%" in cover:
+                cover = cover.replace("%%", "1200x675")
+            return cover
+        marker = self._local_video
+        if marker.get("thumbnail"):
+            return str(marker["thumbnail"])
+        if self._video_provider == "youtube" and self._video_id:
+            return f"https://i.ytimg.com/vi/{self._video_id}/mqdefault.jpg"
+        return None
+
+    @property
+    def _video_url(self) -> str | None:
+        """Return a browser URL for the current video when known."""
+        marker = self._local_video
+        if marker.get("url"):
+            return str(marker["url"])
+        provider = self._video_provider
+        video_id = self._video_id
+        if provider == "youtube" and video_id:
+            return f"https://youtu.be/{video_id}"
+        content = str(self.media_content_id or "")
+        if content.startswith("http"):
+            return content
+        return None
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        """Expose live player and video metadata to the panel."""
+        attrs: dict[str, Any] = {}
+        state = self._glagol_state
+        if state:
+            alice = state.get("aliceState")
+            if alice is not None:
+                attrs["alice_state"] = alice
+            attrs["can_stop"] = bool(state.get("canStop"))
+            player = self._player
+            if player:
+                attrs["player_engine"] = player.get("playerType") or ""
+                attrs["player_type"] = player.get("type") or ""
+            live = player.get("liveStreamText")
+            if not live and player.get("type") == "FmRadio":
+                live = "Прямой эфир"
+            if live:
+                attrs["live_stream"] = live
+                attrs["live_stream_subtitle"] = (
+                    player.get("title") or player.get("subtitle") or ""
+                )
+        if self._is_video:
+            attrs.update(
+                {
+                    "yahome_video": True,
+                    "video_provider": self._video_provider,
+                    "video_id": self._video_id,
+                    "video_thumbnail": self._video_thumbnail,
+                    "video_url": self._video_url,
+                }
+            )
+        return attrs
+
+    @property
     def _iot_device_id(self) -> str | None:
         return self.coordinator.data.quasar_to_iot.get(self._speaker_id)
 
@@ -156,7 +331,8 @@ class YahomeSpeaker(
                 MediaPlayerEntityFeature.VOLUME_SET
                 | MediaPlayerEntityFeature.VOLUME_MUTE
             )
-        if self._glagol_state:
+        glagol = self.coordinator.glagol(self._speaker_id)
+        if self._glagol_state or (glagol is not None and glagol.connected):
             features |= (
                 MediaPlayerEntityFeature.PREVIOUS_TRACK
                 | MediaPlayerEntityFeature.NEXT_TRACK
@@ -274,6 +450,10 @@ class YahomeSpeaker(
 
     @property
     def media_image_url(self) -> str | None:
+        if self._is_video:
+            thumbnail = self._video_thumbnail
+            if thumbnail:
+                return thumbnail
         cover = self._extra.get("coverURI")
         if not cover:
             cover = self.coordinator.track_meta(self.media_content_id).get(
@@ -298,6 +478,8 @@ class YahomeSpeaker(
 
     @property
     def media_content_type(self) -> str | None:
+        if self._is_video:
+            return "video"
         if self._player.get("type") == "Track":
             return "music"
         if self._player.get("type") == "FmRadio":

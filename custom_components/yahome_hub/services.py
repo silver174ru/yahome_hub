@@ -16,6 +16,7 @@ SERVICE_REFRESH = "refresh"
 SERVICE_EXPORT = "export"
 SERVICE_SAY = "say"
 SERVICE_SET_LED = "set_led"
+SERVICE_SET_SPEAKER_CONFIG = "set_speaker_config"
 
 SEND_ACTION_SCHEMA = vol.Schema(
     {
@@ -41,6 +42,12 @@ LED_SCHEMA = vol.Schema(
         vol.Optional("brightness"): vol.Coerce(float),
         vol.Optional("visualization"): vol.In(["clock", "equalizer"]),
         vol.Optional("auto"): bool,
+    }
+)
+SPEAKER_CONFIG_SCHEMA = vol.Schema(
+    {
+        vol.Required("entity_id"): str,
+        vol.Required("config"): dict,
     }
 )
 
@@ -101,6 +108,19 @@ async def async_setup_services(hass: HomeAssistant) -> None:
             call.data.get("auto"),
         )
 
+    async def handle_set_speaker_config(call: ServiceCall) -> None:
+        coordinator = get_coordinator(hass)
+        if coordinator is None:
+            raise ValueError("YaHome Hub is not configured")
+        speaker_id = coordinator.speaker_id_for_entity(
+            call.data["entity_id"]
+        )
+        if not speaker_id:
+            raise ValueError("Speaker not found")
+        await coordinator.async_set_speaker_config(
+            speaker_id, call.data["config"]
+        )
+
     hass.services.async_register(
         DOMAIN, SERVICE_SEND_ACTION, handle_send_action, schema=SEND_ACTION_SCHEMA
     )
@@ -125,4 +145,10 @@ async def async_setup_services(hass: HomeAssistant) -> None:
     )
     hass.services.async_register(
         DOMAIN, SERVICE_SET_LED, handle_set_led, schema=LED_SCHEMA
+    )
+    hass.services.async_register(
+        DOMAIN,
+        SERVICE_SET_SPEAKER_CONFIG,
+        handle_set_speaker_config,
+        schema=SPEAKER_CONFIG_SCHEMA,
     )

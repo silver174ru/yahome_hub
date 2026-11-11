@@ -54,6 +54,143 @@ async def websocket_devices(
 
 @websocket_api.websocket_command(
     {
+        vol.Required("type"): f"{DOMAIN}/sensor_values",
+    }
+)
+@websocket_api.require_admin
+@websocket_api.async_response
+async def websocket_sensor_values(
+    hass: HomeAssistant,
+    connection: websocket_api.ActiveConnection,
+    msg: dict[str, Any],
+) -> None:
+    """Return the device catalog after a lightweight sensor refresh."""
+    coordinator = get_coordinator(hass)
+    if coordinator is None:
+        connection.send_error(msg["id"], "not_configured", NOT_CONFIGURED)
+        return
+    try:
+        await coordinator.async_fast_sensor_refresh()
+    except Exception:  # noqa: BLE001
+        pass
+    connection.send_result(msg["id"], serialize_data(coordinator.data))
+
+
+@websocket_api.websocket_command(
+    {
+        vol.Required("type"): f"{DOMAIN}/speaker_diagnostics",
+        vol.Required("speaker_id"): str,
+    }
+)
+@websocket_api.require_admin
+@websocket_api.async_response
+async def websocket_speaker_diagnostics(
+    hass: HomeAssistant,
+    connection: websocket_api.ActiveConnection,
+    msg: dict[str, Any],
+) -> None:
+    """Return live state and config for one speaker."""
+    coordinator = get_coordinator(hass)
+    if coordinator is None:
+        connection.send_error(msg["id"], "not_configured", NOT_CONFIGURED)
+        return
+    try:
+        result = await coordinator.async_speaker_diagnostics(
+            msg["speaker_id"]
+        )
+    except Exception as err:  # noqa: BLE001
+        connection.send_error(msg["id"], "diagnostics_failed", str(err))
+        return
+    connection.send_result(msg["id"], result)
+
+
+@websocket_api.websocket_command(
+    {
+        vol.Required("type"): f"{DOMAIN}/speaker_command",
+        vol.Required("speaker_id"): str,
+        vol.Required("payload"): dict,
+        vol.Optional("wait", default=False): bool,
+    }
+)
+@websocket_api.require_admin
+@websocket_api.async_response
+async def websocket_speaker_command(
+    hass: HomeAssistant,
+    connection: websocket_api.ActiveConnection,
+    msg: dict[str, Any],
+) -> None:
+    """Send a raw local glagol command for diagnostics."""
+    coordinator = get_coordinator(hass)
+    if coordinator is None:
+        connection.send_error(msg["id"], "not_configured", NOT_CONFIGURED)
+        return
+    try:
+        result = await coordinator.async_send_speaker_command(
+            msg["speaker_id"], msg["payload"], msg.get("wait", False)
+        )
+    except Exception as err:  # noqa: BLE001
+        connection.send_error(msg["id"], "command_failed", str(err))
+        return
+    connection.send_result(msg["id"], result or {})
+
+
+@websocket_api.websocket_command(
+    {
+        vol.Required("type"): f"{DOMAIN}/speaker_config_set",
+        vol.Required("speaker_id"): str,
+        vol.Required("config"): dict,
+    }
+)
+@websocket_api.require_admin
+@websocket_api.async_response
+async def websocket_speaker_config_set(
+    hass: HomeAssistant,
+    connection: websocket_api.ActiveConnection,
+    msg: dict[str, Any],
+) -> None:
+    """Write experimental speaker configuration."""
+    coordinator = get_coordinator(hass)
+    if coordinator is None:
+        connection.send_error(msg["id"], "not_configured", NOT_CONFIGURED)
+        return
+    try:
+        await coordinator.async_set_speaker_config(
+            msg["speaker_id"], msg["config"]
+        )
+    except Exception as err:  # noqa: BLE001
+        connection.send_error(msg["id"], "config_failed", str(err))
+        return
+    connection.send_result(msg["id"], {"ok": True})
+
+
+@websocket_api.websocket_command(
+    {
+        vol.Required("type"): f"{DOMAIN}/video_close",
+        vol.Required("speaker_id"): str,
+    }
+)
+@websocket_api.require_admin
+@websocket_api.async_response
+async def websocket_video_close(
+    hass: HomeAssistant,
+    connection: websocket_api.ActiveConnection,
+    msg: dict[str, Any],
+) -> None:
+    """Stop video playback and leave video mode."""
+    coordinator = get_coordinator(hass)
+    if coordinator is None:
+        connection.send_error(msg["id"], "not_configured", NOT_CONFIGURED)
+        return
+    try:
+        await coordinator.async_close_video(msg["speaker_id"])
+    except Exception as err:  # noqa: BLE001
+        connection.send_error(msg["id"], "video_close_failed", str(err))
+        return
+    connection.send_result(msg["id"], {"ok": True})
+
+
+@websocket_api.websocket_command(
+    {
         vol.Required("type"): f"{DOMAIN}/action",
         vol.Required("device_id"): str,
         vol.Required("capability_type"): str,
@@ -531,6 +668,15 @@ def async_register_websocket_commands(hass: HomeAssistant) -> None:
     websocket_api.async_register_command(hass, websocket_music_playlists)
     websocket_api.async_register_command(hass, websocket_music_playlist)
     websocket_api.async_register_command(hass, websocket_devices)
+    websocket_api.async_register_command(hass, websocket_sensor_values)
+    websocket_api.async_register_command(
+        hass, websocket_speaker_diagnostics
+    )
+    websocket_api.async_register_command(
+        hass, websocket_speaker_config_set
+    )
+    websocket_api.async_register_command(hass, websocket_speaker_command)
+    websocket_api.async_register_command(hass, websocket_video_close)
     websocket_api.async_register_command(hass, websocket_action)
     websocket_api.async_register_command(hass, websocket_scenario)
     websocket_api.async_register_command(hass, websocket_refresh)

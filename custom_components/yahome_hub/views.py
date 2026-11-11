@@ -217,6 +217,7 @@ def _speaker_view(
             for prop in (iot_device or {}).get("properties") or []
             if (prop.get("state") or {}).get("instance")
         ],
+        "music_quality": speaker.get("music_quality"),
         "volume": (
             get_capability_state(iot_device, CAP_VOLUME, "volume")
             if iot_device

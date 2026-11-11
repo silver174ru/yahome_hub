@@ -9,11 +9,14 @@ import time
 from datetime import timedelta
 from typing import Any
 
+import aiohttp
+
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.exceptions import ConfigEntryAuthFailed, HomeAssistantError
 from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
+from homeassistant.helpers.event import async_track_time_interval
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 from homeassistant.util import dt as dt_util
 
@@ -42,6 +45,7 @@ from .const import (
 )
 from .store import YahomeDeviceStore, default_export_path
 from .models import YahomeData
+from .video import async_resolve_video
 from .music import async_search_tracks
 
 _LOGGER = logging.getLogger(__name__)
@@ -84,6 +88,8 @@ class YahomeDataUpdateCoordinator(DataUpdateCoordinator[YahomeData]):
         self._glagol_states: dict[str, dict[str, Any]] = {}
         self._glagol_state_ts: dict[str, Any] = {}
         self._track_meta: dict[str, dict[str, Any]] = {}
+        self._local_video: dict[str, dict[str, Any]] = {}
+        self._music_quality: dict[str, str] = {}
         self._lyrics_offset = 0.0
         self._suppress_panel_event = False
         self._music_queues: dict[str, dict[str, Any]] = {}
@@ -95,6 +101,9 @@ class YahomeDataUpdateCoordinator(DataUpdateCoordinator[YahomeData]):
         self._tts_messages: dict[str, str] = {}
         self._hdmi_load_tasks: set[str] = set()
         self._speaker_config_loaded: set[str] = set()
+        self._sensor_unsub = None
+        self._sensor_lock = asyncio.Lock()
+        self._last_sensor_poll = 0.0
         self._discovery = YahomeLocalDiscovery(hass, self._async_local_found)
         self._store = YahomeDeviceStore(hass)
 
@@ -179,14 +188,23 @@ class YahomeDataUpdateCoordinator(DataUpdateCoordinator[YahomeData]):
         )
 
     async def async_start_local(self) -> None:
-        """Start mDNS discovery and local speaker connections."""
+        """Start mDNS discovery, local speakers and fast sensor polling."""
         try:
             await self._discovery.async_start()
         except Exception as err:  # noqa: BLE001
             _LOGGER.debug("Local speaker discovery failed: %s", err)
+        if self._sensor_unsub is None:
+            self._sensor_unsub = async_track_time_interval(
+                self.hass,
+                self._async_sensor_tick,
+                timedelta(seconds=5),
+            )
 
     async def async_stop_local(self) -> None:
         """Stop discovery and all local connections."""
+        if self._sensor_unsub is not None:
+            self._sensor_unsub()
+            self._sensor_unsub = None
         self._discovery.stop()
         for glagol in list(self._glagols.values()):
             await glagol.stop()
@@ -231,6 +249,13 @@ class YahomeDataUpdateCoordinator(DataUpdateCoordinator[YahomeData]):
         self._glagol_state_ts[speaker_id] = dt_util.utcnow()
         player = state.get("playerState") or {}
         track_id = player.get("id")
+        if track_id and str(track_id).isdigit():
+            marker = self._local_video.get(speaker_id)
+            if marker:
+                marker_title = str(marker.get("title") or "").strip().lower()
+                player_title = str(player.get("title") or "").strip().lower()
+                if marker_title and player_title and marker_title != player_title:
+                    self._local_video.pop(speaker_id, None)
         if track_id and str(track_id) not in self._track_meta:
             self.hass.async_create_task(
                 self._async_enrich_track(str(track_id))
@@ -273,6 +298,18 @@ class YahomeDataUpdateCoordinator(DataUpdateCoordinator[YahomeData]):
     def glagol_state_updated_at(self, speaker_id: str):
         """Return when the local playback state was received."""
         return self._glagol_state_ts.get(speaker_id)
+
+    def local_video(self, speaker_id: str) -> dict[str, Any] | None:
+        """Return local metadata for a video started by this integration."""
+        return self._local_video.get(speaker_id)
+
+    async def async_close_video(self, speaker_id: str) -> None:
+        """Stop video playback and leave video mode."""
+        self._local_video.pop(speaker_id, None)
+        glagol = self._glagols.get(speaker_id)
+        if glagol is not None and glagol.connected:
+            await glagol.send({"command": "stop"}, wait=False)
+        self.async_update_listeners()
 
     @property
     def lyrics_offset(self) -> float:
@@ -562,6 +599,10 @@ class YahomeDataUpdateCoordinator(DataUpdateCoordinator[YahomeData]):
                     )
                 )
 
+        for speaker_id, quality in self._music_quality.items():
+            if speaker_id in speakers:
+                speakers[speaker_id]["music_quality"] = quality
+
         return YahomeData(
             devices=devices,
             rooms=rooms,
@@ -785,6 +826,71 @@ class YahomeDataUpdateCoordinator(DataUpdateCoordinator[YahomeData]):
         """Return True while the LED brightness is managed automatically."""
         return self._led_auto.get(speaker_id, True)
 
+    async def async_set_speaker_config(
+        self, speaker_id: str, patch: dict[str, Any]
+    ) -> None:
+        """Write experimental Quasar configuration keys for one speaker."""
+        allowed = {
+            "audio_player",
+            "dndMode",
+            "led",
+            "locale",
+            "timezone",
+            "location",
+            "calls_settings",
+            "radio_nanny_enabled",
+            "allow_non_self_calls",
+            "intonationSpotting",
+            "tv_beta",
+            "tv_max",
+            "beta",
+            "standby",
+        }
+        cleaned = {
+            key: value
+            for key, value in (patch or {}).items()
+            if key in allowed
+        }
+        if not cleaned:
+            raise HomeAssistantError("No supported speaker settings supplied")
+        quasar = await self.async_live_quasar()
+        if quasar is None:
+            raise HomeAssistantError("Yandex cookies are not available")
+        device_id = self.data.quasar_to_iot.get(speaker_id, speaker_id)
+        config, version = await quasar.get_device_config(device_id)
+
+        def merge(target: dict[str, Any], source: dict[str, Any]) -> None:
+            for key, value in source.items():
+                if isinstance(value, dict) and isinstance(
+                    target.get(key), dict
+                ):
+                    merge(target[key], value)
+                else:
+                    target[key] = value
+
+        merge(config, cleaned)
+        quality = (config.get("audio_player") or {}).get("music_quality")
+        if quality:
+            self._music_quality[speaker_id] = str(quality)
+            if speaker_id in self.data.speakers:
+                self.data.speakers[speaker_id]["music_quality"] = str(quality)
+        led = config.get("led") or {}
+        brightness = led.get("brightness") or {}
+        if isinstance(brightness, dict):
+            self._led_auto[speaker_id] = bool(brightness.get("auto", True))
+            value = brightness.get("value")
+            if isinstance(value, (int, float)):
+                self._led_brightness[speaker_id] = max(
+                    0.0, min(1.0, float(value))
+                )
+        visualization = led.get("music_equalizer_visualization") or {}
+        if isinstance(visualization, dict):
+            self._led_visualization[speaker_id] = (
+                "equalizer" if visualization.get("auto") else "clock"
+            )
+        await quasar.set_device_config(device_id, config, version)
+        self.async_update_listeners()
+
     async def async_set_speaker_hdmi(
         self, speaker_id: str, enabled: bool
     ) -> None:
@@ -801,6 +907,128 @@ class YahomeDataUpdateCoordinator(DataUpdateCoordinator[YahomeData]):
         await quasar.set_device_config(device_id, config, version)
         self._hdmi_audio[speaker_id] = bool(enabled)
         self.async_update_listeners()
+
+    async def async_send_speaker_command(
+        self,
+        speaker_id: str,
+        payload: dict[str, Any],
+        wait: bool = False,
+    ) -> dict[str, Any] | None:
+        """Send a raw glagol command to a speaker (diagnostics only)."""
+        glagol = self._glagols.get(speaker_id)
+        if glagol is None or not glagol.connected:
+            raise HomeAssistantError("Local speaker connection is not ready")
+        return await glagol.send(payload, timeout=4.0, wait=wait)
+
+    async def async_speaker_diagnostics(
+        self, speaker_id: str
+    ) -> dict[str, Any]:
+        """Return live glagol state and Quasar config for one speaker."""
+        speaker = self.data.speakers.get(speaker_id, {}) if self.data else {}
+        config: dict[str, Any] = {}
+        try:
+            quasar = await self.async_live_quasar()
+            if quasar is not None:
+                device_id = (
+                    self.data.quasar_to_iot.get(speaker_id, speaker_id)
+                    if self.data
+                    else speaker_id
+                )
+                config, _ = await quasar.get_device_config(device_id)
+        except Exception as err:  # noqa: BLE001
+            _LOGGER.debug("Speaker diagnostics config failed: %s", err)
+        safe_speaker = {
+            key: value
+            for key, value in speaker.items()
+            if key
+            not in {
+                "glagol",
+                "config",
+                "activation_code",
+                "promocode_activated",
+                "networkInfo",
+            }
+        }
+        return {
+            "speaker_id": speaker_id,
+            "speaker": safe_speaker,
+            "state": self.glagol_state(speaker_id),
+            "config": config,
+            "local": self._local_speakers.get(speaker_id, {}),
+            "updated": self.glagol_state_updated_at(speaker_id),
+            "hdmi_available": speaker.get("platform")
+            in HDMI_SPEAKER_PLATFORMS,
+            "led_available": speaker.get("platform")
+            in LED_SPEAKER_PLATFORMS,
+        }
+
+    async def _async_sensor_tick(self, now=None) -> None:
+        """Timer callback for the five-second sensor refresh."""
+        try:
+            await self.async_fast_sensor_refresh()
+        except Exception as err:  # noqa: BLE001
+            _LOGGER.debug("Fast sensor refresh failed: %s", err)
+
+    async def async_fast_sensor_refresh(self, force: bool = False) -> None:
+        """Refresh only device properties and capability states."""
+        if self._iot is None or self.data is None:
+            return
+        async with self._sensor_lock:
+            now = time.time()
+            if not force and now - self._last_sensor_poll < 4.0:
+                return
+            self._last_sensor_poll = now
+            try:
+                payload = await self._iot.get_user_info()
+            except (YahomeApiError, YahomeAuthError) as err:
+                _LOGGER.debug("Fast sensor poll failed: %s", err)
+                return
+            fresh_devices = (
+                payload.get("devices") if isinstance(payload, dict) else None
+            )
+            if not isinstance(fresh_devices, list):
+                return
+            fresh_by_id = {
+                item.get("id"): item
+                for item in fresh_devices
+                if isinstance(item, dict) and item.get("id")
+            }
+            changed = False
+            for device_id, device in self.data.devices.items():
+                fresh = fresh_by_id.get(device_id)
+                if not fresh:
+                    continue
+                if isinstance(fresh.get("properties"), list):
+                    if device.get("properties") != fresh["properties"]:
+                        device["properties"] = fresh["properties"]
+                        changed = True
+                fresh_caps: dict[tuple[str, str], dict[str, Any]] = {}
+                for capability in fresh.get("capabilities") or []:
+                    state = capability.get("state") or {}
+                    key = (
+                        capability.get("type") or "",
+                        state.get("instance") or "",
+                    )
+                    fresh_caps[key] = capability
+                for capability in device.get("capabilities") or []:
+                    state = capability.get("state") or {}
+                    key = (
+                        capability.get("type") or "",
+                        state.get("instance") or "",
+                    )
+                    replacement = fresh_caps.get(key)
+                    if replacement and replacement.get("state") != state:
+                        capability["state"] = replacement["state"]
+                        changed = True
+                if fresh.get("state") and fresh["state"] != device.get("state"):
+                    device["state"] = fresh["state"]
+                    changed = True
+            if changed:
+                self._suppress_panel_event = True
+                try:
+                    self.async_update_listeners()
+                finally:
+                    self._suppress_panel_event = False
 
     def hdmi_audio(self, speaker_id: str) -> bool:
         """Return the last known HDMI audio switch state."""
@@ -823,6 +1051,15 @@ class YahomeDataUpdateCoordinator(DataUpdateCoordinator[YahomeData]):
             if quasar is None:
                 return
             config, _ = await quasar.get_device_config(device_id)
+            quality = (config.get("audio_player") or {}).get(
+                "music_quality"
+            )
+            if quality:
+                self._music_quality[speaker_id] = str(quality)
+                if self.data is not None and speaker_id in self.data.speakers:
+                    self.data.speakers[speaker_id]["music_quality"] = str(
+                        quality
+                    )
             if load_hdmi:
                 self._hdmi_audio[speaker_id] = bool(
                     config.get("hdmiAudio", False)
@@ -879,12 +1116,14 @@ class YahomeDataUpdateCoordinator(DataUpdateCoordinator[YahomeData]):
             return
         payload: dict[str, Any] | None = None
         if value.isdigit():
+            self._local_video.pop(speaker_id, None)
             await self.async_play_track(entity_id, value)
             return
         if "music.yandex" in value:
             match = re.search(r"(track|album|artist|playlist)/(\d+)", value)
             if match:
                 if match.group(1) == "track":
+                    self._local_video.pop(speaker_id, None)
                     await self.async_play_track(entity_id, match.group(2))
                     return
                 payload = {
@@ -894,26 +1133,86 @@ class YahomeDataUpdateCoordinator(DataUpdateCoordinator[YahomeData]):
                 }
         elif "youtu" in value:
             match = re.search(
-                r"(?:youtu\.be/|v=)([0-9A-Za-z_-]{11})", value
+                r"(?:youtu\.be/|youtube\.com/(?:watch\?[^#]*v=|shorts/|embed/))"
+                r"([0-9A-Za-z_-]{11})",
+                value,
             )
             if match:
-                payload = {
-                    "command": "serverAction",
-                    "serverActionEventPayload": {
-                        "type": "server_action",
-                        "name": "bass_action",
-                        "payload": {
-                            "data": {
-                                "video_descriptor": {
-                                    "provider_item_id": match.group(1),
-                                    "provider_name": "youtube",
-                                }
-                            },
-                            "name": "quasar.play_video_by_descriptor",
-                        },
-                    },
+                video_id = match.group(1)
+                payload = self._video_descriptor("youtube", video_id)
+                self._local_video[speaker_id] = {
+                    "provider": "youtube",
+                    "video_id": video_id,
+                    "title": "",
+                    "subtitle": "",
+                    "thumbnail": (
+                        f"https://i.ytimg.com/vi/{video_id}/mqdefault.jpg"
+                    ),
+                    "url": f"https://youtu.be/{video_id}",
                 }
+        elif "kinopoisk" in value:
+            match = re.search(r"hd\.kinopoisk\.ru/.*?([0-9a-z]{32})", value)
+            if match:
+                item_id = match.group(1)
+                payload = self._video_descriptor("kinopoisk", item_id)
+                self._local_video[speaker_id] = {
+                    "provider": "kinopoisk",
+                    "video_id": item_id,
+                    "title": "",
+                    "subtitle": "",
+                    "thumbnail": "",
+                    "url": value,
+                }
+            else:
+                match = re.search(r"kinopoisk\.ru/film/(\d+)", value)
+                if match:
+                    uuid = await self._async_kinopoisk_uuid(match.group(1))
+                    if uuid:
+                        payload = self._video_descriptor("kinopoisk", uuid)
+                        self._local_video[speaker_id] = {
+                            "provider": "kinopoisk",
+                            "video_id": uuid,
+                            "title": "",
+                            "subtitle": "",
+                            "thumbnail": "",
+                            "url": value,
+                        }
+        elif "yandex.ru/efir" in value:
+            match = re.search(r"stream_id=([^&]+)", value)
+            if match:
+                payload = self._video_descriptor("strm", match.group(1))
+                self._local_video[speaker_id] = {
+                    "provider": "strm",
+                    "video_id": match.group(1),
+                    "title": "",
+                    "subtitle": "",
+                    "thumbnail": "",
+                    "url": value,
+                }
+        elif "vk.com/video" in value or "ok.ru/video" in value:
+            payload = self._video_descriptor("yavideo", value)
+            self._local_video[speaker_id] = {
+                "provider": "yavideo",
+                "video_id": "",
+                "title": "",
+                "subtitle": "",
+                "thumbnail": "",
+                "url": value,
+            }
+        if payload is None and re.match(r"^https?://", value):
+            payload, info = await async_resolve_video(
+                self.hass, self._session, value
+            )
+            if payload is not None:
+                self._local_video[speaker_id] = info
         if payload is None:
+            if re.match(r"^https?://", value):
+                raise HomeAssistantError(
+                    "Не удалось распознать ссылку. Поддерживаются YouTube, "
+                    "Кинопоиск, Rutube, IVI, Okko, Wink, Start, Premier, "
+                    "VK Видео, Яндекс Эфир, прямые mp4/m3u8 и другие сервисы "
+                    "через yt-dlp."
+                )
             tracks = await async_search_tracks(
                 self._session,
                 value,
@@ -921,14 +1220,53 @@ class YahomeDataUpdateCoordinator(DataUpdateCoordinator[YahomeData]):
                 1,
             )
             if tracks:
+                self._local_video.pop(speaker_id, None)
                 await self.async_play_track(entity_id, tracks[0]["id"])
                 return
         if payload is None:
             raise HomeAssistantError("Could not resolve media")
+        if payload.get("command") == "playMusic":
+            self._local_video.pop(speaker_id, None)
         await glagol.send(payload, wait=False)
         if payload.get("command") == "playMusic":
             await asyncio.sleep(0.5)
             await glagol.send({"command": "play"}, wait=False)
+
+    @staticmethod
+    def _video_descriptor(provider: str, item_id: str) -> dict[str, Any]:
+        """Build a glagol directive that opens a video on the station."""
+        return {
+            "command": "serverAction",
+            "serverActionEventPayload": {
+                "type": "server_action",
+                "name": "bass_action",
+                "payload": {
+                    "data": {
+                        "video_descriptor": {
+                            "provider_item_id": str(item_id),
+                            "provider_name": provider,
+                        }
+                    },
+                    "name": "quasar.play_video_by_descriptor",
+                },
+            },
+        }
+
+    async def _async_kinopoisk_uuid(self, film_id: str) -> str | None:
+        """Resolve a Kinopoisk film id to the UUID used by the station."""
+        try:
+            async with self._session.get(
+                "https://ott-widget.kinopoisk.ru/ott/api/kp-film-status/",
+                params={"kpFilmId": str(film_id)},
+                timeout=aiohttp.ClientTimeout(total=10),
+            ) as response:
+                if response.status != 200:
+                    return None
+                data = await response.json(content_type=None)
+        except Exception:  # noqa: BLE001
+            return None
+        value = data.get("uuid") if isinstance(data, dict) else None
+        return str(value) if value else None
 
     async def async_search_music(
         self, query: str, limit: int = 10
@@ -955,6 +1293,7 @@ class YahomeDataUpdateCoordinator(DataUpdateCoordinator[YahomeData]):
         glagol = self._glagols.get(speaker_id)
         if glagol is None or not glagol.connected:
             raise HomeAssistantError("Local speaker connection is not ready")
+        self._local_video.pop(speaker_id, None)
         await glagol.send(
             {"command": "playMusic", "id": str(track_id), "type": "track"},
             wait=False,
@@ -971,6 +1310,7 @@ class YahomeDataUpdateCoordinator(DataUpdateCoordinator[YahomeData]):
         speaker_id = self.speaker_id_for_entity(entity_id)
         if not speaker_id:
             raise HomeAssistantError("Speaker not found")
+        self._local_video.pop(speaker_id, None)
         if queue is not None:
             index = max(0, min(len(queue) - 1, int(index))) if queue else -1
             self._music_queues[speaker_id] = {
