@@ -49,10 +49,19 @@ class YaHomeHubPanel extends HTMLElement {
     }
     this._fullPlayer = null;
     this._showLyrics = true;
+    this._miniPlayerClosed = false;
+    this._miniVideoKey = "";
+    this._videoModeKey = "";
     this._tickCount = 0;
     this._quickDevice = null;
     this._viewFilter = "all";
     this._favorites = [];
+    this._lastCardId = null;
+    this._diagnostics = {};
+    this._diagLoading = {};
+    this._sensorTimer = null;
+    this._sensorBusy = false;
+    this._cardFields = {};
     try {
       const stored = JSON.parse(
         localStorage.getItem("yahome-hub-favorites") || "[]"
@@ -62,6 +71,16 @@ class YaHomeHubPanel extends HTMLElement {
       }
     } catch (err) {
       this._favorites = [];
+    }
+    try {
+      const stored = JSON.parse(
+        localStorage.getItem("yahome-hub-card-fields") || "{}"
+      );
+      if (stored && typeof stored === "object" && !Array.isArray(stored)) {
+        this._cardFields = stored;
+      }
+    } catch (err) {
+      this._cardFields = {};
     }
     this._beatTimer = null;
     this._beatLastLabel = 0;
@@ -121,6 +140,10 @@ class YaHomeHubPanel extends HTMLElement {
       clearInterval(this._beatTimer);
       this._beatTimer = null;
     }
+    if (this._sensorTimer) {
+      clearInterval(this._sensorTimer);
+      this._sensorTimer = null;
+    }
     if (this._stateTimer) {
       clearTimeout(this._stateTimer);
       this._stateTimer = null;
@@ -146,22 +169,19 @@ class YaHomeHubPanel extends HTMLElement {
   }
 
   _onStateChanged(event) {
-    if (
-      this._tab !== "speakers" &&
-      this._tab !== "devices" &&
-      !this._fullPlayer
-    ) {
-      return;
-    }
     const entityId = event && event.data ? event.data.entity_id : "";
-    if (
-      !entityId ||
-      (!entityId.startsWith("media_player.") &&
-        !entityId.startsWith("select.") &&
-        !entityId.startsWith("camera.") &&
-        !entityId.startsWith("switch.") &&
-        !entityId.startsWith("light."))
-    ) {
+    if (!entityId) return;
+    const media = entityId.startsWith("media_player.");
+    const auxiliary =
+      entityId.startsWith("select.") ||
+      entityId.startsWith("camera.") ||
+      entityId.startsWith("switch.") ||
+      entityId.startsWith("light.");
+    const uiOpen =
+      this._tab === "speakers" ||
+      this._tab === "devices" ||
+      Boolean(this._fullPlayer);
+    if (!media && !(auxiliary && uiOpen)) {
       return;
     }
     clearTimeout(this._stateTimer);
@@ -202,6 +222,7 @@ class YaHomeHubPanel extends HTMLElement {
         speaker.entity_id,
         speaker.equalizer_entity,
         speaker.lyrics_entity,
+        speaker.music_quality,
       ]),
     });
   }
@@ -264,6 +285,54 @@ class YaHomeHubPanel extends HTMLElement {
     if (!err) return "неизвестная ошибка";
     if (typeof err === "string") return err;
     return err.message || JSON.stringify(err);
+  }
+
+  _colorPresets() {
+    return [
+      ["Тёплый белый", "#ffd9a0"],
+      ["Холодный белый", "#d8ecff"],
+      ["Красный", "#ff3b30"],
+      ["Оранжевый", "#ff9500"],
+      ["Жёлтый", "#ffd60a"],
+      ["Зелёный", "#34c759"],
+      ["Бирюзовый", "#30d5c8"],
+      ["Голубой", "#32ade6"],
+      ["Синий", "#3b82f6"],
+      ["Фиолетовый", "#8b5cf6"],
+      ["Розовый", "#ff4f9a"],
+      ["Малиновый", "#e11d48"],
+    ].map(([name, hex]) => ({ name, hex }));
+  }
+
+  _hexToRgbInt(hex) {
+    const value = String(hex || "").replace("#", "");
+    return parseInt(value.slice(0, 6), 16) || 0;
+  }
+
+  _hexToHsv(hex) {
+    let value = String(hex || "").replace("#", "");
+    if (value.length === 3) {
+      value = value
+        .split("")
+        .map((char) => char + char)
+        .join("");
+    }
+    const r = parseInt(value.slice(0, 2), 16) / 255;
+    const g = parseInt(value.slice(2, 4), 16) / 255;
+    const b = parseInt(value.slice(4, 6), 16) / 255;
+    const max = Math.max(r, g, b);
+    const min = Math.min(r, g, b);
+    const delta = max - min;
+    let h = 0;
+    if (delta) {
+      if (max === r) h = ((g - b) / delta) % 6;
+      else if (max === g) h = (b - r) / delta + 2;
+      else h = (r - g) / delta + 4;
+      h *= 60;
+      if (h < 0) h += 360;
+    }
+    const s = max ? delta / max : 0;
+    return `${Math.round(h)},${Math.round(s * 100)},${Math.round(max * 100)}`;
   }
 
   _modeLabel(value) {
@@ -531,10 +600,129 @@ class YaHomeHubPanel extends HTMLElement {
       </div>
       ${data ? this._renderQuickSheet(data) : ""}
       ${data && this._fullPlayer ? this._renderFullPlayer(data) : ""}
+      ${data ? this._renderMiniPlayer() : ""}
     `;
     this._attachEvents();
+    this._updateMiniPlayer();
     this._startTicker();
     this._startBeatClock();
+    this._startSensorPolling();
+  }
+
+  _renderMiniPlayer() {
+    return `<div class="mini-player" data-mini-player hidden>
+      <button class="mini-cover" data-mini-open="" title="Открыть плеер">
+        <img data-mini-cover alt="" />
+        <span class="mini-badge" data-mini-badge><ha-icon icon="mdi:play"></ha-icon></span>
+      </button>
+      <div class="mini-info" data-mini-open="">
+        <span class="mini-kicker" data-mini-kicker>Видео</span>
+        <b data-mini-title>Видео</b>
+        <span class="mini-meta" data-mini-meta></span>
+        <span class="alice-live mini-alice" data-mini-alice><i></i><span data-mini-alice-label>Алиса · Свободна</span></span>
+      </div>
+      <div class="mini-progress"><span data-mini-progress></span></div>
+      <div class="mini-controls">
+        <button data-player-action="previous" data-mini-prev title="Предыдущее"><ha-icon icon="mdi:skip-previous"></ha-icon></button>
+        <button class="mini-play" data-player-action="playpause" data-mini-play title="Пауза"><ha-icon icon="mdi:pause"></ha-icon></button>
+        <button data-player-action="next" data-mini-next title="Следующее"><ha-icon icon="mdi:skip-next"></ha-icon></button>
+        <button data-video-close="" data-mini-video-close title="Закрыть видео"><ha-icon icon="mdi:close-circle-outline"></ha-icon></button>
+        <button data-mini-open="" title="Развернуть"><ha-icon icon="mdi:arrow-expand"></ha-icon></button>
+        <button data-mini-close title="Скрыть"><ha-icon icon="mdi:close"></ha-icon></button>
+      </div>
+    </div>`;
+  }
+
+  _updateMiniPlayer() {
+    const root = this.shadowRoot;
+    const el = root ? root.querySelector("[data-mini-player]") : null;
+    if (!el) return;
+    const found = this._activeVideo();
+    const shell = root.querySelector(".shell");
+    if (!found) {
+      el.hidden = true;
+      if (shell) shell.classList.remove("has-mini-player");
+      this._miniVideoKey = "";
+      return;
+    }
+
+    const { speaker, entity, info } = found;
+    const key = `${info.provider}|${info.videoId}|${info.title}`;
+    if (this._miniVideoKey !== key) {
+      this._miniVideoKey = key;
+      this._miniPlayerClosed = false;
+    }
+    const visible = !this._fullPlayer && !this._miniPlayerClosed;
+    el.hidden = !visible;
+    if (shell) shell.classList.toggle("has-mini-player", visible);
+    if (!visible) return;
+    el.setAttribute("data-mini-speaker", speaker.id);
+    el.classList.toggle("playing", info.playing);
+
+    const cover = el.querySelector("[data-mini-cover]");
+    if (cover) {
+      if (info.thumbnail) {
+        if (cover.getAttribute("src") !== info.thumbnail) {
+          cover.setAttribute("src", info.thumbnail);
+        }
+        cover.hidden = false;
+      } else {
+        cover.removeAttribute("src");
+        cover.hidden = true;
+      }
+    }
+    const badge = el.querySelector("[data-mini-badge]");
+    if (badge) {
+      badge.innerHTML = `<ha-icon icon="${
+        info.provider === "youtube" ? "mdi:youtube" : "mdi:play-circle"
+      }"></ha-icon>`;
+    }
+    const kicker = el.querySelector("[data-mini-kicker]");
+    if (kicker) kicker.textContent = this._videoProviderLabel(info.provider);
+    const title = el.querySelector("[data-mini-title]");
+    if (title) title.textContent = info.title;
+    const meta = el.querySelector("[data-mini-meta]");
+    if (meta) {
+      meta.textContent =
+        info.subtitle || (info.playing ? "Идёт воспроизведение" : "Пауза");
+    }
+    const aliceInfo = this._aliceInfo(entity.attributes || {});
+    const aliceEl = el.querySelector("[data-mini-alice]");
+    if (aliceEl) {
+      aliceEl.hidden = false;
+      aliceEl.className = `alice-live mini-alice ${aliceInfo.state.toLowerCase()}`;
+      const aliceText = aliceEl.querySelector("[data-mini-alice-label]");
+      const nextAlice = `Алиса · ${aliceInfo.label}`;
+      if (aliceText && aliceText.textContent !== nextAlice) {
+        aliceText.textContent = nextAlice;
+      }
+    }
+    const play = el.querySelector("[data-mini-play]");
+    if (play) {
+      play.setAttribute("data-player-entity", entity.entity_id);
+      const icon = play.querySelector("ha-icon");
+      if (icon) icon.setAttribute("icon", info.playing ? "mdi:pause" : "mdi:play");
+      play.title = info.playing ? "Пауза" : "Продолжить";
+    }
+    const prev = el.querySelector("[data-mini-prev]");
+    if (prev) prev.setAttribute("data-player-entity", entity.entity_id);
+    const next = el.querySelector("[data-mini-next]");
+    if (next) next.setAttribute("data-player-entity", entity.entity_id);
+    const closeVideo = el.querySelector("[data-mini-video-close]");
+    if (closeVideo) {
+      closeVideo.setAttribute("data-video-close", speaker.id);
+      closeVideo.hidden = info.playing;
+    }
+    el.querySelectorAll("[data-mini-open]").forEach((button) =>
+      button.setAttribute("data-mini-open", speaker.id)
+    );
+    const progress = el.querySelector("[data-mini-progress]");
+    if (progress) {
+      const pct = info.duration
+        ? Math.min(100, Math.max(0, (info.position / info.duration) * 100))
+        : 0;
+      progress.style.width = `${pct}%`;
+    }
   }
 
   _renderSpeakerExtras(speaker, entity) {
@@ -604,8 +792,11 @@ class YaHomeHubPanel extends HTMLElement {
     const trackId = String(attrs.media_content_id || "");
     const trackInfo = /^\d+$/.test(trackId) ? this._trackInfo(trackId) : null;
     const image = this._speakerImage(speaker);
+    const video = this._videoInfo(speaker, entity);
     const cover =
-      attrs.entity_picture || (trackInfo && trackInfo.cover) || image;
+      video.active && video.thumbnail
+        ? video.thumbnail
+        : attrs.entity_picture || (trackInfo && trackInfo.cover) || image;
     const title = attrs.media_title || "Готов к воспроизведению";
     const artist = attrs.media_artist || speaker.name;
     const album =
@@ -623,7 +814,22 @@ class YaHomeHubPanel extends HTMLElement {
     const lyrics = this._lyricsFor(speaker);
     const lyric = this._lyricLines(lyrics, position + this._lyricsOffset);
     const skin = this._playerSkin || 2;
-    const kicker = playing
+    const modeInfo = this._playerMode(speaker, entity);
+    const musicQuality = speaker.music_quality || "high";
+    const aliceInfo = this._aliceInfo(attrs);
+    const engineInfo = this._engineInfo(modeInfo);
+    const canStop = Boolean(attrs.can_stop);
+    const liveText = String(attrs.live_stream || "");
+    const liveName = String(
+      attrs.live_stream_subtitle || attrs.media_artist || ""
+    );
+    const kicker = video.active
+      ? playing
+        ? "Сейчас играет видео"
+        : paused
+        ? "Пауза · видео"
+        : "Видео"
+      : playing
       ? "Сейчас играет"
       : paused
       ? "Пауза"
@@ -631,6 +837,8 @@ class YaHomeHubPanel extends HTMLElement {
       ? "Выключена"
       : "Колонка";
     return `<article class="player full full-player skin-${skin} ${
+      video.active ? "video-mode" : ""
+    } mode-${modeInfo.mode} ${
       playing ? "playing" : ""
     } ${paused ? "paused" : ""}" data-player="${this._esc(
       speaker.id
@@ -644,17 +852,53 @@ class YaHomeHubPanel extends HTMLElement {
       <div class="full-content">
         <header class="full-header">
           <div class="full-title">
+            <div class="player-topline">
+              <span class="engine-pill engine-${modeInfo.mode}" data-engine-pill>
+                <ha-icon icon="${engineInfo.icon}"></ha-icon>
+                <b data-engine-label>${this._esc(engineInfo.label)}</b>
+                <small data-engine-raw>${this._esc(engineInfo.raw)}</small>
+              </span>
+              <span class="alice-live ${aliceInfo.state.toLowerCase()}" data-alice-live>
+                <i></i><span data-alice-label>Алиса · ${this._esc(
+                  aliceInfo.label
+                )}</span>
+              </span>
+            </div>
             <span class="full-kicker" data-player-kicker><span class="beat-dot" data-beat-dot></span>${kicker}</span>
             <h2 data-player-title>${this._esc(title)}</h2>
             <p data-player-meta>${this._esc(artist)}${
       album ? ` · ${this._esc(album)}` : ""
     }</p>
+            <div class="player-badges">
+              <span class="live-badge" data-live-badge ${
+                liveText ? "" : "hidden"
+              }><ha-icon icon="mdi:radio"></ha-icon> <span data-live-name>${this._esc(
+      liveName || liveText
+    )}</span></span>
+            </div>
           </div>
           <div class="full-actions">
             <button class="round-btn" data-music-scroll="${this._esc(
               speaker.id
             )}" title="Поиск музыки"><ha-icon icon="mdi:magnify"></ha-icon></button>
-            <button class="round-btn" data-toggle-lyrics title="Текст песни"><ha-icon icon="mdi:text-box-music"></ha-icon></button>
+            ${
+              video.active
+                ? video.url
+                  ? `<button class="round-btn video-link" data-video-open="${this._esc(
+                      video.url
+                    )}" title="Открыть видео"><ha-icon icon="mdi:open-in-new"></ha-icon></button>`
+                  : ""
+                : `<button class="round-btn" data-toggle-lyrics title="Текст песни"><ha-icon icon="mdi:text-box-music"></ha-icon></button>`
+            }
+            ${
+              video.active
+                ? `<button class="round-btn" data-video-close="${this._esc(
+                    speaker.id
+                  )}" title="Закрыть видео" ${
+                    video.playing ? "hidden" : ""
+                  }><ha-icon icon="mdi:close-circle-outline"></ha-icon></button>`
+                : ""
+            }
             <button class="round-btn" data-close-player title="Закрыть"><ha-icon icon="mdi:close"></ha-icon></button>
             <button class="round-btn power ${
               entity.state !== "off" ? "on" : ""
@@ -665,7 +909,7 @@ class YaHomeHubPanel extends HTMLElement {
         </header>
         <div class="full-main">
           <div class="full-cover-wrap">
-            <div class="player-cover big">
+            <div class="player-cover big ${video.active ? "video" : ""}">
               ${
                 cover
                   ? `<img data-player-cover src="${this._esc(
@@ -674,7 +918,18 @@ class YaHomeHubPanel extends HTMLElement {
                   : `<ha-icon data-cover-fallback icon="mdi:speaker"></ha-icon>`
               }
               ${
-                this._showLyrics
+                video.active
+                  ? `<span class="video-chip"><ha-icon icon="${
+                      video.provider === "youtube"
+                        ? "mdi:youtube"
+                        : "mdi:play-circle"
+                    }"></ha-icon> ${this._esc(
+                      this._videoProviderLabel(video.provider)
+                    )}</span>`
+                  : ""
+              }
+              ${
+                !video.active && this._showLyrics
                   ? `<div class="lyrics-overlay">
                       <div class="lyrics-prev" data-lyrics-prev>${this._esc(
                         lyric.prev
@@ -729,6 +984,7 @@ class YaHomeHubPanel extends HTMLElement {
                   attrs.repeat === "one" ? "selected" : ""
                 }>Повторять трек</option>
               </select>
+              ${this._renderQualitySwitch(speaker, musicQuality, entityId)}
             </div>
             ${this._renderSpeakerExtras(speaker, entity)}
             <div class="full-skin-row">
@@ -754,6 +1010,14 @@ class YaHomeHubPanel extends HTMLElement {
                 .join("")}</div>
             </div>
           </div>
+        </div>
+        <div class="radio-card full-radio" data-radio-card ${liveText ? "" : "hidden"}>
+          <ha-icon icon="mdi:radio"></ha-icon>
+          <div class="radio-copy">
+            <span data-radio-live>${this._esc(liveText || "Прямой эфир")}</span>
+            <b data-radio-name>${this._esc(liveName)}</b>
+          </div>
+          <div class="radio-bars"><i></i><i></i><i></i><i></i><i></i></div>
         </div>
         <div class="full-seek">
           <input type="range" min="0" max="${duration}" step="1" value="${position}"
@@ -782,6 +1046,11 @@ class YaHomeHubPanel extends HTMLElement {
             <button class="icon-btn" data-player-action="next" data-player-entity="${this._esc(
               entityId
             )}" title="Следующий трек"><ha-icon icon="mdi:skip-next"></ha-icon></button>
+            <button class="icon-btn stop" data-player-action="stop" data-player-entity="${this._esc(
+              entityId
+            )}" data-player-stop title="${
+      canStop ? "Остановить" : "Нет активного действия"
+    }" ${canStop ? "" : "disabled"}><ha-icon icon="mdi:stop"></ha-icon></button>
           </div>
           <div class="volume-control">
             <button class="volume-toggle" data-player-mute="${this._esc(
@@ -806,9 +1075,59 @@ class YaHomeHubPanel extends HTMLElement {
           )} с</b>
           <button class="sync-btn" data-lyrics-offset="0.5">+0.5</button>
         </div>
+        ${this._renderVideoBlock(speaker, entity, video)}
         ${this._renderMusicHub(speaker.id, true)}
       </div>
     </article>`;
+  }
+
+  _renderVideoBlock(speaker, entity, video) {
+    const active = Boolean(video && video.active);
+    const provider = active
+      ? this._videoProviderLabel(video.provider)
+      : "Видео и сервисы";
+    return `<div class="video-hub ${active ? "active" : ""}" data-video-hub="${this._esc(
+      speaker.id
+    )}">
+      <div class="video-hub-head">
+        <div class="video-hub-title">
+          <span class="video-badge"><ha-icon icon="mdi:youtube-tv"></ha-icon> Видео и сервисы</span>
+          <p>${
+            active
+              ? `${this._esc(provider)} · ${this._esc(video.title)}`
+              : "Вставьте ссылку YouTube, Rutube, Кинопоиска, IVI, Okko, Wink, Start, Premier, VK Видео, Яндекс Эфира или прямой mp4/m3u8 — колонка включит видео."
+          }</p>
+        </div>
+        ${
+          active && video.url
+            ? `<a class="video-open" href="${this._esc(
+                video.url
+              )}" target="_blank" rel="noopener"><ha-icon icon="mdi:open-in-new"></ha-icon> Открыть</a>`
+            : ""
+        }
+        ${
+          active
+            ? `<button class="video-close" data-video-close="${this._esc(
+                speaker.id
+              )}" ${video.playing ? "hidden" : ""}><ha-icon icon="mdi:close-circle-outline"></ha-icon> Закрыть видео</button>`
+            : ""
+        }
+      </div>
+      <div class="video-form">
+        <input type="url" data-video-url="${this._esc(
+          speaker.id
+        )}" placeholder="https://youtu.be/…, https://rutube.ru/video/… или прямая ссылка" />
+        <button class="video-play" data-video-play="${this._esc(
+          speaker.id
+        )}" data-entity="${this._esc(
+      entity.entity_id
+    )}"><ha-icon icon="mdi:play"></ha-icon> Включить</button>
+      </div>
+      <div class="video-services">
+        <span>YouTube</span><span>Rutube</span><span>Кинопоиск</span><span>IVI</span><span>Okko</span><span>Wink</span><span>Start</span><span>Premier</span><span>VK Видео</span><span>Яндекс Эфир</span><span>mp4 / m3u8</span>
+      </div>
+      <div class="video-status" data-video-status="${this._esc(speaker.id)}"></div>
+    </div>`;
   }
 
   _renderTabs(data) {
@@ -834,6 +1153,8 @@ class YaHomeHubPanel extends HTMLElement {
       return `${this._renderSpeakerTabs()}${
         this._speakerTab === "speaker"
           ? this._renderSpeakerControls(data.speakers || [])
+          : this._speakerTab === "features"
+          ? this._renderSpeakerFeatures(data.speakers || [])
           : this._renderSpeakerPlayers(data.speakers || [])
       }`;
     }
@@ -1078,7 +1399,9 @@ class YaHomeHubPanel extends HTMLElement {
             )}"></ha-icon></span>
             <span class="favorite-meta">
               <b>${this._esc(device.name)}</b>
-              <small>${this._esc(this._stateText(device))}</small>
+              <small data-state-device="${this._esc(
+                device.id
+              )}">${this._esc(this._stateText(device))}</small>
             </span>
             <span class="status ${device.online ? "online" : "offline"}"></span>
           </button>`;
@@ -1146,9 +1469,11 @@ class YaHomeHubPanel extends HTMLElement {
           <p class="muted">${this._esc(device.type_label)} · ${this._esc(
       device.room_name || "Без комнаты"
     )}</p>
-          ${this._renderMiniControl(device)}
+          ${this._renderCardReadings(device)}
           <div class="card-foot">
-            <span class="state">${this._esc(this._stateText(device))}</span>
+            <span class="state" data-state-device="${this._esc(
+              device.id
+            )}">${this._esc(this._stateText(device))}</span>
             <div class="card-actions-row">
               <button class="mini-action" data-quick="${this._esc(
                 device.id
@@ -1299,6 +1624,7 @@ class YaHomeHubPanel extends HTMLElement {
             </span>
           </div>
         </div>
+        ${this._renderCardFieldPicker(device)}
         ${this._renderControls(device)}
         ${this._renderProperties(device)}
       </div>
@@ -1399,22 +1725,51 @@ class YaHomeHubPanel extends HTMLElement {
     if (cap.kind === "color") {
       const scenes = cap.color_scenes || [];
       const temperature = cap.temperature_k || null;
+      const model =
+        cap.color_model === "hsv"
+          ? "hsv"
+          : cap.color_model === "rgb"
+          ? "rgb"
+          : "";
       return `
-        <div class="control-block">
-          <div class="control-label"><strong>${label}</strong></div>
+        <div class="control-block color-control">
+          <div class="control-label"><strong>${label}</strong>${
+            model
+              ? `<span class="color-model">${model.toUpperCase()}</span>`
+              : ""
+          }</div>
+          ${
+            model
+              ? `<div class="color-presets">${this._colorPresets()
+                  .map(
+                    (color) =>
+                      `<button class="color-dot" style="--c:${color.hex}" data-color-preset="${color.hex}" data-color-device="${this._esc(
+                        device.id
+                      )}" data-color-instance="${model}" title="${this._esc(
+                        color.name
+                      )}"></button>`
+                  )
+                  .join("")}</div>
+                <label class="color-native">Свой цвет
+                  <input type="color" value="#6c7cff"
+                    data-color-picker="${this._esc(device.id)}"
+                    data-color-instance="${model}" />
+                </label>`
+              : ""
+          }
           ${
             scenes.length
-              ? `<select data-scene-device="${this._esc(device.id)}">
-                  <option value="">Без сцены</option>
-                  ${scenes
-                    .map(
-                      (scene) =>
-                        `<option value="${this._esc(scene.id)}" ${
-                          cap.value === scene.id ? "selected" : ""
-                        }>${this._esc(scene.name)}</option>`
-                    )
-                    .join("")}
-                </select>`
+              ? `<div class="control-label sub"><span>Режимы и сцены</span></div>
+                 <div class="scene-presets">${scenes
+                   .map(
+                     (scene) =>
+                       `<button class="scene-preset" data-color-scene="${this._esc(
+                         device.id
+                       )}" data-scene-id="${this._esc(scene.id)}">${this._esc(
+                         scene.name
+                       )}</button>`
+                   )
+                   .join("")}</div>`
               : ""
           }
           ${
@@ -1423,7 +1778,7 @@ class YaHomeHubPanel extends HTMLElement {
                  <input type="range" min="${temperature.min}" max="${temperature.max}" step="100" value="${temperature.min}"
                    data-color-device="${this._esc(device.id)}"
                    data-color-instance="temperature_k" />`
-              : `<p class="muted">Цвет управляется сценами или приложением производителя.</p>`
+              : ""
           }
         </div>`;
     }
@@ -1470,7 +1825,11 @@ class YaHomeHubPanel extends HTMLElement {
           <span><ha-icon icon="${this._propIcon(prop.instance)}"></ha-icon>${this._esc(
           prop.name
         )}</span>
-          <b>${this._esc(String(prop.value ?? "—"))}${
+          <b data-prop-device="${this._esc(
+            device.id
+          )}" data-prop-instance="${this._esc(
+            prop.instance
+          )}">${this._esc(String(prop.value ?? "—"))}${
             prop.unit ? " " + this._esc(prop.unit) : ""
           }</b>
         </div>`
@@ -1797,9 +2156,24 @@ class YaHomeHubPanel extends HTMLElement {
       return `<div class="empty">Колонки не найдены. Проверьте cookies и токен в настройках интеграции.</div>`;
     }
     const targetId = this._musicTargetId(withEntity[0]?.id);
+    const targetSpeaker =
+      withEntity.find((speaker) => speaker.id === targetId) ||
+      withEntity[0];
+    const targetEntity = targetSpeaker
+      ? this._hass.states[targetSpeaker.entity_id]
+      : null;
     return `
       <div class="speakers-section">
         ${this._renderMusicHub(targetId)}
+        ${
+          targetSpeaker && targetEntity
+            ? this._renderVideoBlock(
+                targetSpeaker,
+                targetEntity,
+                this._videoInfo(targetSpeaker, targetEntity)
+              )
+            : ""
+        }
         <div class="speaker-toolbar">
           <div>
             <h3>Музыка</h3>
@@ -1829,6 +2203,7 @@ class YaHomeHubPanel extends HTMLElement {
     const tabs = [
       ["music", "Музыка", "mdi:music-note"],
       ["speaker", "Колонка", "mdi:speaker"],
+      ["features", "Возможности", "mdi:radar"],
     ];
     return `<div class="subtabs">${tabs
       .map(
@@ -1840,6 +2215,936 @@ class YaHomeHubPanel extends HTMLElement {
       .join("")}</div>`;
   }
 
+  _renderSpeakerFeatures(speakers) {
+    const withEntity = speakers.filter((speaker) => speaker.id);
+    if (!withEntity.length) {
+      return `<div class="empty">Колонки не найдены.</div>`;
+    }
+    withEntity.forEach((speaker) => {
+      if (!this._diagnostics[speaker.id] && !this._diagLoading[speaker.id]) {
+        this._loadSpeakerDiagnostics(speaker.id);
+      }
+    });
+    return `<div class="features-view">
+      <div class="section feature-intro">
+        <div class="feature-intro-head">
+          <div class="device-icon" style="--accent:#5b6cff"><ha-icon icon="mdi:radar"></ha-icon></div>
+          <div>
+            <h2>Возможности Яндекс Станции</h2>
+            <p class="muted">Здесь показан реальный поток состояния и конфигурации колонки. Функции с зелёной отметкой «добавлено» уже доступны в карточке «Колонка»; остальные можно добавить следующими.</p>
+          </div>
+        </div>
+      </div>
+      ${withEntity
+        .map((speaker) => this._renderFeatureCard(speaker))
+        .join("")}
+    </div>`;
+  }
+
+  async _loadSpeakerDiagnostics(speakerId) {
+    if (this._diagLoading[speakerId]) return;
+    this._diagLoading[speakerId] = true;
+    try {
+      const result = await this._hass.callWS({
+        type: "yahome_hub/speaker_diagnostics",
+        speaker_id: speakerId,
+      });
+      this._diagnostics[speakerId] = {
+        ...result,
+        fetched_at: Date.now(),
+      };
+    } catch (err) {
+      this._diagnostics[speakerId] = {
+        error: this._message(err),
+        fetched_at: Date.now(),
+      };
+    } finally {
+      delete this._diagLoading[speakerId];
+      if (
+        this._tab === "speakers" &&
+        (this._speakerTab === "features" || this._speakerTab === "speaker")
+      ) {
+        this._render();
+      }
+    }
+  }
+
+  _featureFormat(value) {
+    if (value === null || value === undefined) return "—";
+    if (typeof value === "object") {
+      return JSON.stringify(value).slice(0, 160);
+    }
+    return String(value);
+  }
+
+  _speakerFeatureItems(diag) {
+    const state = diag.state || {};
+    const config = diag.config || {};
+    const player = state.playerState || {};
+    const entityInfo = player.entityInfo || {};
+    const extra = player.extra || {};
+    const items = [];
+    const add = (id, icon, title, value, description) =>
+      items.push({ id, icon, title, value, description });
+    if (state.aliceState !== undefined) {
+      const labels = {
+        IDLE: "свободна",
+        LISTENING: "слушает",
+        THINKING: "думает",
+        SPEAKING: "говорит",
+      };
+      add(
+        "alice_state",
+        "mdi:account-voice",
+        "Статус Алисы",
+        labels[state.aliceState] || state.aliceState,
+        "Живой индикатор на карточке колонки: слушает, думает или говорит. Обновляется вместе с потоком состояния."
+      );
+    }
+    if (state.canStop !== undefined) {
+      add(
+        "can_stop",
+        "mdi:stop-circle-outline",
+        "Остановка текущего действия",
+        state.canStop ? "доступна" : "нет активного действия",
+        "Кнопка «Стоп» добавлена в карточку колонки и в настройки станции. Если действия нет — показывает «нет активного действия»."
+      );
+    }
+    if (state.timeSinceLastVoiceActivity !== undefined) {
+      add(
+        "voice_activity",
+        "mdi:timer-sand",
+        "Время с последней голосовой команды",
+        `${state.timeSinceLastVoiceActivity} с`,
+        "Можно показывать, как давно вы обращались к Алисе, и строить сценарии по активности."
+      );
+    }
+    if (entityInfo.next || entityInfo.prev) {
+      add(
+        "track_neighbors",
+        "mdi:skip-next-circle-outline",
+        "Следующий и предыдущий трек",
+        [entityInfo.next?.id, entityInfo.prev?.id].filter(Boolean).join(" / ") || "—",
+        "Показывать названия соседних треков и запускать их одним касанием без открытия поиска."
+      );
+    }
+    if (entityInfo.type) {
+      add(
+        "source_type",
+        "mdi:source-branch",
+        "Источник подбора",
+        entityInfo.type,
+        "Что сейчас является источником: Artist, Playlist, Album и т.п. Полезно для карточки «сейчас играет»."
+      );
+    }
+    if (player.playlistId || player.playlistType) {
+      add(
+        "playlist_context",
+        "mdi:playlist-music",
+        "Плейлист и контекст воспроизведения",
+        `${player.playlistType || "—"} · ${player.playlistId || "—"}`,
+        "Показывать текущий плейлист, его тип и описание; можно добавить переход к плейлисту."
+      );
+    }
+    add(
+      "live_stream",
+      "mdi:radio",
+      "Live-поток",
+      player.liveStreamText || "нет активного потока",
+      "Блок «Прямой эфир» показывает радиостанцию или live-передачу на карточке колонки."
+    );
+    add(
+      "video_mode",
+      "mdi:youtube-tv",
+      "Видео и видеосервисы",
+      extra.item?.type ||
+        (player.type && player.type !== "Track"
+          ? player.type
+          : "готово к видео"),
+      "Колонка играет видео с отдельной обложкой 16:9. Поддерживаются YouTube, Rutube, Кинопоиск, IVI, Okko, Wink, Start, Premier, VK Видео, Яндекс Эфир, прямые mp4/m3u8 и другие сервисы через yt-dlp. Мини-плеер и кнопка закрытия видео появляются автоматически."
+    );
+    if (player.playerType) {
+      const engineLabels = {
+        music_thin: "Музыка",
+        video: "Видео",
+        radio: "Радио",
+      };
+      add(
+        "player_engine",
+        "mdi:engine-outline",
+        "Тип плеера",
+        `${engineLabels[player.playerType] || "Плеер"} · ${
+          player.playerType
+        }`,
+        "Тип плеера автоматически переключает управление: music_thin — музыкальные кнопки, video — видео-режим, radio — радио без перемотки и shuffle."
+      );
+    }
+    if (config.audio_player?.music_quality) {
+      add(
+        "music_quality",
+        "mdi:equalizer",
+        "Качество музыки",
+        config.audio_player.music_quality,
+        "Select high / low добавлен в настройки колонки. Влияет на качество и трафик Яндекс Музыки."
+      );
+    }
+    if (config.dndMode) {
+      add(
+        "dnd",
+        "mdi:bell-off-outline",
+        "Режим «Не беспокоить»",
+        `${config.dndMode.enabled ? "вкл" : "выкл"} · ${
+          config.dndMode.starts || "—"
+        }–${config.dndMode.ends || "—"}`,
+        "Switch и time-селекторы добавлены в настройки колонки: начало, конец и пропуск входящих звонков."
+      );
+    }
+    if (config.led?.time_visualization) {
+      add(
+        "clock_style",
+        "mdi:clock-outline",
+        "Формат и размер часов",
+        `${config.led.time_visualization.format || "24h"} · ${
+          config.led.time_visualization.size || "large"
+        }`,
+        "Селекторы 12/24 часа и размера часов добавлены в настройки колонки."
+      );
+    }
+    if (config.standby) {
+      add(
+        "standby",
+        "mdi:power-sleep",
+        "Глубокий сон",
+        `${
+          config.standby.deepStandbyEnabled ? "вкл" : "выкл"
+        } · ${config.standby.deepStandbyTimeoutMinutes || "—"} мин`,
+        "Switch и выбор таймаута добавлены в настройки колонки."
+      );
+    }
+    if (config.locale) {
+      add(
+        "locale",
+        "mdi:translate",
+        "Язык интерфейса",
+        config.locale,
+        "Select языка добавлен в настройки колонки: ru-RU, en-US, ar-SA, kk-KZ, tr-TR."
+      );
+    }
+    if (config.timezone?.timezone_name) {
+      add(
+        "timezone",
+        "mdi:map-clock-outline",
+        "Часовой пояс",
+        config.timezone.timezone_name,
+        "Поле часового пояса добавлено в настройки колонки; используется для времени и будильников."
+      );
+    }
+    if (config.location?.latitude !== undefined) {
+      add(
+        "location",
+        "mdi:map-marker-outline",
+        "Геолокация",
+        `${config.location.latitude}, ${config.location.longitude}`,
+        "Широта и долгота добавлены в настройки колонки; нужны для погоды и локальных сценариев."
+      );
+    }
+    if (config.calls_settings) {
+      add(
+        "calls",
+        "mdi:phone-in-talk-outline",
+        "Звонки и Drop-in",
+        JSON.stringify(config.calls_settings).slice(0, 120),
+        "Select-политики входящих звонков, Drop-in и радионяни добавлены в настройки колонки."
+      );
+    }
+    if (config.radio_nanny_enabled !== undefined) {
+      add(
+        "radio_nanny",
+        "mdi:baby-carriage",
+        "Радионяня",
+        config.radio_nanny_enabled ? "включена" : "выключена",
+        "Switch радионяни добавлен в настройки колонки: колонка слушает комнату и передаёт звук на телефон."
+      );
+    }
+    if (config.allow_non_self_calls !== undefined) {
+      add(
+        "non_self_calls",
+        "mdi:phone-plus-outline",
+        "Звонки с других аккаунтов",
+        config.allow_non_self_calls ? "разрешены" : "запрещены",
+        "Switch добавлен в настройки колонки: разрешать звонки с аккаунтов, которые не являются владельцем."
+      );
+    }
+    if (config.intonationSpotting) {
+      add(
+        "intonation",
+        "mdi:waveform",
+        "Распознавание интонаций",
+        config.intonationSpotting.enabled ? "включено" : "выключено",
+        "Switch добавлен в настройки колонки: Алиса анализирует интонацию голоса."
+      );
+    }
+    if (config.tv_beta !== undefined || config.tv_max !== undefined) {
+      add(
+        "tv_mode",
+        "mdi:television",
+        "ТВ-режим",
+        `tv_beta: ${config.tv_beta ? "да" : "нет"} · tv_max: ${
+          config.tv_max ? "да" : "нет"
+        }`,
+        "Switches ТВ-режима добавлены в настройки колонки; связаны с HDMI-источником."
+      );
+    }
+    if (config.beta !== undefined) {
+      add(
+        "beta",
+        "mdi:flask-outline",
+        "Бета-канал",
+        config.beta ? "включён" : "выключен",
+        "Switch добавлен в настройки колонки: бета-прошивка и экспериментальные функции Яндекса."
+      );
+    }
+    return items;
+  }
+
+  _renderTestPanel(speaker, diag, settings = false) {
+    const state = diag.state || {};
+    const config = diag.config || {};
+    const player = state.playerState || {};
+    const entityInfo = player.entityInfo || {};
+    const dnd = config.dndMode || {};
+    const clock = (config.led || {}).time_visualization || {};
+    const standby = config.standby || {};
+    const calls = config.calls_settings || {};
+    const location = config.location || {};
+    const locale = config.locale || "ru-RU";
+    const quality = (config.audio_player || {}).music_quality || "high";
+    const timezone = (config.timezone || {}).timezone_name || "";
+    const aliceState = String(state.aliceState || "").toUpperCase();
+    const aliceLabel =
+      {
+        IDLE: "Свободна",
+        LISTENING: "Слушает",
+        THINKING: "Думает",
+        SPEAKING: "Говорит",
+      }[aliceState] ||
+      aliceState ||
+      "—";
+    const liveText = String(player.liveStreamText || "");
+    const liveName = String(player.subtitle || "");
+    const option = (value, current, label) =>
+      `<option value="${this._esc(value)}" ${
+        String(value) === String(current) ? "selected" : ""
+      }>${this._esc(label || value)}</option>`;
+    const boolSwitch = (path, value, label, warning = false) =>
+      `<label class="test-switch ${warning ? "warning" : ""}">
+        <span>${this._esc(label)}</span>
+        <input type="checkbox" data-test-config="${this._esc(
+          speaker.id
+        )}" data-test-path="${this._esc(path)}" data-test-kind="bool" ${
+        value ? "checked" : ""
+      } />
+        <b>${value ? "вкл" : "выкл"}</b>
+      </label>`;
+    return `<div class="test-panel ${settings ? "settings-panel" : ""}">
+      ${
+        settings
+          ? ""
+          : `<div class="test-warning">
+        <ha-icon icon="mdi:flask-outline"></ha-icon>
+        <div><b>Тестовый режим</b><p>Эти настройки читаются и записываются напрямую в конфигурацию Станции. Некоторые из них могут изменить поведение колонки. Если что-то пойдёт не так — верните прежнее значение.</p></div>
+      </div>`
+      }
+      <div class="test-grid">
+        <section class="test-block">
+          <h4><ha-icon icon="mdi:account-voice"></ha-icon> Алиса и плеер</h4>
+          <div class="test-status-row"><span>Состояние Алисы</span><b class="alice-state ${aliceState.toLowerCase()}">${this._esc(
+            aliceLabel
+          )}</b></div>
+          <div class="test-status-row"><span>Последняя активность</span><b>${
+            state.timeSinceLastVoiceActivity !== undefined
+              ? `${state.timeSinceLastVoiceActivity} с`
+              : "—"
+          }</b></div>
+          <div class="test-status-row"><span>Остановка</span><b>${
+            state.canStop ? "доступна" : "нет активного действия"
+          }</b></div>
+          <div class="test-status-row"><span>Тип плеера</span><b>${this._esc(
+            player.playerType || "—"
+          )}</b></div>
+          <div class="test-status-row"><span>Источник</span><b>${this._esc(
+            entityInfo.type || "—"
+          )}</b></div>
+          <div class="test-status-row"><span>Плейлист</span><b>${this._esc(
+            player.playlistType || "—"
+          )} · ${this._esc(player.playlistId || "—")}</b></div>
+          <div class="test-live ${liveText ? "active" : ""}">
+            <ha-icon icon="mdi:radio"></ha-icon>
+            <div class="test-live-copy">
+              <span>Прямой эфир</span>
+              <b>${this._esc(liveText || "нет активного потока")}</b>
+              ${liveName ? `<small>${this._esc(liveName)}</small>` : ""}
+            </div>
+            <div class="radio-bars"><i></i><i></i><i></i><i></i><i></i></div>
+          </div>
+          <div class="test-actions">
+            <button class="test-btn" data-test-stop="${this._esc(
+              speaker.entity_id || ""
+            )}" ${state.canStop ? "" : "disabled"}>Стоп</button>
+            <button class="test-btn" data-test-track="previous" data-test-entity="${this._esc(
+              speaker.entity_id || ""
+            )}">← Предыдущий</button>
+            <button class="test-btn" data-test-track="next" data-test-entity="${this._esc(
+              speaker.entity_id || ""
+            )}">Следующий →</button>
+          </div>
+          <div class="test-next-prev">Соседние треки: ${this._esc(
+            [entityInfo.prev?.id, entityInfo.next?.id]
+              .filter(Boolean)
+              .join(" / ") || "—"
+          )}</div>
+        </section>
+        <section class="test-block">
+          <h4><ha-icon icon="mdi:music-note"></ha-icon> Музыка</h4>
+          <label class="test-field"><span>Качество музыки</span>
+            <select data-test-config="${this._esc(
+              speaker.id
+            )}" data-test-path="audio_player.music_quality" data-test-kind="string">
+              ${option("high", quality, "Высокое")}
+              ${option("low", quality, "Низкое")}
+            </select>
+          </label>
+          <div class="test-hint">Влияет на качество и расход трафика Яндекс Музыки.</div>
+        </section>
+        <section class="test-block">
+          <h4><ha-icon icon="mdi:bell-off-outline"></ha-icon> Не беспокоить</h4>
+          ${boolSwitch("dndMode.enabled", dnd.enabled, "Режим DND")}
+          ${boolSwitch(
+            "dndMode.features.allowIncomingCalls",
+            (dnd.features || {}).allowIncomingCalls,
+            "Пропускать входящие звонки"
+          )}
+          <label class="test-field"><span>Начало</span>
+            <input type="time" value="${this._esc(
+              String(dnd.starts || "23:00").slice(0, 5)
+            )}" data-test-time="${this._esc(
+              speaker.id
+            )}" data-test-path="dndMode.starts" data-test-current="${this._esc(
+      dnd.starts || ""
+    )}" />
+          </label>
+          <label class="test-field"><span>Конец</span>
+            <input type="time" value="${this._esc(
+              String(dnd.ends || "09:00").slice(0, 5)
+            )}" data-test-time="${this._esc(
+              speaker.id
+            )}" data-test-path="dndMode.ends" data-test-current="${this._esc(
+      dnd.ends || ""
+    )}" />
+          </label>
+        </section>
+        <section class="test-block">
+          <h4><ha-icon icon="mdi:clock-outline"></ha-icon> Часы на экране</h4>
+          <label class="test-field"><span>Формат</span>
+            <select data-test-config="${this._esc(
+              speaker.id
+            )}" data-test-path="led.time_visualization.format" data-test-kind="string">
+              ${option("24h", clock.format, "24 часа")}
+              ${option("12h", clock.format, "12 часов")}
+            </select>
+          </label>
+          <label class="test-field"><span>Размер</span>
+            <select data-test-config="${this._esc(
+              speaker.id
+            )}" data-test-path="led.time_visualization.size" data-test-kind="string">
+              ${option("large", clock.size, "Большой")}
+              ${option("small", clock.size, "Маленький")}
+            </select>
+          </label>
+        </section>
+        <section class="test-block">
+          <h4><ha-icon icon="mdi:power-sleep"></ha-icon> Глубокий сон</h4>
+          ${boolSwitch(
+            "standby.deepStandbyEnabled",
+            standby.deepStandbyEnabled,
+            "Глубокий сон"
+          )}
+          <label class="test-field"><span>Таймаут, мин</span>
+            <input type="number" min="1" max="1440" value="${
+              standby.deepStandbyTimeoutMinutes || 240
+            }" data-test-config="${this._esc(
+      speaker.id
+    )}" data-test-path="standby.deepStandbyTimeoutMinutes" data-test-kind="number" />
+          </label>
+        </section>
+        <section class="test-block">
+          <h4><ha-icon icon="mdi:translate"></ha-icon> Язык и регион</h4>
+          <label class="test-field"><span>Язык</span>
+            <select data-test-config="${this._esc(
+              speaker.id
+            )}" data-test-path="locale" data-test-kind="string">
+              ${option("ru-RU", locale, "Русский")}
+              ${option("en-US", locale, "English")}
+              ${option("ar-SA", locale, "العربية")}
+              ${option("kk-KZ", locale, "Қазақша")}
+              ${option("tr-TR", locale, "Türkçe")}
+            </select>
+          </label>
+          <label class="test-field"><span>Часовой пояс</span>
+            <input type="text" value="${this._esc(
+              timezone
+            )}" data-test-timezone="${this._esc(speaker.id)}" />
+            <button class="test-btn" data-test-timezone-save="${this._esc(
+              speaker.id
+            )}">Сохранить</button>
+          </label>
+          <div class="test-row-2">
+            <label class="test-field"><span>Широта</span>
+              <input type="number" step="0.000001" value="${
+                location.latitude ?? ""
+              }" data-test-lat="${this._esc(speaker.id)}" />
+            </label>
+            <label class="test-field"><span>Долгота</span>
+              <input type="number" step="0.000001" value="${
+                location.longitude ?? ""
+              }" data-test-lon="${this._esc(speaker.id)}" />
+            </label>
+          </div>
+          <button class="test-btn" data-test-location-save="${this._esc(
+            speaker.id
+          )}">Сохранить геолокацию</button>
+        </section>
+        <section class="test-block">
+          <h4><ha-icon icon="mdi:phone-in-talk-outline"></ha-icon> Звонки и Drop-in</h4>
+          <label class="test-field"><span>Входящие звонки</span>
+            <select data-test-config="${this._esc(
+              speaker.id
+            )}" data-test-path="calls_settings.incoming_policy" data-test-kind="string">
+              ${option("allow_device_owner_and_guests", calls.incoming_policy, "Владелец и гости")}
+              ${option("allow_device_owner", calls.incoming_policy, "Только владелец")}
+              ${option("allow_all", calls.incoming_policy, "Все")}
+              ${option("deny_all", calls.incoming_policy, "Запретить")}
+            </select>
+          </label>
+          <label class="test-field"><span>Drop-in</span>
+            <select data-test-config="${this._esc(
+              speaker.id
+            )}" data-test-path="calls_settings.incoming_dropin_policy" data-test-kind="string">
+              ${option("allow_device_owner_and_guests", calls.incoming_dropin_policy, "Владелец и гости")}
+              ${option("allow_device_owner", calls.incoming_dropin_policy, "Только владелец")}
+              ${option("deny_all", calls.incoming_dropin_policy, "Запретить")}
+            </select>
+          </label>
+          <label class="test-field"><span>Радионяня</span>
+            <select data-test-config="${this._esc(
+              speaker.id
+            )}" data-test-path="calls_settings.incoming_radionanny_policy" data-test-kind="string">
+              ${option("allow_device_owner", calls.incoming_radionanny_policy, "Только владелец")}
+              ${option("allow_device_owner_and_guests", calls.incoming_radionanny_policy, "Владелец и гости")}
+              ${option("deny_all", calls.incoming_radionanny_policy, "Запретить")}
+            </select>
+          </label>
+          ${boolSwitch(
+            "radio_nanny_enabled",
+            config.radio_nanny_enabled,
+            "Радионяня включена"
+          )}
+          ${boolSwitch(
+            "allow_non_self_calls",
+            config.allow_non_self_calls,
+            "Звонки с других аккаунтов"
+          )}
+        </section>
+        <section class="test-block">
+          <h4><ha-icon icon="mdi:flask-outline"></ha-icon> Экспериментальные</h4>
+          ${boolSwitch(
+            "intonationSpotting.enabled",
+            (config.intonationSpotting || {}).enabled,
+            "Распознавание интонаций"
+          )}
+          ${boolSwitch("tv_beta", config.tv_beta, "ТВ-режим (бета)")}
+          ${boolSwitch("tv_max", config.tv_max, "ТВ-режим (Макс)")}
+          <div class="test-hint">ТВ-режим связан с HDMI-источником и экспериментальным управлением телевизором.</div>
+          ${boolSwitch("beta", config.beta, "Бета-канал", true)}
+          <div class="test-hint">Бета-канал подключает колонку к экспериментальным функциям Яндекса и может быть нестабильным.</div>
+        </section>
+      </div>
+    </div>`;
+  }
+
+  _renderFeatureCard(speaker) {
+    const diag = this._diagnostics[speaker.id];
+    const loading = this._diagLoading[speaker.id];
+    if (!diag) {
+      return `<article class="feature-card"><div class="feature-loading">
+        <div class="spinner"></div>
+        <h3>${this._esc(speaker.name)}</h3>
+        <p class="muted">${
+          loading ? "Сканирую поток колонки…" : "Подключаюсь к колонке…"
+        }</p>
+      </div></article>`;
+    }
+    if (diag.error) {
+      return `<article class="feature-card"><div class="feature-error">
+        <ha-icon icon="mdi:alert-circle-outline"></ha-icon>
+        <div><h3>${this._esc(speaker.name)}</h3><p class="muted">${this._esc(
+          diag.error
+        )}</p></div>
+      </div></article>`;
+    }
+    const added = [
+      ["Музыка и плеер", "play/pause, следующий/предыдущий трек, перемотка, громкость, mute"],
+      ["Очередь, лайки, плейлисты", "поиск и запуск треков Яндекс Музыки, локальная очередь"],
+      ["Текст песни", "три строки: прошлая, текущая, следующая, с отсчётом"],
+      ["TTS и диалог", "озвучивание текста и общение с Алисой"],
+      ["LED и авто-яркость", "яркость кольца, автоматический режим"],
+      ["Экран", "часы / эквалайзер"],
+      ["HDMI", "источник звука «Станция / HDMI»"],
+      ["Эквалайзер", "пресеты и ручные полосы"],
+      ["Будильники", "календарь будильников Станции"],
+      ["Media Browser", "лайки, плейлисты и очередь в HA"],
+    ];
+    const found = this._speakerFeatureItems(diag);
+    const implemented = new Set([
+      "alice_state",
+      "can_stop",
+      "live_stream",
+      "video_mode",
+      "player_engine",
+      "music_quality",
+      "dnd",
+      "clock_style",
+      "standby",
+      "locale",
+      "timezone",
+      "location",
+      "calls",
+      "radio_nanny",
+      "non_self_calls",
+      "intonation",
+      "tv_mode",
+      "beta",
+    ]);
+    const state = diag.state || {};
+    const config = diag.config || {};
+    return `<article class="feature-card">
+      <header class="feature-card-head">
+        <div class="device-icon" style="--accent:#5b6cff"><ha-icon icon="mdi:speaker-wireless"></ha-icon></div>
+        <div>
+          <h3>${this._esc(speaker.name)}</h3>
+          <p class="muted">${this._esc(
+            speaker.platform || ""
+          )} · обновлено ${new Date(
+      diag.fetched_at || Date.now()
+    ).toLocaleTimeString("ru-RU", { hour: "2-digit", minute: "2-digit" })}</p>
+        </div>
+        <button class="ghost-btn" data-diag-refresh="${
+          speaker.id
+        }">Сканировать снова</button>
+      </header>
+      <div class="feature-summary">
+        <div><b>${Object.keys(state).length}</b><span>ключей состояния</span></div>
+        <div><b>${Object.keys(config).length}</b><span>ключей конфигурации</span></div>
+        <div><b>${found.length}</b><span>найдено функций</span></div>
+      </div>
+      <h4 class="feature-section-title">Уже добавлено</h4>
+      <div class="feature-added">${added
+        .map(
+          ([title, desc]) =>
+            `<div class="feature-added-item"><ha-icon icon="mdi:check-circle"></ha-icon><div><b>${title}</b><small>${desc}</small></div></div>`
+        )
+        .join("")}</div>
+      <h4 class="feature-section-title">Найдено в потоке</h4>
+      <div class="feature-list">${found
+        .map((item) => {
+          const done = implemented.has(item.id);
+          return `<div class="feature-item" data-feature-id="${item.id}">
+              <div class="feature-item-icon"><ha-icon icon="${item.icon}"></ha-icon></div>
+              <div class="feature-item-body">
+                <div class="feature-item-title"><b>${item.title}</b><span>${this._esc(
+            this._featureFormat(item.value)
+          )}</span></div>
+                <p>${item.description}</p>
+              </div>
+              <span class="feature-badge ${done ? "added" : ""}">${
+            done ? "добавлено" : "не добавлено"
+          }</span>
+            </div>`;
+        })
+        .join("")}</div>
+      <h4 class="feature-section-title">Тестовое управление</h4>
+      ${this._renderTestPanel(speaker, diag)}
+      <details class="feature-raw">
+        <summary>Сырые данные потока и конфигурации</summary>
+        <div class="feature-raw-grid">
+          <div><h5>Состояние</h5><pre>${this._esc(
+            JSON.stringify(state, null, 2)
+          )}</pre></div>
+          <div><h5>Конфигурация</h5><pre>${this._esc(
+            JSON.stringify(config, null, 2)
+          )}</pre></div>
+        </div>
+      </details>
+    </article>`;
+  }
+
+  _renderStationSettings(speaker, diag) {
+    const state = diag.state || {};
+    const config = diag.config || {};
+    const player = state.playerState || {};
+    const entityInfo = player.entityInfo || {};
+    const dnd = config.dndMode || {};
+    const clock = (config.led || {}).time_visualization || {};
+    const standby = config.standby || {};
+    const calls = config.calls_settings || {};
+    const location = config.location || {};
+    const locale = config.locale || "ru-RU";
+    const quality = (config.audio_player || {}).music_quality || "high";
+    const timezone = (config.timezone || {}).timezone_name || "";
+    const entity = this._hass.states[speaker.entity_id];
+    const modeInfo = this._playerMode(speaker, entity);
+    const aliceInfo = this._aliceInfo(entity?.attributes || {});
+    const liveText = String(player.liveStreamText || "");
+    const liveName = String(player.subtitle || "");
+    const esc = (value) => this._esc(value);
+    const option = (value, current, label) =>
+      `<option value="${esc(value)}" ${
+        String(value) === String(current) ? "selected" : ""
+      }>${esc(label || value)}</option>`;
+    const switchRow = (path, value, label, warning = false) =>
+      `<label class="settings-switch ${warning ? "warning" : ""}">
+        <span>${esc(label)}</span>
+        <input type="checkbox" data-test-config="${esc(
+          speaker.id
+        )}" data-test-path="${esc(path)}" data-test-kind="bool" ${
+        value ? "checked" : ""
+      } />
+        <b>${value ? "вкл" : "выкл"}</b>
+      </label>`;
+    const timeRow = (path, value, label) =>
+      `<label class="settings-row"><span>${esc(label)}</span>
+        <input class="settings-time" type="time" value="${esc(
+          String(value || "").slice(0, 5)
+        )}" data-test-time="${esc(
+        speaker.id
+      )}" data-test-path="${esc(path)}" data-test-current="${esc(
+        value || ""
+      )}" />
+      </label>`;
+    const label = (value) => esc(value || "—");
+    return `<div class="station-settings">
+      <div class="settings-grid">
+        <section class="settings-card">
+          <div class="settings-card-head"><ha-icon icon="mdi:account-voice"></ha-icon><h5>Алиса и плеер</h5></div>
+          <div class="settings-status-row"><span>Алиса</span><b class="alice-state ${aliceInfo.state.toLowerCase()}">${esc(
+      aliceInfo.label
+    )}</b></div>
+          <div class="settings-status-row"><span>Тип плеера</span><b>${esc(
+            modeInfo.label
+          )} <small>${esc(modeInfo.engine)}</small></b></div>
+          <div class="settings-status-row"><span>Остановка</span><b>${
+            state.canStop ? "доступна" : "нет активного действия"
+          }</b></div>
+          <div class="settings-status-row"><span>Источник</span><b>${label(
+            entityInfo.type
+          )}</b></div>
+          <div class="settings-actions">
+            <button class="settings-btn" data-test-stop="${esc(
+              speaker.entity_id || ""
+            )}" ${state.canStop ? "" : "disabled"}>Стоп</button>
+            <button class="settings-btn" data-test-track="previous" data-test-entity="${esc(
+              speaker.entity_id || ""
+            )}">← Назад</button>
+            <button class="settings-btn" data-test-track="next" data-test-entity="${esc(
+              speaker.entity_id || ""
+            )}">Вперёд →</button>
+          </div>
+          <div class="settings-live ${liveText ? "active" : ""}">
+            <ha-icon icon="mdi:radio"></ha-icon>
+            <div><span>Прямой эфир</span><b>${esc(
+              liveText || "нет активного потока"
+            )}</b>${liveName ? `<small>${esc(liveName)}</small>` : ""}</div>
+          </div>
+        </section>
+
+        <section class="settings-card">
+          <div class="settings-card-head"><ha-icon icon="mdi:music-note"></ha-icon><h5>Музыка</h5></div>
+          ${this._renderQualitySwitch(speaker, quality, speaker.entity_id)}
+          <div class="settings-hint">Качество Яндекс Музыки: высокое или экономное.</div>
+        </section>
+
+        <section class="settings-card">
+          <div class="settings-card-head"><ha-icon icon="mdi:bell-off-outline"></ha-icon><h5>Не беспокоить</h5></div>
+          ${switchRow("dndMode.enabled", dnd.enabled, "Режим DND")}
+          ${switchRow(
+            "dndMode.features.allowIncomingCalls",
+            (dnd.features || {}).allowIncomingCalls,
+            "Пропускать входящие звонки"
+          )}
+          ${timeRow("dndMode.starts", dnd.starts, "Начало")}
+          ${timeRow("dndMode.ends", dnd.ends, "Конец")}
+        </section>
+
+        <section class="settings-card">
+          <div class="settings-card-head"><ha-icon icon="mdi:clock-outline"></ha-icon><h5>Экран</h5></div>
+          <label class="settings-row"><span>Формат часов</span>
+            <select class="settings-select" data-test-config="${esc(
+              speaker.id
+            )}" data-test-path="led.time_visualization.format" data-test-kind="string">
+              ${option("24h", clock.format, "24 часа")}
+              ${option("12h", clock.format, "12 часов")}
+            </select>
+          </label>
+          <label class="settings-row"><span>Размер</span>
+            <select class="settings-select" data-test-config="${esc(
+              speaker.id
+            )}" data-test-path="led.time_visualization.size" data-test-kind="string">
+              ${option("large", clock.size, "Большой")}
+              ${option("small", clock.size, "Маленький")}
+            </select>
+          </label>
+        </section>
+
+        <section class="settings-card">
+          <div class="settings-card-head"><ha-icon icon="mdi:power-sleep"></ha-icon><h5>Глубокий сон</h5></div>
+          ${switchRow(
+            "standby.deepStandbyEnabled",
+            standby.deepStandbyEnabled,
+            "Глубокий сон"
+          )}
+          <label class="settings-row"><span>Таймаут, мин</span>
+            <input class="settings-input" type="number" min="1" max="1440" value="${
+              standby.deepStandbyTimeoutMinutes || 240
+            }" data-test-config="${esc(
+      speaker.id
+    )}" data-test-path="standby.deepStandbyTimeoutMinutes" data-test-kind="number" />
+          </label>
+        </section>
+
+        <section class="settings-card">
+          <div class="settings-card-head"><ha-icon icon="mdi:translate"></ha-icon><h5>Язык и регион</h5></div>
+          <label class="settings-row"><span>Язык</span>
+            <select class="settings-select" data-test-config="${esc(
+              speaker.id
+            )}" data-test-path="locale" data-test-kind="string">
+              ${option("ru-RU", locale, "Русский")}
+              ${option("en-US", locale, "English")}
+              ${option("ar-SA", locale, "العربية")}
+              ${option("kk-KZ", locale, "Қазақша")}
+              ${option("tr-TR", locale, "Türkçe")}
+            </select>
+          </label>
+          <label class="settings-row"><span>Часовой пояс</span>
+            <input class="settings-input" type="text" value="${esc(
+              timezone
+            )}" data-test-timezone="${esc(speaker.id)}" />
+          </label>
+          <button class="settings-btn" data-test-timezone-save="${esc(
+            speaker.id
+          )}">Сохранить часовой пояс</button>
+          <div class="settings-row-2">
+            <label class="settings-row"><span>Широта</span>
+              <input class="settings-input" type="number" step="0.000001" value="${
+                location.latitude ?? ""
+              }" data-test-lat="${esc(speaker.id)}" />
+            </label>
+            <label class="settings-row"><span>Долгота</span>
+              <input class="settings-input" type="number" step="0.000001" value="${
+                location.longitude ?? ""
+              }" data-test-lon="${esc(speaker.id)}" />
+            </label>
+          </div>
+          <button class="settings-btn" data-test-location-save="${esc(
+            speaker.id
+          )}">Сохранить геолокацию</button>
+        </section>
+
+        <section class="settings-card">
+          <div class="settings-card-head"><ha-icon icon="mdi:phone-in-talk-outline"></ha-icon><h5>Звонки и Drop-in</h5></div>
+          <label class="settings-row"><span>Входящие</span>
+            <select class="settings-select" data-test-config="${esc(
+              speaker.id
+            )}" data-test-path="calls_settings.incoming_policy" data-test-kind="string">
+              ${option(
+                "allow_device_owner_and_guests",
+                calls.incoming_policy,
+                "Владелец и гости"
+              )}
+              ${option(
+                "allow_device_owner",
+                calls.incoming_policy,
+                "Только владелец"
+              )}
+              ${option("allow_all", calls.incoming_policy, "Все")}
+              ${option("deny_all", calls.incoming_policy, "Запретить")}
+            </select>
+          </label>
+          <label class="settings-row"><span>Drop-in</span>
+            <select class="settings-select" data-test-config="${esc(
+              speaker.id
+            )}" data-test-path="calls_settings.incoming_dropin_policy" data-test-kind="string">
+              ${option(
+                "allow_device_owner_and_guests",
+                calls.incoming_dropin_policy,
+                "Владелец и гости"
+              )}
+              ${option(
+                "allow_device_owner",
+                calls.incoming_dropin_policy,
+                "Только владелец"
+              )}
+              ${option("deny_all", calls.incoming_dropin_policy, "Запретить")}
+            </select>
+          </label>
+          <label class="settings-row"><span>Радионяня</span>
+            <select class="settings-select" data-test-config="${esc(
+              speaker.id
+            )}" data-test-path="calls_settings.incoming_radionanny_policy" data-test-kind="string">
+              ${option(
+                "allow_device_owner",
+                calls.incoming_radionanny_policy,
+                "Только владелец"
+              )}
+              ${option(
+                "allow_device_owner_and_guests",
+                calls.incoming_radionanny_policy,
+                "Владелец и гости"
+              )}
+              ${option(
+                "deny_all",
+                calls.incoming_radionanny_policy,
+                "Запретить"
+              )}
+            </select>
+          </label>
+          ${switchRow(
+            "radio_nanny_enabled",
+            config.radio_nanny_enabled,
+            "Радионяня включена"
+          )}
+          ${switchRow(
+            "allow_non_self_calls",
+            config.allow_non_self_calls,
+            "Звонки с других аккаунтов"
+          )}
+        </section>
+
+        <section class="settings-card">
+          <div class="settings-card-head"><ha-icon icon="mdi:flask-outline"></ha-icon><h5>Эксперименты</h5></div>
+          ${switchRow(
+            "intonationSpotting.enabled",
+            (config.intonationSpotting || {}).enabled,
+            "Распознавание интонаций"
+          )}
+          ${switchRow("tv_beta", config.tv_beta, "ТВ-режим (бета)")}
+          ${switchRow("tv_max", config.tv_max, "ТВ-режим (Макс)")}
+          ${switchRow("beta", config.beta, "Бета-канал", true)}
+          <div class="settings-hint">ТВ-режим связан с HDMI. Бета-канал может быть нестабильным.</div>
+        </section>
+      </div>
+    </div>`;
+  }
+
   _renderSpeakerControls(speakers) {
     const withEntity = speakers.filter(
       (speaker) => speaker.entity_id && this._hass.states[speaker.entity_id]
@@ -1847,6 +3152,11 @@ class YaHomeHubPanel extends HTMLElement {
     if (!withEntity.length) {
       return `<div class="empty">Колонки не найдены. Проверьте cookies и токен в настройках интеграции.</div>`;
     }
+    withEntity.forEach((speaker) => {
+      if (!this._diagnostics[speaker.id] && !this._diagLoading[speaker.id]) {
+        this._loadSpeakerDiagnostics(speaker.id);
+      }
+    });
     return `
       <div class="speaker-controls">
         ${withEntity
@@ -2047,6 +3357,31 @@ class YaHomeHubPanel extends HTMLElement {
           }
         </div>
       </div>
+      <div class="speaker-settings" data-speaker-settings="${this._esc(
+        speaker.id
+      )}">
+        <div class="settings-head">
+          <div>
+            <h4>Настройки станции</h4>
+            <p class="muted">Алиса, плеер, музыка, DND, часы, сон, язык, звонки и эксперименты.</p>
+          </div>
+          <button class="ghost-btn" data-settings-refresh="${this._esc(
+            speaker.id
+          )}">Обновить</button>
+        </div>
+        ${
+          this._diagnostics[speaker.id] && !this._diagnostics[speaker.id].error
+            ? this._renderStationSettings(
+                speaker,
+                this._diagnostics[speaker.id]
+              )
+            : `<div class="settings-loading"><div class="spinner"></div><span>${
+                this._diagLoading[speaker.id]
+                  ? "Сканирую настройки колонки…"
+                  : "Настройки ещё не загружены"
+              }</span></div>`
+        }
+      </div>
       <div class="control-status" data-control-status="${this._esc(
         speaker.id
       )}"></div>
@@ -2093,6 +3428,194 @@ class YaHomeHubPanel extends HTMLElement {
       return "/yahome_hub/station-max.svg";
     }
     return "";
+  }
+
+  _videoProviderLabel(provider) {
+    const labels = {
+      youtube: "YouTube",
+      rutube: "Rutube",
+      kinopoisk: "Кинопоиск",
+      ivi: "IVI",
+      okko: "Okko",
+      wink: "Wink",
+      start: "Start",
+      premier: "Premier",
+      yavideo: "VK Видео",
+      strm: "Яндекс Эфир",
+      video: "Видео",
+    };
+    return labels[String(provider || "").toLowerCase()] || "Видео";
+  }
+
+  _videoInfo(speaker, entity) {
+    const attrs = (entity && entity.attributes) || {};
+    const state = entity ? entity.state : "";
+    const contentId = String(attrs.media_content_id || "");
+    const title = String(attrs.media_title || "Видео");
+    const source = `${contentId} ${attrs.video_url || ""}`;
+    let provider = String(attrs.video_provider || "").toLowerCase();
+    let videoId = String(attrs.video_id || "");
+    if (!videoId) {
+      const match = source.match(
+        /(?:youtu\.be\/|youtube\.com\/(?:watch\?[^#]*v=|shorts\/|embed\/))([0-9A-Za-z_-]{11})/
+      );
+      if (match) videoId = match[1];
+    }
+    if (!provider) {
+      if (/youtu/i.test(source) || /youtube/i.test(title)) {
+        provider = "youtube";
+      } else if (/rutube/i.test(source)) {
+        provider = "rutube";
+      } else if (/kinopoisk/i.test(source)) {
+        provider = "kinopoisk";
+      } else if (/ivi\.ru/i.test(source)) {
+        provider = "ivi";
+      } else if (/okko\.tv/i.test(source)) {
+        provider = "okko";
+      } else if (/wink\.ru/i.test(source)) {
+        provider = "wink";
+      } else if (/start\.ru/i.test(source)) {
+        provider = "start";
+      } else if (/premier\.one/i.test(source)) {
+        provider = "premier";
+      } else if (/vk\.com|ok\.ru/i.test(source)) {
+        provider = "yavideo";
+      }
+    }
+    if (!provider && /^[0-9A-Za-z_-]{11}$/.test(videoId)) {
+      provider = "youtube";
+    }
+    const contentType = String(attrs.media_content_type || "").toLowerCase();
+    const detected =
+      Boolean(attrs.yahome_video || attrs.video) ||
+      contentType === "video" ||
+      contentType === "tvshow" ||
+      Boolean(provider) ||
+      Boolean(videoId);
+    const active =
+      detected && (state === "playing" || state === "paused");
+    let thumbnail =
+      attrs.video_thumbnail ||
+      (provider === "youtube" && videoId
+        ? `https://i.ytimg.com/vi/${videoId}/mqdefault.jpg`
+        : "") ||
+      attrs.entity_picture ||
+      "";
+    let url = String(attrs.video_url || "");
+    if (!url && provider === "youtube" && videoId) {
+      url = `https://youtu.be/${videoId}`;
+    }
+    if (!url && /^https?:\/\//i.test(contentId)) {
+      url = contentId;
+    }
+    return {
+      active,
+      playing: state === "playing",
+      paused: state === "paused",
+      provider,
+      videoId,
+      thumbnail,
+      url,
+      title,
+      subtitle: attrs.media_artist || attrs.media_series_title || "",
+      position: this._currentPosition(entity),
+      duration: Number(attrs.media_duration) || 0,
+    };
+  }
+
+  _playerMode(speaker, entity) {
+    const attrs = (entity && entity.attributes) || {};
+    const video = this._videoInfo(speaker, entity);
+    const engine = String(attrs.player_engine || "").toLowerCase();
+    const contentType = String(attrs.media_content_type || "").toLowerCase();
+    if (video.active) {
+      return {
+        mode: "video",
+        engine: engine || "video",
+        label: "Видео",
+      };
+    }
+    if (engine.includes("radio") || contentType === "radio") {
+      return {
+        mode: "radio",
+        engine: engine || "radio",
+        label: "Радио",
+      };
+    }
+    if (
+      engine ||
+      contentType === "music" ||
+      (entity && (entity.state === "playing" || entity.state === "paused"))
+    ) {
+      return {
+        mode: "music",
+        engine: engine || "music_thin",
+        label: "Музыка",
+      };
+    }
+    return { mode: "idle", engine, label: "Ожидание" };
+  }
+
+  _aliceInfo(attrs) {
+    const state = String((attrs && attrs.alice_state) || "IDLE").toUpperCase();
+    const labels = {
+      IDLE: "Свободна",
+      LISTENING: "Слушает",
+      THINKING: "Думает",
+      SPEAKING: "Говорит",
+    };
+    return { state, label: labels[state] || "Свободна" };
+  }
+
+  _engineInfo(modeInfo) {
+    const icons = {
+      music: "mdi:music-note",
+      video: "mdi:movie-open",
+      radio: "mdi:radio",
+      idle: "mdi:power",
+    };
+    return {
+      label: modeInfo.label,
+      raw: modeInfo.engine || "",
+      icon: icons[modeInfo.mode] || "mdi:play",
+    };
+  }
+
+  _renderQualitySwitch(speaker, quality, entityId) {
+    const value = quality === "low" ? "low" : "high";
+    return `<div class="quality-switch" data-quality-group="${this._esc(
+      speaker.id
+    )}">
+      <span class="quality-label"><ha-icon icon="mdi:equalizer"></ha-icon> Качество</span>
+      <button class="${
+        value === "high" ? "active" : ""
+      }" data-quality-value="high" data-quality-speaker="${this._esc(
+      speaker.id
+    )}" data-entity="${this._esc(
+      entityId
+    )}" title="Высокое качество">Высокое</button>
+      <button class="${
+        value === "low" ? "active" : ""
+      }" data-quality-value="low" data-quality-speaker="${this._esc(
+      speaker.id
+    )}" data-entity="${this._esc(
+      entityId
+    )}" title="Экономный трафик">Низкое</button>
+    </div>`;
+  }
+
+  _activeVideo() {
+    const speakers = (this._data && this._data.speakers) || [];
+    let paused = null;
+    for (const speaker of speakers) {
+      const entity = this._hass.states[speaker.entity_id];
+      if (!entity) continue;
+      const info = this._videoInfo(speaker, entity);
+      if (!info.active) continue;
+      if (info.playing) return { speaker, entity, info };
+      if (!paused) paused = { speaker, entity, info };
+    }
+    return paused;
   }
 
   _lyricLines(lyrics, position) {
@@ -2192,8 +3715,13 @@ class YaHomeHubPanel extends HTMLElement {
     const trackId = String(attrs.media_content_id || "");
     const trackInfo = /^\d+$/.test(trackId) ? this._trackInfo(trackId) : null;
     const image = this._speakerImage(speaker);
+    const video = this._videoInfo(speaker, entity);
+    const modeInfo = this._playerMode(speaker, entity);
+    const musicQuality = speaker.music_quality || "high";
     const cover =
-      attrs.entity_picture || (trackInfo && trackInfo.cover) || image;
+      video.active && video.thumbnail
+        ? video.thumbnail
+        : attrs.entity_picture || (trackInfo && trackInfo.cover) || image;
     const title = attrs.media_title || "Готов к воспроизведению";
     const artist = attrs.media_artist || speaker.name;
     const album =
@@ -2214,10 +3742,19 @@ class YaHomeHubPanel extends HTMLElement {
     const lyric = full
       ? this._lyricLines(lyrics, position + this._lyricsOffset)
       : { prev: "", current: "", next: "", remaining: null };
+    const aliceInfo = this._aliceInfo(attrs);
+    const engineInfo = this._engineInfo(modeInfo);
+    const canStop = Boolean(attrs.can_stop);
+    const liveText = String(attrs.live_stream || "");
+    const liveName = String(
+      attrs.live_stream_subtitle || attrs.media_artist || ""
+    );
     return `
       <article class="player skin-${this._playerSkin} ${full ? "full" : ""} ${
-      playing ? "playing" : ""
-    } ${paused ? "paused" : ""}" data-player="${this._esc(
+      video.active ? "video-mode" : ""
+    } mode-${modeInfo.mode} ${playing ? "playing" : ""} ${
+      paused ? "paused" : ""
+    }" data-player="${this._esc(
       speaker.id
     )}" data-player-entity="${this._esc(entityId)}" style="--beat-dur:${(
       60 / this._trackBpm(entity)
@@ -2228,7 +3765,9 @@ class YaHomeHubPanel extends HTMLElement {
         <div class="player-glow"></div>
         <div class="player-content">
           <div class="player-head">
-            <div class="player-cover ${full ? "big" : ""}">
+            <div class="player-cover ${full ? "big" : ""} ${
+      video.active ? "video" : ""
+    }">
               ${
                 cover
                   ? `<img data-player-cover src="${this._esc(
@@ -2237,7 +3776,18 @@ class YaHomeHubPanel extends HTMLElement {
                   : `<ha-icon data-cover-fallback icon="mdi:speaker"></ha-icon>`
               }
               ${
-                full && this._showLyrics
+                video.active
+                  ? `<span class="video-chip"><ha-icon icon="${
+                      video.provider === "youtube"
+                        ? "mdi:youtube"
+                        : "mdi:play-circle"
+                    }"></ha-icon> ${this._esc(
+                      this._videoProviderLabel(video.provider)
+                    )}</span>`
+                  : ""
+              }
+              ${
+                full && !video.active && this._showLyrics
                   ? `<div class="lyrics-overlay">
                       <div class="lyrics-prev" data-lyrics-prev>${this._esc(
                         lyric.prev
@@ -2258,8 +3808,26 @@ class YaHomeHubPanel extends HTMLElement {
               }
             </div>
             <div class="player-meta">
+              <div class="player-topline">
+                <span class="engine-pill engine-${modeInfo.mode}" data-engine-pill>
+                  <ha-icon icon="${engineInfo.icon}"></ha-icon>
+                  <b data-engine-label>${this._esc(engineInfo.label)}</b>
+                  <small data-engine-raw>${this._esc(engineInfo.raw)}</small>
+                </span>
+                <span class="alice-live ${aliceInfo.state.toLowerCase()}" data-alice-live>
+                  <i></i><span data-alice-label>Алиса · ${this._esc(
+                    aliceInfo.label
+                  )}</span>
+                </span>
+              </div>
               <span class="player-kicker" data-player-kicker><span class="beat-dot" data-beat-dot></span>${
-                playing
+                video.active
+                  ? playing
+                    ? "Сейчас играет видео"
+                    : paused
+                    ? "Пауза · видео"
+                    : "Видео"
+                  : playing
                   ? "Сейчас играет"
                   : paused
                   ? "Пауза"
@@ -2271,6 +3839,13 @@ class YaHomeHubPanel extends HTMLElement {
               <p data-player-meta>${this._esc(artist)}${
       album ? ` <span class="dot">·</span> ${this._esc(album)}` : ""
     }</p>
+              <div class="player-badges">
+                <span class="live-badge" data-live-badge ${
+                  liveText ? "" : "hidden"
+                }><ha-icon icon="mdi:radio"></ha-icon> <span data-live-name>${this._esc(
+      liveName || liveText
+    )}</span></span>
+              </div>
             </div>
             <div class="player-actions">
               ${
@@ -2287,6 +3862,14 @@ class YaHomeHubPanel extends HTMLElement {
       entityId
     )}" title="Вкл/выкл"><ha-icon icon="mdi:power"></ha-icon></button>
             </div>
+          </div>
+          <div class="radio-card" data-radio-card ${liveText ? "" : "hidden"}>
+            <ha-icon icon="mdi:radio"></ha-icon>
+            <div class="radio-copy">
+              <span data-radio-live>${this._esc(liveText || "Прямой эфир")}</span>
+              <b data-radio-name>${this._esc(liveName)}</b>
+            </div>
+            <div class="radio-bars"><i></i><i></i><i></i><i></i><i></i></div>
           </div>
           ${this._renderViz(playing)}
           <div class="player-seek">
@@ -2315,6 +3898,11 @@ class YaHomeHubPanel extends HTMLElement {
               <button class="icon-btn" data-player-action="next" data-player-entity="${this._esc(
                 entityId
               )}" title="Следующий трек"><ha-icon icon="mdi:skip-next"></ha-icon></button>
+              <button class="icon-btn stop" data-player-action="stop" data-player-entity="${this._esc(
+                entityId
+              )}" data-player-stop title="${
+      canStop ? "Остановить" : "Нет активного действия"
+    }" ${canStop ? "" : "disabled"}><ha-icon icon="mdi:stop"></ha-icon></button>
             </div>
             <div class="volume-control">
               <button class="volume-toggle" data-player-mute="${this._esc(
@@ -2330,6 +3918,7 @@ class YaHomeHubPanel extends HTMLElement {
                 entityId
               )}" data-player-volume-label>${volume}%</span>
             </div>
+            ${this._renderQualitySwitch(speaker, musicQuality, entityId)}
           </div>
           ${this._renderSpeakerExtras(speaker, entity)}
           ${
@@ -2396,15 +3985,34 @@ class YaHomeHubPanel extends HTMLElement {
       const attrs = entity.attributes || {};
       const playing = entity.state === "playing";
       const paused = entity.state === "paused";
+      const video = this._videoInfo(speaker, entity);
+      const modeInfo = this._playerMode(speaker, entity);
+      const aliceInfo = this._aliceInfo(attrs);
+      const engineInfo = this._engineInfo(modeInfo);
+      const canStop = Boolean(attrs.can_stop);
+      const liveText = String(attrs.live_stream || "");
+      const liveName = String(
+        attrs.live_stream_subtitle || attrs.media_artist || ""
+      );
       el.classList.toggle("playing", playing);
       el.classList.toggle("paused", paused);
+      el.classList.toggle("video-mode", video.active);
+      el.classList.remove(
+        "mode-music",
+        "mode-radio",
+        "mode-video",
+        "mode-idle"
+      );
+      el.classList.add(`mode-${modeInfo.mode}`);
       const trackId = String(attrs.media_content_id || "");
       const trackInfo = /^\d+$/.test(trackId) ? this._trackInfo(trackId) : null;
       const cover =
-        attrs.entity_picture ||
-        (trackInfo && trackInfo.cover) ||
-        this._speakerImage(speaker) ||
-        "";
+        video.active && video.thumbnail
+          ? video.thumbnail
+          : attrs.entity_picture ||
+            (trackInfo && trackInfo.cover) ||
+            this._speakerImage(speaker) ||
+            "";
       const coverBox = el.querySelector(".player-cover");
       let image = el.querySelector("[data-player-cover]");
       if (cover) {
@@ -2433,6 +4041,22 @@ class YaHomeHubPanel extends HTMLElement {
         }
         el.style.removeProperty("--cover");
       }
+      let chip = coverBox ? coverBox.querySelector("[data-video-chip]") : null;
+      if (video.active) {
+        if (!chip && coverBox) {
+          chip = document.createElement("span");
+          chip.setAttribute("data-video-chip", "");
+          chip.className = "video-chip";
+          coverBox.appendChild(chip);
+        }
+        if (chip) {
+          chip.innerHTML = `<ha-icon icon="${
+            video.provider === "youtube" ? "mdi:youtube" : "mdi:play-circle"
+          }"></ha-icon> ${this._videoProviderLabel(video.provider)}`;
+        }
+      } else if (chip) {
+        chip.remove();
+      }
       const title = attrs.media_title || "Готов к воспроизведению";
       const artist = attrs.media_artist || speaker.name;
       const album =
@@ -2444,7 +4068,61 @@ class YaHomeHubPanel extends HTMLElement {
       if (metaEl && metaEl.textContent !== metaText) {
         metaEl.textContent = metaText;
       }
-      const kickerText = playing
+      const aliceEl = el.querySelector("[data-alice-live]");
+      if (aliceEl) {
+        aliceEl.hidden = false;
+        aliceEl.className = `alice-live ${aliceInfo.state.toLowerCase()}`;
+        const aliceText = aliceEl.querySelector("[data-alice-label]");
+        const nextAlice = `Алиса · ${aliceInfo.label}`;
+        if (aliceText && aliceText.textContent !== nextAlice) {
+          aliceText.textContent = nextAlice;
+        }
+      }
+      const liveBadge = el.querySelector("[data-live-badge]");
+      if (liveBadge) {
+        liveBadge.hidden = !liveText;
+        const liveLabel = liveBadge.querySelector("[data-live-name]");
+        if (liveLabel && liveLabel.textContent !== (liveName || liveText)) {
+          liveLabel.textContent = liveName || liveText;
+        }
+      }
+      const enginePill = el.querySelector("[data-engine-pill]");
+      if (enginePill) {
+        enginePill.className = `engine-pill engine-${modeInfo.mode}`;
+        const engineIcon = enginePill.querySelector("ha-icon");
+        if (engineIcon) engineIcon.setAttribute("icon", engineInfo.icon);
+        const engineLabel = enginePill.querySelector("[data-engine-label]");
+        if (engineLabel) engineLabel.textContent = engineInfo.label;
+        const engineRaw = enginePill.querySelector("[data-engine-raw]");
+        if (engineRaw) engineRaw.textContent = engineInfo.raw;
+      }
+      const radioCard = el.querySelector("[data-radio-card]");
+      if (radioCard) {
+        radioCard.hidden = !liveText;
+        const radioLive = radioCard.querySelector("[data-radio-live]");
+        if (radioLive) {
+          radioLive.textContent = liveText || "Прямой эфир";
+        }
+        const radioName = radioCard.querySelector("[data-radio-name]");
+        if (radioName) radioName.textContent = liveName;
+      }
+      const stopButton = el.querySelector("[data-player-stop]");
+      if (stopButton) {
+        stopButton.disabled = !canStop;
+        stopButton.title = canStop
+          ? "Остановить"
+          : "Нет активного действия";
+      }
+      el.querySelectorAll("[data-video-close]").forEach((button) => {
+        button.hidden = !video.active || video.playing;
+      });
+      const kickerText = video.active
+        ? playing
+          ? "Сейчас играет видео"
+          : paused
+          ? "Пауза · видео"
+          : "Видео"
+        : playing
         ? "Сейчас играет"
         : paused
         ? "Пауза"
@@ -2553,7 +4231,30 @@ class YaHomeHubPanel extends HTMLElement {
         }
       }
     });
+    root.querySelectorAll("[data-video-hub]").forEach((hub) => {
+      const speakerId = hub.getAttribute("data-video-hub");
+      const speaker = (this._data.speakers || []).find(
+        (item) => item.id === speakerId
+      );
+      const entity = speaker ? this._hass.states[speaker.entity_id] : null;
+      if (!entity) return;
+      const info = this._videoInfo(speaker, entity);
+      const button = hub.querySelector("[data-video-close]");
+      if (button) button.hidden = !info.active || info.playing;
+    });
     this._syncExtras();
+    const active = this._activeVideo();
+    const modeKey = active
+      ? `${active.speaker.id}|${active.info.videoId}|${active.info.title}`
+      : "";
+    const modeChanged =
+      Boolean(this._fullPlayer) && modeKey !== this._videoModeKey;
+    this._videoModeKey = modeKey;
+    this._updateMiniPlayer();
+    if (modeChanged) {
+      this._render();
+      return;
+    }
     if (restartTicker) this._startTicker();
   }
 
@@ -2809,6 +4510,258 @@ class YaHomeHubPanel extends HTMLElement {
     };
     this._beatTimer = setInterval(tick, 50);
     tick();
+  }
+
+  _startSensorPolling() {
+    if (this._sensorTimer) return;
+    this._sensorTimer = setInterval(() => this._pollSensors(), 5000);
+  }
+
+  async _pollSensors() {
+    if (this._sensorBusy || !this._hass) return;
+    this._sensorBusy = true;
+    try {
+      const data = await this._hass.callWS({
+        type: "yahome_hub/sensor_values",
+      });
+      if (!data || !Array.isArray(data.devices)) return;
+      this._data = data;
+      this._patchSensorDom();
+    } catch (err) {
+      /* silent: the interface must not jump on a failed poll */
+    } finally {
+      this._sensorBusy = false;
+    }
+  }
+
+  _patchSensorDom() {
+    const root = this.shadowRoot;
+    const data = this._data;
+    if (!root || !data) return;
+    const devices = new Map(
+      (data.devices || []).map((device) => [device.id, device])
+    );
+    root.querySelectorAll("[data-prop-device]").forEach((el) => {
+      const device = devices.get(el.getAttribute("data-prop-device"));
+      if (!device) return;
+      const prop = (device.properties || []).find(
+        (item) => item.instance === el.getAttribute("data-prop-instance")
+      );
+      if (!prop) return;
+      const text = `${prop.value ?? "—"}${prop.unit ? " " + prop.unit : ""}`;
+      if (el.textContent !== text) el.textContent = text;
+    });
+    root.querySelectorAll("[data-state-device]").forEach((el) => {
+      const device = devices.get(el.getAttribute("data-state-device"));
+      if (!device) return;
+      const text = this._stateText(device);
+      if (el.textContent !== text) el.textContent = text;
+    });
+    root.querySelectorAll("[data-card-field]").forEach((el) => {
+      const device = devices.get(el.getAttribute("data-card-device"));
+      if (!device) return;
+      const reading = this._resolveCardReading(
+        device,
+        el.getAttribute("data-card-field") || ""
+      );
+      const sample = el.querySelector("b");
+      if (reading && sample && sample.textContent !== reading.text) {
+        sample.textContent = reading.text;
+      }
+    });
+    root.querySelectorAll("[data-card-reading-device]").forEach((el) => {
+      const device = devices.get(el.getAttribute("data-card-reading-device"));
+      if (!device) return;
+      const token = el.getAttribute("data-card-reading-token") || "";
+      const reading = this._resolveCardReading(device, token);
+      if (!reading) return;
+      const input = el.querySelector("[data-reading-input]");
+      if (input && root.activeElement !== input) {
+        const value = Math.max(
+          Number(reading.cap.min ?? 0),
+          Math.min(Number(reading.cap.max ?? 100), Number(reading.cap.value))
+        );
+        if (Number(input.value) !== value) input.value = value;
+        const label = el.querySelector("[data-reading-value]");
+        if (label) {
+          label.textContent = `${Math.round(value)}${
+            reading.cap.unit || "%"
+          }`;
+        }
+        return;
+      }
+      const label = el.querySelector("[data-reading-value]");
+      if (label && reading.text !== label.textContent) {
+        label.textContent = reading.text;
+      }
+    });
+  }
+
+  _cardReadingTokens(device) {
+    const stored = this._cardFields[device.id];
+    if (Array.isArray(stored)) return stored;
+    const tokens = [];
+    const brightness = (device.capabilities || []).find(
+      (cap) =>
+        cap.kind === "range" &&
+        ["brightness", "brightness_percent"].includes(cap.instance)
+    );
+    if (brightness) {
+      tokens.push(`cap:${brightness.instance}`);
+    } else {
+      const temperature = (device.capabilities || []).find(
+        (cap) =>
+          cap.kind === "range" &&
+          ["temperature", "target_temperature"].includes(cap.instance)
+      );
+      if (temperature) tokens.push(`cap:${temperature.instance}`);
+    }
+    const prop = (device.properties || []).find(
+      (item) => item.instance && item.value !== undefined
+    );
+    if (prop) tokens.push(`prop:${prop.instance}`);
+    return tokens.slice(0, 2);
+  }
+
+  _resolveCardReading(device, token) {
+    if (!token) return null;
+    const [kind, instance] = token.split(":", 2);
+    if (kind === "prop") {
+      const prop = (device.properties || []).find(
+        (item) => item.instance === instance
+      );
+      if (!prop) return null;
+      return {
+        token,
+        kind: "prop",
+        icon: this._propIcon(prop.instance),
+        label: prop.name || instance,
+        text: `${prop.value ?? "—"}${prop.unit ? " " + prop.unit : ""}`,
+      };
+    }
+    if (kind === "cap") {
+      const cap = (device.capabilities || []).find(
+        (item) => item.kind === "range" && item.instance === instance
+      );
+      if (!cap) return null;
+      const value = Number(cap.value ?? cap.min ?? 0);
+      return {
+        token,
+        kind: "cap",
+        cap,
+        icon: cap.instance?.includes("brightness")
+          ? "mdi:brightness-6"
+          : cap.instance?.includes("temperature")
+          ? "mdi:thermometer"
+          : "mdi:tune",
+        label: cap.name || instance,
+        text: `${Math.round(value)}${cap.unit || ""}`,
+      };
+    }
+    return null;
+  }
+
+  _renderCardReadings(device) {
+    const tokens = this._cardReadingTokens(device);
+    const readings = tokens
+      .map((token) => this._resolveCardReading(device, token))
+      .filter(Boolean);
+    if (!readings.length) {
+      return `<div class="card-readings" data-empty="1"></div>`;
+    }
+    const visible = readings.slice(0, 2);
+    const hidden = readings.length - visible.length;
+    return `<div class="card-readings">${visible
+      .map((reading) => {
+        if (
+          reading.kind === "cap" &&
+          ["brightness", "brightness_percent"].includes(
+            reading.cap.instance
+          )
+        ) {
+          const cap = reading.cap;
+          const value = Math.max(
+            Number(cap.min ?? 0),
+            Math.min(Number(cap.max ?? 100), Number(cap.value ?? cap.min ?? 0))
+          );
+          return `<div class="mini-slider" data-card-reading-device="${
+            device.id
+          }" data-card-reading-token="${this._esc(reading.token)}">
+            <ha-icon icon="mdi:brightness-6"></ha-icon>
+            <input type="range" min="${cap.min ?? 0}" max="${
+            cap.max ?? 100
+          }" step="${cap.step || 1}" value="${value}" data-mini-brightness="${
+            device.id
+          }" data-mini-type="${this._esc(
+            cap.type
+          )}" data-mini-instance="${this._esc(
+            cap.instance
+          )}" data-mini-unit="${this._esc(
+            cap.unit || ""
+          )}" data-reading-input />
+            <span data-reading-value>${Math.round(value)}${
+            cap.unit || "%"
+          }</span>
+          </div>`;
+        }
+        return `<span class="mini-chip" data-card-reading-device="${
+          device.id
+        }" data-card-reading-token="${this._esc(reading.token)}">
+          <ha-icon icon="${reading.icon}"></ha-icon>
+          <b data-reading-value>${this._esc(reading.text)}</b>
+        </span>`;
+      })
+      .join("")}${
+      hidden > 0
+        ? `<span class="reading-more" title="Ещё показаний: ${hidden}">+${hidden}</span>`
+        : ""
+    }</div>`;
+  }
+
+  _renderCardFieldPicker(device) {
+    const options = [];
+    for (const prop of device.properties || []) {
+      if (!prop.instance) continue;
+      options.push({
+        token: `prop:${prop.instance}`,
+        label: prop.name || prop.instance,
+        sample: `${prop.value ?? "—"}${prop.unit ? " " + prop.unit : ""}`,
+        icon: this._propIcon(prop.instance),
+      });
+    }
+    for (const cap of device.capabilities || []) {
+      if (cap.kind !== "range" || !cap.instance) continue;
+      options.push({
+        token: `cap:${cap.instance}`,
+        label: cap.name || cap.instance,
+        sample: `${cap.value ?? "—"}${cap.unit ? " " + cap.unit : ""}`,
+        icon: cap.instance.includes("brightness")
+          ? "mdi:brightness-6"
+          : cap.instance.includes("temperature")
+          ? "mdi:thermometer"
+          : "mdi:tune",
+      });
+    }
+    if (!options.length) return "";
+    const selected = new Set(this._cardReadingTokens(device));
+    return `<div class="section card-fields-section">
+      <h3>Показания на карточке</h3>
+      <p class="muted">Выберите, что видно в маленькой карточке. Большая карточка останется подробной.</p>
+      <div class="card-field-picker">${options
+        .map(
+          (option) =>
+            `<button class="card-field ${
+              selected.has(option.token) ? "active" : ""
+            }" data-card-field="${this._esc(option.token)}" data-card-device="${
+              device.id
+            }" title="${this._esc(option.label)}">
+              <ha-icon icon="${option.icon}"></ha-icon>
+              <span>${this._esc(option.label)}</span>
+              <b>${this._esc(option.sample)}</b>
+            </button>`
+        )
+        .join("")}</div>
+    </div>`;
   }
 
   _startTicker() {
@@ -3278,9 +5231,111 @@ class YaHomeHubPanel extends HTMLElement {
     }
   }
 
+  _onVideoAction(event) {
+    const closeVideo = event.target.closest("[data-video-close]");
+    if (closeVideo) {
+      this._closeVideo(closeVideo.getAttribute("data-video-close"));
+      return;
+    }
+    const open = event.target.closest("[data-video-open]");
+    if (open) {
+      event.preventDefault();
+      window.open(open.getAttribute("data-video-open"), "_blank", "noopener");
+      return;
+    }
+    const close = event.target.closest("[data-mini-close]");
+    if (close) {
+      this._miniPlayerClosed = true;
+      this._updateMiniPlayer();
+      return;
+    }
+    const mini = event.target.closest("[data-mini-open]");
+    if (mini) {
+      const speakerId = mini.getAttribute("data-mini-open");
+      if (speakerId) {
+        this._fullPlayer = speakerId;
+        this._showLyrics = false;
+        this._miniPlayerClosed = false;
+        this._render();
+      }
+      return;
+    }
+    const play = event.target.closest("[data-video-play]");
+    if (play) {
+      this._playVideo(play);
+    }
+  }
+
+  async _closeVideo(speakerId) {
+    if (!this._hass || !speakerId) return;
+    try {
+      await this._hass.callWS({
+        type: "yahome_hub/video_close",
+        speaker_id: speakerId,
+      });
+      this._miniPlayerClosed = true;
+      this._showToast("Видео закрыто");
+      this._render();
+      setTimeout(() => {
+        this._load(true);
+        this._render();
+      }, 700);
+    } catch (err) {
+      this._showToast("Ошибка: " + this._message(err));
+    }
+  }
+
+  async _playVideo(button) {
+    if (!this._hass) return;
+    const speakerId = button.getAttribute("data-video-play");
+    const entityId = button.getAttribute("data-entity");
+    const hub = button.closest(".video-hub") || this.shadowRoot;
+    const input = hub.querySelector(`[data-video-url="${speakerId}"]`);
+    const status = hub.querySelector(`[data-video-status="${speakerId}"]`);
+    const value = input ? input.value.trim() : "";
+    if (!value) {
+      if (status) status.textContent = "Вставьте ссылку на видео";
+      if (input) input.focus();
+      return;
+    }
+    if (status) status.textContent = "Отправляю на колонку…";
+    button.disabled = true;
+    try {
+      await this._hass.callService("media_player", "play_media", {
+        entity_id: entityId,
+        media_content_id: value,
+        media_content_type: "video",
+      });
+      if (status) {
+        status.textContent =
+          "Видео отправлено. Загрузка может занять несколько секунд.";
+      }
+      if (input) input.value = "";
+      this._miniPlayerClosed = false;
+    } catch (err) {
+      if (status) status.textContent = "Ошибка: " + this._message(err);
+    } finally {
+      button.disabled = false;
+    }
+  }
+
   _attachEvents() {
     const root = this.shadowRoot;
     if (!root) return;
+    root.addEventListener("click", (event) => this._onVideoAction(event));
+    root.addEventListener("keydown", (event) => {
+      if (event.key !== "Enter") return;
+      const input = event.target.closest("[data-video-url]");
+      if (!input) return;
+      event.preventDefault();
+      const hub = input.closest(".video-hub");
+      const target = hub
+        ? hub.querySelector(
+            `[data-video-play="${input.getAttribute("data-video-url")}"]`
+          )
+        : null;
+      if (target) this._playVideo(target);
+    });
     root.addEventListener("click", (event) => this._onMusicAction(event));
     root.addEventListener("click", (event) => {
       if (!event.target.closest("[data-card-shell]")) {
@@ -3306,6 +5361,132 @@ class YaHomeHubPanel extends HTMLElement {
           /* ignore */
         }
         this._render();
+      });
+    });
+    root.querySelectorAll("[data-diag-refresh]").forEach((el) => {
+      el.addEventListener("click", () => {
+        const speakerId = el.getAttribute("data-diag-refresh");
+        delete this._diagnostics[speakerId];
+        this._render();
+      });
+    });
+    root.querySelectorAll("[data-settings-refresh]").forEach((el) => {
+      el.addEventListener("click", () => {
+        const speakerId = el.getAttribute("data-settings-refresh");
+        delete this._diagnostics[speakerId];
+        this._render();
+      });
+    });
+    root.querySelectorAll("[data-quality-value]").forEach((el) => {
+      el.addEventListener("click", async () => {
+        const speakerId = el.getAttribute("data-quality-speaker");
+        const value = el.getAttribute("data-quality-value");
+        root
+          .querySelectorAll(`[data-quality-group="${speakerId}"] button`)
+          .forEach((button) => {
+            button.classList.toggle(
+              "active",
+              button.getAttribute("data-quality-value") === value
+            );
+          });
+        const speaker = (this._data?.speakers || []).find(
+          (item) => item.id === speakerId
+        );
+        if (speaker) speaker.music_quality = value;
+        this._mergeLocalDiag(speakerId, {
+          audio_player: { music_quality: value },
+        });
+        await this._setSpeakerConfig(speakerId, {
+          audio_player: { music_quality: value },
+        });
+      });
+    });
+    root.querySelectorAll("[data-test-config]").forEach((el) => {
+      el.addEventListener("change", async () => {
+        const speakerId = el.getAttribute("data-test-config");
+        const path = el.getAttribute("data-test-path");
+        const kind = el.getAttribute("data-test-kind");
+        let value =
+          el.type === "checkbox"
+            ? el.checked
+            : kind === "number"
+            ? Number(el.value)
+            : el.value;
+        if (el.type === "checkbox") {
+          const label = el
+            .closest(".test-switch, .settings-switch")
+            ?.querySelector("b");
+          if (label) label.textContent = value ? "вкл" : "выкл";
+        }
+        await this._setSpeakerConfig(speakerId, this._pathPatch(path, value));
+      });
+    });
+    root.querySelectorAll("[data-test-time]").forEach((el) => {
+      el.addEventListener("change", async () => {
+        const speakerId = el.getAttribute("data-test-time");
+        const path = el.getAttribute("data-test-path");
+        const value = this._normalizeTime(
+          el.value,
+          el.getAttribute("data-test-current")
+        );
+        await this._setSpeakerConfig(speakerId, this._pathPatch(path, value));
+      });
+    });
+    root.querySelectorAll("[data-test-timezone-save]").forEach((el) => {
+      el.addEventListener("click", async () => {
+        const speakerId = el.getAttribute("data-test-timezone-save");
+        const input = root.querySelector(
+          `[data-test-timezone="${speakerId}"]`
+        );
+        if (!input) return;
+        await this._setSpeakerConfig(
+          speakerId,
+          this._pathPatch("timezone.timezone_name", input.value.trim())
+        );
+      });
+    });
+    root.querySelectorAll("[data-test-location-save]").forEach((el) => {
+      el.addEventListener("click", async () => {
+        const speakerId = el.getAttribute("data-test-location-save");
+        const lat = root.querySelector(`[data-test-lat="${speakerId}"]`);
+        const lon = root.querySelector(`[data-test-lon="${speakerId}"]`);
+        if (!lat || !lon) return;
+        await this._setSpeakerConfig(speakerId, {
+          location: {
+            latitude: Number(lat.value),
+            longitude: Number(lon.value),
+          },
+        });
+      });
+    });
+    root.querySelectorAll("[data-test-stop]").forEach((el) => {
+      el.addEventListener("click", async () => {
+        const entityId = el.getAttribute("data-test-stop");
+        if (!entityId) return;
+        try {
+          await this._hass.callService("media_player", "media_stop", {
+            entity_id: entityId,
+          });
+          this._showToast("Команда «Стоп» отправлена");
+        } catch (err) {
+          this._showToast("Ошибка: " + this._message(err));
+        }
+      });
+    });
+    root.querySelectorAll("[data-test-track]").forEach((el) => {
+      el.addEventListener("click", async () => {
+        const entityId = el.getAttribute("data-test-entity");
+        const action = el.getAttribute("data-test-track");
+        if (!entityId) return;
+        try {
+          await this._hass.callService(
+            "media_player",
+            action === "next" ? "media_next_track" : "media_previous_track",
+            { entity_id: entityId }
+          );
+        } catch (err) {
+          this._showToast("Ошибка: " + this._message(err));
+        }
       });
     });
     root.querySelectorAll("[data-tts-send]").forEach((el) => {
@@ -3463,6 +5644,10 @@ class YaHomeHubPanel extends HTMLElement {
           this._callService("media_player", "media_next_track", {
             entity_id: entityId,
           });
+        } else if (action === "stop") {
+          this._callService("media_player", "media_stop", {
+            entity_id: entityId,
+          });
         }
       });
     });
@@ -3566,8 +5751,7 @@ class YaHomeHubPanel extends HTMLElement {
         if (action === "refresh") this._refresh();
         if (action === "export") this._export();
         if (action === "back") {
-          this._selected = null;
-          this._render();
+          this._backToCards();
         }
       });
     });
@@ -3609,6 +5793,7 @@ class YaHomeHubPanel extends HTMLElement {
     });
     root.querySelectorAll("[data-sheet-open]").forEach((el) => {
       el.addEventListener("click", () => {
+        this._lastCardId = el.getAttribute("data-sheet-open");
         this._selected = el.getAttribute("data-sheet-open");
         this._quickDevice = null;
         this._render();
@@ -3799,6 +5984,48 @@ class YaHomeHubPanel extends HTMLElement {
         );
       });
     });
+    root.querySelectorAll("[data-color-preset]").forEach((el) => {
+      el.addEventListener("click", () => {
+        this._sendColor(
+          el.getAttribute("data-color-device"),
+          el.getAttribute("data-color-instance"),
+          el.getAttribute("data-color-preset")
+        );
+      });
+    });
+    root.querySelectorAll("[data-color-picker]").forEach((el) => {
+      el.addEventListener("change", () => {
+        this._sendColor(
+          el.getAttribute("data-color-picker"),
+          el.getAttribute("data-color-instance"),
+          el.value
+        );
+      });
+    });
+    root.querySelectorAll("[data-color-scene]").forEach((el) => {
+      el.addEventListener("click", () => {
+        const device = this._data.devices.find(
+          (item) => item.id === el.getAttribute("data-color-scene")
+        );
+        if (!device) return;
+        this._action(
+          device,
+          {
+            type: "devices.capabilities.color_setting",
+            instance: "color_scene",
+          },
+          el.getAttribute("data-scene-id")
+        );
+      });
+    });
+    root.querySelectorAll("[data-card-field]").forEach((el) => {
+      el.addEventListener("click", () => {
+        this._toggleCardField(
+          el.getAttribute("data-card-device"),
+          el.getAttribute("data-card-field")
+        );
+      });
+    });
     root.querySelectorAll("[data-media-device]").forEach((el) => {
       el.addEventListener("click", () => {
         const device = this._data.devices.find(
@@ -3835,6 +6062,118 @@ class YaHomeHubPanel extends HTMLElement {
     });
   }
 
+  _pathPatch(path, value) {
+    const parts = String(path || "").split(".").filter(Boolean);
+    const patch = {};
+    let cursor = patch;
+    parts.forEach((part, index) => {
+      if (index === parts.length - 1) cursor[part] = value;
+      else {
+        cursor[part] = {};
+        cursor = cursor[part];
+      }
+    });
+    return patch;
+  }
+
+  _normalizeTime(value, current) {
+    if (!value) return value;
+    if (/[+-]\d{4}$/.test(value)) return value;
+    const offset = String(current || "").match(/[+-]\d{4}$/)?.[0] || "+0000";
+    return `${value}:00${offset}`;
+  }
+
+  _mergeLocalDiag(speakerId, patch) {
+    const diag = this._diagnostics[speakerId];
+    if (!diag || !diag.config) return;
+    const merge = (target, source) => {
+      Object.entries(source || {}).forEach(([key, value]) => {
+        if (
+          value &&
+          typeof value === "object" &&
+          !Array.isArray(value) &&
+          target[key] &&
+          typeof target[key] === "object"
+        ) {
+          merge(target[key], value);
+        } else {
+          target[key] = value;
+        }
+      });
+    };
+    merge(diag.config, patch);
+  }
+
+  async _setSpeakerConfig(speakerId, patch) {
+    if (!this._hass || !speakerId || !patch) return;
+    try {
+      await this._hass.callWS({
+        type: "yahome_hub/speaker_config_set",
+        speaker_id: speakerId,
+        config: patch,
+      });
+      this._mergeLocalDiag(speakerId, patch);
+      this._showToast("Настройка записана");
+    } catch (err) {
+      this._showToast("Ошибка настройки: " + this._message(err));
+    }
+  }
+
+  _sendColor(deviceId, instance, hex) {
+    const device = this._data?.devices?.find((item) => item.id === deviceId);
+    if (!device || !hex) return;
+    const value =
+      instance === "hsv" ? this._hexToHsv(hex) : this._hexToRgbInt(hex);
+    this._action(
+      device,
+      {
+        type: "devices.capabilities.color_setting",
+        instance: instance || "rgb",
+      },
+      value
+    );
+  }
+
+  _toggleCardField(deviceId, token) {
+    if (!deviceId || !token) return;
+    const device = this._data?.devices?.find((item) => item.id === deviceId);
+    if (!device) return;
+    const current = this._cardReadingTokens(device).slice();
+    const index = current.indexOf(token);
+    if (index >= 0) current.splice(index, 1);
+    else current.push(token);
+    this._cardFields[deviceId] = current;
+    try {
+      localStorage.setItem(
+        "yahome-hub-card-fields",
+        JSON.stringify(this._cardFields)
+      );
+    } catch (err) {
+      /* ignore */
+    }
+    const root = this.shadowRoot;
+    root?.querySelectorAll("[data-card-field]").forEach((el) => {
+      if (el.getAttribute("data-card-device") !== deviceId) return;
+      el.classList.toggle(
+        "active",
+        current.includes(el.getAttribute("data-card-field"))
+      );
+    });
+  }
+
+  _backToCards() {
+    const cardId = this._lastCardId;
+    this._selected = null;
+    this._quickDevice = null;
+    this._render();
+    if (!cardId) return;
+    const restore = () => {
+      const card = this.shadowRoot?.querySelector(`[data-card="${cardId}"]`);
+      if (card) card.scrollIntoView({ block: "center", behavior: "auto" });
+    };
+    setTimeout(restore, 40);
+  }
+
   _toggleFavorite(deviceId) {
     if (!deviceId) return;
     if (navigator.vibrate) navigator.vibrate(10);
@@ -3859,6 +6198,7 @@ class YaHomeHubPanel extends HTMLElement {
 
   _openQuickSheet(deviceId) {
     this._quickDevice = deviceId;
+    this._lastCardId = deviceId;
     this._render();
   }
 
@@ -3894,6 +6234,7 @@ class YaHomeHubPanel extends HTMLElement {
           return;
         }
         if (action === el && el.tagName !== "BUTTON") return;
+        this._lastCardId = el.getAttribute("data-device");
         this._selected = el.getAttribute("data-device");
         this._quickDevice = null;
         this._render();
@@ -4103,10 +6444,14 @@ class YaHomeHubPanel extends HTMLElement {
       }
       .chip b { opacity: .65; font-weight: 600; }
       .chip.active { background: var(--primary-color, #5b6cff); color: #fff; border-color: transparent; }
-      .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(255px, 1fr)); gap: 14px; }
+      .grid {
+        display: grid; grid-template-columns: repeat(auto-fill, minmax(255px, 1fr));
+        gap: 14px; align-items: stretch;
+      }
       .card {
         background: var(--card-background-color, #fff); border: 1px solid var(--divider-color, #e4e7ec);
         border-radius: 20px; padding: 16px; cursor: pointer; position: relative;
+        min-height: 268px; height: 100%; display: flex; flex-direction: column;
         transition: transform .15s ease, box-shadow .15s ease, border-color .15s ease;
       }
       .card:hover { transform: translateY(-2px); box-shadow: 0 14px 30px rgba(16, 24, 40, .09); border-color: transparent; }
@@ -4120,10 +6465,20 @@ class YaHomeHubPanel extends HTMLElement {
       .status { width: 10px; height: 10px; border-radius: 50%; background: #c0c6d0; }
       .status.online { background: #22c55e; box-shadow: 0 0 0 4px rgba(34, 197, 94, .14); }
       .status.offline { background: #ef4444; box-shadow: 0 0 0 4px rgba(239, 68, 68, .12); }
-      .card h3 { margin: 14px 0 4px; font-size: 15px; line-height: 1.3; }
+      .card h3 {
+        margin: 14px 0 4px; font-size: 15px; line-height: 1.3;
+        min-height: 2.6em; display: -webkit-box; -webkit-line-clamp: 2;
+        -webkit-box-orient: vertical; overflow: hidden;
+      }
       .muted { color: var(--secondary-text-color, #667085); font-size: 12px; margin: 0; }
-      .card-foot { display: flex; justify-content: space-between; align-items: center; margin-top: 14px; gap: 10px; }
-      .state { font-size: 12px; font-weight: 600; color: var(--primary-text-color, #1f2430); }
+      .card-foot {
+        display: flex; justify-content: space-between; align-items: center;
+        margin-top: auto; padding-top: 12px; gap: 10px;
+      }
+      .state {
+        font-size: 12px; font-weight: 600; color: var(--primary-text-color, #1f2430);
+        white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+      }
       .power {
         width: 34px; height: 34px; border-radius: 12px; border: 1px solid var(--divider-color, #e4e7ec);
         background: transparent; color: var(--secondary-text-color, #667085); cursor: pointer; display: grid; place-items: center;
@@ -4743,6 +7098,457 @@ class YaHomeHubPanel extends HTMLElement {
       .full-player .sync-btn { border-color: rgba(255,255,255,.18); color: #fff; }
       .full-player .sync-btn:hover { border-color: #8f9bff; color: #b9c2ff; }
       .full-player .music-hub { margin-top: 4px; }
+
+      /* Video mode and mini-player */
+      .player-cover .video-chip {
+        position: absolute; left: 8px; bottom: 8px; z-index: 2;
+        display: inline-flex; align-items: center; gap: 5px;
+        padding: 4px 8px; border-radius: 8px;
+        background: rgba(0,0,0,.66); color: #fff;
+        font-size: 10px; font-weight: 700; letter-spacing: .04em;
+        backdrop-filter: blur(6px);
+      }
+      .player-cover .video-chip ha-icon { --mdc-icon-size: 14px; }
+      .player.video-mode .player-cover {
+        width: min(220px, 38vw); height: auto; aspect-ratio: 16 / 9;
+        border-radius: 18px;
+      }
+      .player.video-mode .player-cover img { object-fit: cover; }
+      .player.video-mode.playing .player-cover img { animation: none; }
+      .player.full.video-mode .full-main {
+        grid-template-columns: minmax(0, 1fr);
+        width: 100%; max-width: 1080px; margin: 0 auto;
+      }
+      .player.full.video-mode .full-side { display: none; }
+      .player.full.video-mode .full-cover-wrap {
+        width: 100%; max-width: 1000px; margin: 0 auto;
+      }
+      .player.full.video-mode .player-cover.big {
+        width: 100%; height: auto; aspect-ratio: 16 / 9; border-radius: 24px;
+      }
+      .player.full.video-mode .player-cover.big img {
+        border-radius: 24px; object-fit: cover;
+      }
+      .player.full.video-mode .lyrics-overlay,
+      .player.full.video-mode .lyrics-sync { display: none; }
+      .video-hub {
+        margin-top: 4px; padding: 16px; border-radius: 20px;
+        background:
+          radial-gradient(circle at 0% 0%, rgba(255,59,48,.16), transparent 46%),
+          linear-gradient(180deg, rgba(23,27,43,.96), rgba(13,16,27,.96));
+        border: 1px solid rgba(255,255,255,.12); color: #eef0ff;
+      }
+      .video-hub.active {
+        border-color: rgba(255,99,132,.42);
+        box-shadow: 0 0 0 1px rgba(255,99,132,.12) inset;
+      }
+      .video-hub-head {
+        display: flex; align-items: flex-start; justify-content: space-between;
+        gap: 14px;
+      }
+      .video-hub-title { min-width: 0; }
+      .video-badge {
+        display: inline-flex; align-items: center; gap: 7px;
+        font-size: 10px; letter-spacing: .12em; text-transform: uppercase;
+        color: #ff9aa8; font-weight: 700;
+      }
+      .video-hub-title p {
+        margin: 7px 0 0; font-size: 12px; line-height: 1.45;
+        color: rgba(238,240,255,.62);
+      }
+      .video-open {
+        display: inline-flex; align-items: center; gap: 6px;
+        padding: 8px 11px; border-radius: 10px; white-space: nowrap;
+        border: 1px solid rgba(255,255,255,.16); color: #fff;
+        text-decoration: none; font-size: 11px;
+      }
+      .video-open:hover { border-color: #ff8fa3; color: #ffd7de; }
+      .video-form { display: flex; gap: 8px; margin-top: 13px; flex-wrap: wrap; }
+      .video-form input {
+        flex: 1; min-width: 220px; height: 40px; padding: 0 12px;
+        border-radius: 11px; border: 1px solid rgba(255,255,255,.16);
+        background: rgba(0,0,0,.28); color: #fff; font: inherit; font-size: 12px;
+        outline: none;
+      }
+      .video-form input:focus { border-color: rgba(255,99,132,.7); }
+      .video-play {
+        display: inline-flex; align-items: center; gap: 7px;
+        height: 40px; padding: 0 16px; border-radius: 11px; border: 0;
+        background: linear-gradient(135deg, #ff3b30, #ff4f9a);
+        color: #fff; font: inherit; font-size: 12px; font-weight: 700;
+        cursor: pointer;
+      }
+      .video-play:disabled { opacity: .55; cursor: default; }
+      .video-services {
+        display: flex; gap: 14px; flex-wrap: wrap; margin-top: 10px;
+        font-size: 10px; color: rgba(238,240,255,.4);
+      }
+      .video-status {
+        margin-top: 8px; min-height: 14px;
+        font-size: 11px; color: #9facff;
+      }
+      .video-close {
+        display: inline-flex; align-items: center; gap: 6px;
+        padding: 8px 11px; border-radius: 10px; white-space: nowrap;
+        border: 1px solid rgba(255,255,255,.18);
+        background: rgba(255,255,255,.08); color: #fff;
+        font: inherit; font-size: 11px; cursor: pointer;
+      }
+      .video-close:hover { border-color: #ff8fa3; color: #ffd7de; }
+      .video-close ha-icon { --mdc-icon-size: 16px; }
+      .video-close[hidden], .round-btn[hidden] { display: none; }
+      .player-badges {
+        display: flex; gap: 6px; flex-wrap: wrap; margin-top: 6px;
+      }
+      .alice-live, .live-badge {
+        display: inline-flex; align-items: center; gap: 6px;
+        padding: 3px 8px; border-radius: 999px;
+        font-size: 10px; font-weight: 700; letter-spacing: .03em;
+        background: rgba(255,255,255,.08);
+        border: 1px solid rgba(255,255,255,.12); color: #dbe4ff;
+      }
+      .alice-live[hidden], .live-badge[hidden] { display: none; }
+      .alice-live i {
+        width: 7px; height: 7px; border-radius: 50%;
+        background: #7dd3fc; animation: alicePulse 1.4s infinite;
+      }
+      .alice-live.listening { color: #9be7ff; border-color: rgba(56,189,248,.4); }
+      .alice-live.thinking { color: #ffe08a; border-color: rgba(250,204,21,.4); }
+      .alice-live.speaking { color: #ffb3c9; border-color: rgba(255,79,154,.4); }
+      .alice-live.thinking i { background: #facc15; }
+      .alice-live.speaking i { background: #ff4f9a; }
+      @keyframes alicePulse {
+        0% { box-shadow: 0 0 0 0 rgba(125,211,252,.55); }
+        70% { box-shadow: 0 0 0 7px rgba(125,211,252,0); }
+        100% { box-shadow: 0 0 0 0 rgba(125,211,252,0); }
+      }
+      .alice-state.listening { color: #38bdf8; }
+      .alice-state.thinking { color: #facc15; }
+      .alice-state.speaking { color: #ff6ea9; }
+      .engine-badge {
+        display: inline-flex; align-items: center;
+        padding: 3px 8px; border-radius: 999px;
+        font-size: 9px; font-weight: 700; letter-spacing: .04em;
+        background: rgba(91,108,255,.12);
+        border: 1px solid rgba(91,108,255,.28); color: #b9c2ff;
+      }
+      .player-topline {
+        display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+        margin-bottom: 7px;
+      }
+      .engine-pill {
+        display: inline-flex; align-items: center; gap: 6px;
+        padding: 4px 10px; border-radius: 10px;
+        background: rgba(91,108,255,.16);
+        border: 1px solid rgba(91,108,255,.33);
+        color: #fff; white-space: nowrap;
+      }
+      .engine-pill b { font-size: 11px; font-weight: 800; letter-spacing: .02em; }
+      .engine-pill small {
+        font-size: 9px; font-weight: 600; color: rgba(255,255,255,.52);
+      }
+      .engine-pill ha-icon { --mdc-icon-size: 15px; color: #b9c2ff; }
+      .engine-pill.engine-video {
+        background: rgba(255,79,154,.15);
+        border-color: rgba(255,79,154,.32);
+      }
+      .engine-pill.engine-video ha-icon { color: #ff9ab8; }
+      .engine-pill.engine-radio {
+        background: rgba(34,197,94,.13);
+        border-color: rgba(34,197,94,.32);
+      }
+      .engine-pill.engine-radio ha-icon { color: #7ee2a8; }
+      .engine-pill.engine-idle {
+        background: rgba(255,255,255,.06);
+        border-color: rgba(255,255,255,.12);
+      }
+      .alice-live { white-space: nowrap; }
+      .alice-live.idle {
+        color: rgba(255,255,255,.55);
+        border-color: rgba(255,255,255,.12);
+      }
+      .alice-live.idle i {
+        background: rgba(255,255,255,.38); animation: none;
+      }
+      .player-badges:empty { display: none; }
+      .quality-switch {
+        display: inline-flex; align-items: center; gap: 4px;
+        padding: 4px; border-radius: 12px;
+        background: rgba(255,255,255,.06);
+        border: 1px solid rgba(255,255,255,.12);
+      }
+      .quality-switch .quality-label {
+        display: inline-flex; align-items: center; gap: 5px;
+        padding: 0 6px; font-size: 10px;
+        color: rgba(255,255,255,.55); white-space: nowrap;
+      }
+      .quality-switch .quality-label ha-icon { --mdc-icon-size: 14px; }
+      .quality-switch button {
+        border: 0; background: transparent; color: rgba(255,255,255,.62);
+        font: inherit; font-size: 10px; padding: 6px 9px;
+        border-radius: 9px; cursor: pointer; white-space: nowrap;
+      }
+      .quality-switch button.active {
+        background: linear-gradient(135deg, #5b6cff, #ff4f9a);
+        color: #fff; font-weight: 700;
+        box-shadow: 0 6px 14px rgba(91,108,255,.25);
+      }
+      .quality-control {
+        display: inline-flex; align-items: center; gap: 6px;
+        padding: 4px 8px; border-radius: 10px;
+        border: 1px solid rgba(255,255,255,.14);
+        background: rgba(255,255,255,.06);
+        color: rgba(255,255,255,.75); font-size: 10px;
+      }
+      .quality-control select {
+        border: 0; background: transparent; color: #fff;
+        font: inherit; font-size: 11px; outline: none;
+      }
+      .quality-control ha-icon { --mdc-icon-size: 15px; }
+      .full-quality span { color: rgba(255,255,255,.55); }
+      .player.radio-mode .player-seek { display: none; }
+      .player.radio-mode .full-modes .mode-btn,
+      .player.radio-mode .full-modes select[data-repeat] { display: none; }
+      .player.video-mode .player-content > .viz { display: none; }
+      .live-badge { color: #ffb3c9; border-color: rgba(255,79,154,.35); }
+      .live-badge ha-icon { --mdc-icon-size: 14px; }
+      .radio-card {
+        display: flex; align-items: center; gap: 12px;
+        padding: 12px 14px; margin: 2px 0 4px; border-radius: 16px;
+        background: linear-gradient(135deg, rgba(255,79,154,.16), rgba(91,108,255,.14));
+        border: 1px solid rgba(255,255,255,.12); color: #fff;
+      }
+      .radio-card[hidden] { display: none; }
+      .radio-card > ha-icon { --mdc-icon-size: 28px; color: #ff8fb1; }
+      .radio-copy {
+        flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 2px;
+      }
+      .radio-copy span {
+        font-size: 9px; letter-spacing: .14em; text-transform: uppercase;
+        color: #ff9aa8; font-weight: 700;
+      }
+      .radio-copy b {
+        font-size: 14px; white-space: nowrap; overflow: hidden;
+        text-overflow: ellipsis;
+      }
+      .radio-bars { display: flex; align-items: flex-end; gap: 3px; height: 26px; }
+      .radio-bars i {
+        width: 3px; height: 40%; border-radius: 2px;
+        background: linear-gradient(180deg, #ff8fb1, #7c9cff);
+        animation: radioBar 1.2s ease-in-out infinite;
+      }
+      .radio-bars i:nth-child(2) { animation-delay: .15s; }
+      .radio-bars i:nth-child(3) { animation-delay: .3s; }
+      .radio-bars i:nth-child(4) { animation-delay: .45s; }
+      .radio-bars i:nth-child(5) { animation-delay: .6s; }
+      @keyframes radioBar {
+        0%, 100% { height: 25%; }
+        50% { height: 100%; }
+      }
+      .test-live {
+        display: flex; align-items: center; gap: 10px;
+        margin: 10px 0; padding: 10px 12px; border-radius: 12px;
+        background: rgba(255,255,255,.05);
+        border: 1px solid rgba(255,255,255,.08);
+      }
+      .test-live > ha-icon { color: #ff8fb1; }
+      .test-live-copy { flex: 1; display: flex; flex-direction: column; gap: 2px; }
+      .test-live-copy span {
+        font-size: 9px; letter-spacing: .12em; text-transform: uppercase;
+        color: #ff9aa8; font-weight: 700;
+      }
+      .test-live-copy b { font-size: 13px; color: #fff; }
+      .test-live-copy small { font-size: 11px; color: rgba(255,255,255,.55); }
+      .test-live .radio-bars { height: 22px; }
+      .speaker-settings {
+        margin-top: 18px; padding-top: 16px;
+        border-top: 1px solid rgba(255,255,255,.12);
+      }
+      .settings-head {
+        display: flex; justify-content: space-between; align-items: flex-start;
+        gap: 12px; margin-bottom: 10px;
+      }
+      .settings-head h4 { margin: 0 0 4px; color: #fff; }
+      .settings-head p { margin: 0; font-size: 12px; }
+      .settings-loading {
+        display: flex; align-items: center; gap: 10px; padding: 18px;
+        color: rgba(238,240,255,.6); font-size: 12px;
+      }
+      .settings-panel {
+        padding: 0; background: transparent; border: 0; box-shadow: none;
+      }
+      .settings-panel .test-grid {
+        grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+      }
+      .station-settings { margin-top: 0; }
+      .settings-grid {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(255px, 1fr));
+        gap: 12px;
+      }
+      .settings-card {
+        display: flex; flex-direction: column; gap: 9px;
+        padding: 14px; border-radius: 16px;
+        background: linear-gradient(180deg, rgba(255,255,255,.065), rgba(255,255,255,.025));
+        border: 1px solid rgba(255,255,255,.09);
+      }
+      .settings-card-head {
+        display: flex; align-items: center; gap: 8px;
+      }
+      .settings-card-head h5 {
+        margin: 0; font-size: 12px; font-weight: 800;
+        letter-spacing: .02em; color: #fff;
+      }
+      .settings-card-head ha-icon {
+        --mdc-icon-size: 17px; color: #8f9bff;
+      }
+      .settings-status-row, .settings-row {
+        display: flex; align-items: center; justify-content: space-between;
+        gap: 10px; font-size: 11px; color: rgba(238,240,255,.6);
+      }
+      .settings-status-row b {
+        color: #fff; font-weight: 700; text-align: right;
+      }
+      .settings-status-row b small {
+        color: rgba(238,240,255,.4); font-size: 9px; font-weight: 600;
+      }
+      .settings-switch {
+        display: flex; align-items: center; gap: 8px;
+        font-size: 11px; color: rgba(238,240,255,.7);
+      }
+      .settings-switch input {
+        width: 16px; height: 16px; accent-color: #6c7cff; flex: none;
+      }
+      .settings-switch b {
+        margin-left: auto; color: #fff; font-size: 10px; font-weight: 700;
+      }
+      .settings-switch.warning b { color: #ffb3c9; }
+      .settings-select, .settings-input, .settings-time {
+        background: rgba(0,0,0,.25);
+        border: 1px solid rgba(255,255,255,.14);
+        border-radius: 9px; color: #fff;
+        padding: 7px 9px; font: inherit; font-size: 11px;
+        max-width: 160px;
+      }
+      .settings-input { max-width: 145px; }
+      .settings-time { max-width: 110px; }
+      .settings-row-2 {
+        display: grid; grid-template-columns: 1fr 1fr; gap: 8px;
+      }
+      .settings-row-2 .settings-row { flex-direction: column; align-items: stretch; gap: 4px; }
+      .settings-row-2 .settings-input { max-width: none; width: 100%; }
+      .settings-btn {
+        align-self: flex-start;
+        border: 1px solid rgba(255,255,255,.16);
+        background: rgba(255,255,255,.07);
+        color: #fff; border-radius: 9px;
+        padding: 7px 10px; font: inherit; font-size: 10px;
+        cursor: pointer;
+      }
+      .settings-btn:hover { border-color: #8f9bff; color: #dfe4ff; }
+      .settings-btn:disabled { opacity: .45; cursor: default; }
+      .settings-actions { display: flex; gap: 6px; flex-wrap: wrap; }
+      .settings-actions .settings-btn { align-self: auto; }
+      .settings-hint {
+        font-size: 10px; line-height: 1.45;
+        color: rgba(238,240,255,.42);
+      }
+      .settings-live {
+        display: flex; align-items: center; gap: 9px;
+        padding: 9px 10px; border-radius: 12px;
+        background: rgba(255,255,255,.045);
+        border: 1px solid rgba(255,255,255,.08);
+      }
+      .settings-live > ha-icon { color: rgba(255,255,255,.45); }
+      .settings-live.active > ha-icon { color: #ff8fb1; }
+      .settings-live div { display: flex; flex-direction: column; gap: 1px; min-width: 0; }
+      .settings-live span {
+        font-size: 9px; letter-spacing: .1em; text-transform: uppercase;
+        color: #ff9aa8; font-weight: 700;
+      }
+      .settings-live b {
+        font-size: 12px; color: #fff; font-weight: 700;
+        white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+      }
+      .settings-live small { font-size: 10px; color: rgba(255,255,255,.5); }
+      .icon-btn.stop { color: #ff9aa8; }
+      .icon-btn.stop:disabled { opacity: .45; cursor: default; }
+      .mini-controls button[hidden] { display: none; }
+      .mini-player {
+        position: fixed; left: 50%; bottom: 18px; transform: translateX(-50%);
+        z-index: 90; width: min(880px, calc(100vw - 36px));
+        display: flex; align-items: center; gap: 14px;
+        padding: 10px 14px 13px; border-radius: 18px;
+        background: rgba(10,12,20,.94);
+        border: 1px solid rgba(255,255,255,.14);
+        box-shadow: 0 18px 54px rgba(0,0,0,.58);
+        backdrop-filter: blur(18px); color: #fff;
+      }
+      .mini-player[hidden] { display: none; }
+      .mini-cover {
+        position: relative; flex: 0 0 118px; width: 118px; aspect-ratio: 16 / 9;
+        padding: 0; border: 0; border-radius: 12px; overflow: hidden;
+        background: #101018; cursor: pointer;
+      }
+      .mini-cover img {
+        width: 100%; height: 100%; object-fit: cover; display: block;
+      }
+      .mini-badge {
+        position: absolute; left: 6px; bottom: 6px;
+        width: 24px; height: 24px; border-radius: 8px;
+        display: grid; place-items: center;
+        background: rgba(0,0,0,.66); color: #fff;
+      }
+      .mini-badge ha-icon { --mdc-icon-size: 16px; }
+      .mini-info {
+        min-width: 0; flex: 1; display: flex; flex-direction: column;
+        gap: 2px; cursor: pointer;
+      }
+      .mini-kicker {
+        font-size: 9px; letter-spacing: .12em; text-transform: uppercase;
+        color: #ff9aa8; font-weight: 700;
+      }
+      .mini-info b {
+        font-size: 14px; white-space: nowrap; overflow: hidden;
+        text-overflow: ellipsis;
+      }
+      .mini-meta {
+        font-size: 11px; color: rgba(255,255,255,.58);
+        white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+      }
+      .alice-live.mini-alice {
+        align-self: flex-start; padding: 2px 6px; font-size: 9px;
+      }
+      .mini-controls { display: flex; align-items: center; gap: 6px; }
+      .mini-controls button {
+        width: 34px; height: 34px; border-radius: 10px;
+        border: 1px solid rgba(255,255,255,.14);
+        background: rgba(255,255,255,.06); color: #fff;
+        display: grid; place-items: center; cursor: pointer;
+      }
+      .mini-controls button:hover { background: rgba(255,255,255,.13); }
+      .mini-controls .mini-play {
+        width: 42px; height: 42px; border-radius: 12px; border: 0;
+        background: linear-gradient(135deg, #5b6cff, #ff4f9a);
+      }
+      .mini-progress {
+        position: absolute; left: 14px; right: 14px; bottom: 6px;
+        height: 3px; border-radius: 3px; overflow: hidden;
+        background: rgba(255,255,255,.12);
+      }
+      .mini-progress span {
+        display: block; width: 0; height: 100%;
+        background: linear-gradient(90deg, #5b6cff, #ff4f9a);
+        transition: width .3s linear;
+      }
+      .shell.has-mini-player { padding-bottom: 132px; }
+      @media (max-width: 720px) {
+        .mini-player { gap: 10px; padding: 8px 10px 11px; bottom: 10px; }
+        .mini-cover { flex-basis: 88px; width: 88px; }
+        .mini-controls button[data-player-action="previous"],
+        .mini-controls button[data-player-action="next"] { display: none; }
+        .shell.has-mini-player { padding-bottom: 120px; }
+      }
       .speaker-control {
         background: linear-gradient(180deg, #171b2b, #0d101b);
         color: #eef0ff; border-color: rgba(255,255,255,.12);
@@ -5060,6 +7866,197 @@ class YaHomeHubPanel extends HTMLElement {
       .full-viz .viz-radial b { width: 16px; height: 16px; }
       .full-viz .viz-tunnel { perspective: 400px; }
       .full-viz .viz-blocks { gap: 5px; }
+      .card-readings {
+        min-height: 42px; margin-top: 10px; display: flex; align-items: center;
+        gap: 7px; overflow: hidden; flex-wrap: nowrap;
+      }
+      .card-readings[data-empty="1"] { min-height: 42px; }
+      .card-readings .mini-slider {
+        margin-top: 0; flex: 1; min-width: 0; padding: 6px 8px;
+      }
+      .card-readings .mini-chip { margin-top: 0; flex: none; }
+      .card-readings .reading-more {
+        flex: none; min-width: 30px; height: 26px; padding: 0 7px;
+        border-radius: 999px; display: inline-grid; place-items: center;
+        background: var(--secondary-background-color, #f2f4f7);
+        color: var(--secondary-text-color, #667085); font-size: 10px; font-weight: 700;
+      }
+      .card-field-picker {
+        display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px;
+      }
+      .card-field {
+        display: inline-flex; align-items: center; gap: 7px;
+        border: 1px solid var(--divider-color, #e4e7ec); border-radius: 12px;
+        background: var(--secondary-background-color, #f7f8fa);
+        color: var(--primary-text-color, #1f2430); padding: 8px 10px;
+        font: inherit; font-size: 11px; cursor: pointer;
+      }
+      .card-field ha-icon { --mdc-icon-size: 16px; color: var(--secondary-text-color, #667085); }
+      .card-field b {
+        font-size: 10px; color: var(--secondary-text-color, #667085);
+        background: var(--card-background-color, #fff); padding: 2px 6px; border-radius: 999px;
+      }
+      .card-field.active {
+        border-color: transparent; color: #fff;
+        background: linear-gradient(135deg, #5b6cff, #ff4f9a);
+      }
+      .card-field.active ha-icon, .card-field.active b { color: rgba(255,255,255,.9); }
+      .card-field.active b { background: rgba(255,255,255,.18); }
+      .color-presets { display: flex; gap: 7px; flex-wrap: wrap; margin: 4px 0 8px; }
+      .color-dot {
+        width: 26px; height: 26px; border-radius: 50%; border: 2px solid rgba(255,255,255,.7);
+        background: var(--c); cursor: pointer;
+        box-shadow: 0 0 0 1px rgba(0,0,0,.14), 0 4px 10px rgba(0,0,0,.12);
+        transition: transform .15s ease;
+      }
+      .color-dot:hover { transform: scale(1.12); }
+      .color-native {
+        display: flex; align-items: center; justify-content: space-between;
+        gap: 8px; font-size: 11px; color: var(--secondary-text-color, #667085);
+      }
+      .color-native input[type="color"] {
+        width: 42px; height: 30px; border: 0; background: transparent; padding: 0; cursor: pointer;
+      }
+      .color-model {
+        font-size: 9px; letter-spacing: .08em; color: var(--secondary-text-color, #667085);
+        border: 1px solid var(--divider-color, #e4e7ec); border-radius: 999px; padding: 2px 7px;
+      }
+      .scene-presets { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 8px; }
+      .scene-preset {
+        border: 1px solid var(--divider-color, #e4e7ec); border-radius: 999px;
+        background: transparent; color: inherit; padding: 6px 9px;
+        font: inherit; font-size: 10px; cursor: pointer;
+      }
+      .scene-preset:hover { border-color: var(--primary-color, #5b6cff); color: var(--primary-color, #5b6cff); }
+      .features-view { display: flex; flex-direction: column; gap: 16px; }
+      .feature-intro { padding: 18px; }
+      .feature-intro-head { display: flex; gap: 14px; align-items: flex-start; }
+      .feature-intro-head h2 { margin: 0 0 5px; font-size: 20px; }
+      .feature-card {
+        border: 1px solid var(--divider-color, #e4e7ec); border-radius: 22px;
+        background: var(--card-background-color, #fff); padding: 18px;
+      }
+      .feature-card-head { display: flex; align-items: center; gap: 12px; }
+      .feature-card-head h3 { margin: 0 0 3px; font-size: 17px; }
+      .feature-card-head .ghost-btn { margin-left: auto; align-self: center; }
+      .feature-loading { display: grid; place-items: center; text-align: center; padding: 40px 10px; }
+      .feature-error { display: flex; gap: 12px; align-items: flex-start; }
+      .feature-error ha-icon { color: #ef4444; --mdc-icon-size: 24px; }
+      .feature-summary {
+        display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; margin: 14px 0;
+      }
+      .feature-summary > div {
+        display: flex; flex-direction: column; gap: 2px; padding: 10px 12px;
+        border-radius: 14px; background: var(--secondary-background-color, #f7f8fa);
+      }
+      .feature-summary b { font-size: 20px; }
+      .feature-summary span { font-size: 10px; color: var(--secondary-text-color, #667085); }
+      .feature-section-title { margin: 18px 0 9px; font-size: 13px; }
+      .feature-added { display: grid; grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); gap: 8px; }
+      .feature-added-item {
+        display: flex; gap: 8px; align-items: flex-start; padding: 9px 10px;
+        border-radius: 12px; background: rgba(34,197,94,.07); border: 1px solid rgba(34,197,94,.16);
+      }
+      .feature-added-item ha-icon { color: #16a34a; --mdc-icon-size: 17px; flex: none; margin-top: 1px; }
+      .feature-added-item b { display: block; font-size: 11px; }
+      .feature-added-item small { display: block; font-size: 10px; color: var(--secondary-text-color, #667085); margin-top: 2px; }
+      .feature-list { display: flex; flex-direction: column; gap: 8px; }
+      .feature-item {
+        display: flex; align-items: flex-start; gap: 10px; padding: 11px 12px;
+        border-radius: 14px; border: 1px solid rgba(245,158,11,.22);
+        background: rgba(245,158,11,.06);
+      }
+      .feature-item-icon {
+        width: 34px; height: 34px; border-radius: 10px; flex: none;
+        display: grid; place-items: center; color: #b45309;
+        background: rgba(245,158,11,.14);
+      }
+      .feature-item-body { flex: 1; min-width: 0; }
+      .feature-item-title { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+      .feature-item-title b { font-size: 12px; }
+      .feature-item-title span {
+        font-size: 10px; font-weight: 700; color: #b45309;
+        background: rgba(245,158,11,.14); border-radius: 999px; padding: 2px 7px;
+        max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+      }
+      .feature-item-body p { margin: 4px 0 0; font-size: 11px; color: var(--secondary-text-color, #667085); line-height: 1.4; }
+      .feature-badge {
+        flex: none; font-size: 9px; font-weight: 700; color: #b45309;
+        border: 1px solid rgba(245,158,11,.28); border-radius: 999px; padding: 4px 7px;
+        white-space: nowrap;
+      }
+      .feature-badge.added {
+        color: #15803d; border-color: rgba(34,197,94,.35);
+        background: rgba(34,197,94,.10);
+      }
+      .feature-raw { margin-top: 16px; border-top: 1px solid var(--divider-color, #eef0f4); padding-top: 12px; }
+      .feature-raw summary { cursor: pointer; font-size: 12px; font-weight: 600; }
+      .feature-raw-grid {
+        display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-top: 10px;
+      }
+      .feature-raw h5 { margin: 0 0 6px; font-size: 11px; }
+      .feature-raw pre {
+        margin: 0; max-height: 340px; overflow: auto; padding: 10px;
+        border-radius: 12px; background: #0f1420; color: #d7ddff;
+        font-size: 10px; line-height: 1.45; white-space: pre-wrap; word-break: break-word;
+      }
+      .test-panel { margin-top: 4px; }
+      .test-warning {
+        display: flex; gap: 10px; align-items: flex-start; padding: 11px 13px;
+        border-radius: 14px; background: rgba(245,158,11,.09);
+        border: 1px solid rgba(245,158,11,.24); margin-bottom: 12px;
+      }
+      .test-warning ha-icon { color: #b45309; --mdc-icon-size: 21px; flex: none; }
+      .test-warning b { font-size: 12px; }
+      .test-warning p { margin: 3px 0 0; font-size: 11px; line-height: 1.4; color: var(--secondary-text-color, #667085); }
+      .test-grid {
+        display: grid; grid-template-columns: repeat(auto-fill, minmax(265px, 1fr)); gap: 10px;
+      }
+      .test-block {
+        border: 1px solid var(--divider-color, #e4e7ec); border-radius: 16px;
+        background: var(--secondary-background-color, #f8f9fb); padding: 12px;
+      }
+      .test-block h4 {
+        margin: 0 0 10px; display: flex; align-items: center; gap: 6px; font-size: 12px;
+      }
+      .test-block h4 ha-icon { --mdc-icon-size: 16px; color: var(--primary-color, #5b6cff); }
+      .test-status-row {
+        display: flex; justify-content: space-between; gap: 8px;
+        font-size: 10px; padding: 3px 0; border-bottom: 1px dashed var(--divider-color, #e9ecf2);
+      }
+      .test-status-row span { color: var(--secondary-text-color, #667085); }
+      .test-status-row b { text-align: right; font-size: 10px; max-width: 55%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+      .test-field {
+        display: flex; align-items: center; gap: 7px; margin-top: 7px;
+        font-size: 10px; color: var(--secondary-text-color, #667085);
+      }
+      .test-field > span { flex: none; min-width: 96px; }
+      .test-field select, .test-field input {
+        flex: 1; min-width: 0; height: 29px; border-radius: 8px;
+        border: 1px solid var(--divider-color, #e4e7ec);
+        background: var(--card-background-color, #fff); color: inherit;
+        padding: 0 7px; font: inherit; font-size: 10px;
+      }
+      .test-field input[type="number"] { max-width: 96px; }
+      .test-switch {
+        display: flex; align-items: center; gap: 7px; margin: 7px 0;
+        font-size: 10px; color: var(--primary-text-color, #1f2430); cursor: pointer;
+      }
+      .test-switch span { flex: 1; }
+      .test-switch input { width: 34px; height: 18px; accent-color: var(--primary-color, #5b6cff); }
+      .test-switch b { font-size: 9px; color: var(--secondary-text-color, #667085); min-width: 22px; text-align: right; }
+      .test-switch.warning span { color: #b45309; }
+      .test-actions { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 9px; }
+      .test-btn {
+        border: 1px solid var(--divider-color, #e4e7ec); border-radius: 8px;
+        background: var(--card-background-color, #fff); color: inherit;
+        padding: 6px 8px; font: inherit; font-size: 10px; cursor: pointer;
+      }
+      .test-btn:hover { border-color: var(--primary-color, #5b6cff); color: var(--primary-color, #5b6cff); }
+      .test-btn:disabled { opacity: .45; cursor: default; }
+      .test-next-prev { margin-top: 7px; font-size: 9px; color: var(--secondary-text-color, #667085); }
+      .test-hint { margin-top: 7px; font-size: 9px; color: var(--secondary-text-color, #667085); line-height: 1.35; }
+      .test-row-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 7px; }
       .quick-filters { display: flex; gap: 8px; overflow-x: auto; padding-bottom: 2px; }
       .filter-pill {
         display: inline-flex; align-items: center; gap: 7px; flex: none;
@@ -5131,7 +8128,7 @@ class YaHomeHubPanel extends HTMLElement {
       .favorite-meta { display: flex; flex-direction: column; gap: 2px; min-width: 0; flex: 1; }
       .favorite-meta b { font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
       .favorite-meta small { font-size: 10px; color: var(--secondary-text-color, #667085); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-      .card-shell { position: relative; border-radius: 20px; }
+      .card-shell { position: relative; border-radius: 20px; height: 100%; }
       .card-rail {
         position: absolute; top: 0; bottom: 0; display: flex; align-items: center;
         gap: 6px; padding: 10px; z-index: 0;
