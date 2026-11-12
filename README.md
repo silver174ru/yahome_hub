@@ -141,13 +141,54 @@
   - `yahome_hub.say` — озвучить текст на колонке;
   - `yahome_hub.set_led` — яркость LED, авто-яркость и режим экрана;
   - `yahome_hub.set_speaker_config` — экспериментальные настройки
-    Станции (DND, музыка, язык, звонки и другие).
+    Станции (DND, музыка, язык, звонки и другие);
+  - `yahome_hub.stream_music` — транслировать музыку с колонки Яндекс
+    на другие медиаплееры с синхронизацией громкости;
+  - `yahome_hub.stop_stream_music` — остановить трансляцию.
 - WebSocket API для панели и внешних клиентов:
   - `yahome_hub/devices`;
   - `yahome_hub/action`;
   - `yahome_hub/scenario`;
   - `yahome_hub/refresh`;
-  - `yahome_hub/export`.
+  - `yahome_hub/export`;
+  - `yahome_hub/streams`.
+- Трансляция музыки:
+  - источник — любая колонка Яндекс Станции;
+  - получатели — любые `media_player` Home Assistant: Chromecast,
+    Sonos, DLNA, HEOS, WiiM, MusicCast, Bluesound, Squeezebox, VLC и др.;
+  - трек определяется по `media_content_id`, прямой MP3-поток отдаётся
+    через прокси Home Assistant со стабильной ссылкой;
+  - громкость синхронизируется по умолчанию; отключается `sync_volume:
+    false`;
+  - произвольное соответствие громкости задаётся Jinja2-шаблоном,
+    например `sync_volume: "{{ volume_level / 2 }}"`;
+  - пауза, продолжение, смена трека и остановка источника повторяются
+    на получателях; позиция подстраивается, если плеер умеет seek.
+
+Пример автоматизации:
+
+```yaml
+action: yahome_hub.stream_music
+data:
+  source_entity_id: media_player.iandeks_stantsiia_maks
+  target_entity_ids:
+    - media_player.kitchen
+    - media_player.sonos
+  sync_volume: "{{ volume_level / 2 }}"
+```
+
+Остановка:
+
+```yaml
+action: yahome_hub.stop_stream_music
+data:
+  source_entity_id: media_player.iandeks_stantsiia_maks
+```
+
+Для получателей нужен доступ к Home Assistant по локальному IP или
+внешнему URL; прокси-ссылка содержит случайный токен и не требует
+авторизации. Если `use_proxy: false`, используется короткая ссылка
+Яндекса — она может истечь при паузе или перемотке.
 
 ### Ограничения
 
@@ -160,6 +201,15 @@
 - **Yandex Smart Home** — отдельная интеграция, она не встроена в YaHome Hub.
 - Яндекс Музыка: поиск, очередь, лайки и плейлисты работают. Очередь
   локальная: следующие треки запускаются вручную или при остановке трека.
+- Трансляция работает для треков Яндекс Музыки и прямых URL. FM-радио,
+  подкасты и видео с нечисловым ID не транслируются: колонка не отдаёт
+  готовый аудиопоток, а API Яндекса не даёт для них MP3-ссылку.
+- Получатель должен поддерживать `media_player.play_media` с URL.
+  Apple TV/AirPlay, HEOS и некоторые DLNA-устройства имеют ограничения
+  по формату/длине URL; для них используется прокси Home Assistant.
+- Прокси-ссылка требует, чтобы получатель видел Home Assistant по
+  локальному IP или внешнему URL. Для Chromecast предпочтителен IP,
+  а не `homeassistant.local`.
 - Внешний вид плеера выбирается внутри полноэкранного плеера кнопками
   1–8; выбранный вариант сохраняется в браузере.
 
