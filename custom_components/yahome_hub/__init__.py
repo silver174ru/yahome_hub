@@ -5,13 +5,16 @@ from __future__ import annotations
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import Platform
 from homeassistant.core import HomeAssistant
+from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers.typing import ConfigType
 
-from .const import CONF_COOKIES, CONF_MUSIC_TOKEN, CONF_X_TOKEN
+from .const import CONF_COOKIES, CONF_MUSIC_TOKEN, CONF_X_TOKEN, DOMAIN
 from .cookies import async_find_cookies
 from .panel import async_register_panel
 from .services import async_setup_services
 from .websocket_api import async_register_websocket_commands
+
+CONFIG_SCHEMA = cv.empty_config_schema(DOMAIN)
 
 PLATFORMS: list[Platform] = [
     Platform.SWITCH,

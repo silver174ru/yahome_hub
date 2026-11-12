@@ -1,18 +1,14 @@
 {
   "domain": "yahome_hub",
   "name": "YaHome Hub",
+  "categories": ["hubs_protocols", "media_entertainment"],
   "codeowners": ["@silver174ru"],
   "config_flow": true,
   "dependencies": ["frontend", "http", "websocket_api", "zeroconf"],
   "documentation": "https://github.com/silver174ru/yahome_hub",
   "integration_type": "hub",
-  "categories": ["hubs_protocols", "media_entertainment"],
   "iot_class": "cloud_polling",
   "issue_tracker": "https://github.com/silver174ru/yahome_hub/issues",
-  "requirements": ["yt-dlp==2026.7.4"],
+  "requirements": ["yt-dlp>=2026.7.4"],
   "version": "0.5.1"
 }
-
-
-
-
