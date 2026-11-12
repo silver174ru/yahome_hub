@@ -10,8 +10,6 @@
   через cookie-сессию `iot.quasar.yandex.ru`.
 - Вход в Яндекс по **QR-коду**, по **cookies** или по токену Yandex IoT.
 - Все реальные колонки аккаунта через `quasar.yandex.net/glagol/device_list`.
-  Служебные устройства `alice_app_android`, `iot_app_android` и
-  `ya360_mail_android` не импортируются.
 - Для каждой колонки создаются объекты:
   - `media_player` — воспроизведение, громкость, обложка и источник
     «Станция / HDMI»;
