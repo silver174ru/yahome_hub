@@ -49,7 +49,9 @@ async def websocket_devices(
     if coordinator is None:
         connection.send_error(msg["id"], "not_configured", NOT_CONFIGURED)
         return
-    connection.send_result(msg["id"], serialize_data(coordinator.data))
+    connection.send_result(
+        msg["id"], serialize_data(coordinator.data, coordinator.health())
+    )
 
 
 @websocket_api.websocket_command(
@@ -73,7 +75,9 @@ async def websocket_sensor_values(
         await coordinator.async_fast_sensor_refresh()
     except Exception:  # noqa: BLE001
         pass
-    connection.send_result(msg["id"], serialize_data(coordinator.data))
+    connection.send_result(
+        msg["id"], serialize_data(coordinator.data, coordinator.health())
+    )
 
 
 @websocket_api.websocket_command(
@@ -161,6 +165,35 @@ async def websocket_speaker_config_set(
         connection.send_error(msg["id"], "config_failed", str(err))
         return
     connection.send_result(msg["id"], {"ok": True})
+
+
+@websocket_api.websocket_command(
+    {
+        vol.Required("type"): f"{DOMAIN}/player_state",
+        vol.Required("speaker_id"): str,
+    }
+)
+@websocket_api.require_admin
+@websocket_api.async_response
+async def websocket_player_state(
+    hass: HomeAssistant,
+    connection: websocket_api.ActiveConnection,
+    msg: dict[str, Any],
+) -> None:
+    """Return the last local player state and video latch."""
+    coordinator = get_coordinator(hass)
+    if coordinator is None:
+        connection.send_error(msg["id"], "not_configured", NOT_CONFIGURED)
+        return
+    speaker_id = msg["speaker_id"]
+    connection.send_result(
+        msg["id"],
+        {
+            "state": coordinator.glagol_state(speaker_id),
+            "video": coordinator.local_video(speaker_id),
+            "latch": coordinator.video_latch(speaker_id),
+        },
+    )
 
 
 @websocket_api.websocket_command(
@@ -677,6 +710,7 @@ def async_register_websocket_commands(hass: HomeAssistant) -> None:
     )
     websocket_api.async_register_command(hass, websocket_speaker_command)
     websocket_api.async_register_command(hass, websocket_video_close)
+    websocket_api.async_register_command(hass, websocket_player_state)
     websocket_api.async_register_command(hass, websocket_action)
     websocket_api.async_register_command(hass, websocket_scenario)
     websocket_api.async_register_command(hass, websocket_refresh)

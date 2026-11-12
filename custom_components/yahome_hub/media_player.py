@@ -118,6 +118,14 @@ class YahomeSpeaker(
         """Return metadata for a video started from the panel."""
         return self.coordinator.local_video(self._speaker_id) or {}
 
+    @property
+    def _video_marker(self) -> dict[str, Any]:
+        """Return local or detected video metadata."""
+        return (
+            self.coordinator.video_latch(self._speaker_id)
+            or self._local_video
+        )
+
     VIDEO_TYPES = {
         "video",
         "youtube",
@@ -135,8 +143,11 @@ class YahomeSpeaker(
     def _is_video(self) -> bool:
         """Return True when the current media is video/TV content."""
         player = self._player
+        latch = self.coordinator.video_latch(self._speaker_id)
         if not player:
-            return False
+            return bool(latch)
+        if latch:
+            return True
         kind = str(player.get("type") or "").strip().lower()
         if kind in self.VIDEO_TYPES:
             return True
@@ -159,7 +170,7 @@ class YahomeSpeaker(
         descriptor = extra.get("videoDescriptor")
         if isinstance(descriptor, dict) and descriptor:
             return True
-        marker = self._local_video
+        marker = self._video_marker
         if marker and player:
             if str(player.get("type") or "") == "FmRadio":
                 return False
@@ -187,7 +198,7 @@ class YahomeSpeaker(
                 value = item.get(key)
                 if value:
                     return str(value).lower()
-        marker = self._local_video
+        marker = self._video_marker
         if marker.get("provider"):
             return str(marker["provider"]).lower()
         content = str(self.media_content_id or "")
@@ -215,7 +226,7 @@ class YahomeSpeaker(
             value = item.get("id") or item.get("providerItemId")
             if value:
                 return str(value)
-        marker = self._local_video
+        marker = self._video_marker
         if marker.get("video_id"):
             return str(marker["video_id"])
         value = self._player.get("id")
@@ -224,6 +235,11 @@ class YahomeSpeaker(
     @property
     def _video_thumbnail(self) -> str | None:
         """Return a 16:9 thumbnail for video content."""
+        marker = self._video_marker
+        if marker:
+            if marker.get("thumbnail"):
+                return str(marker["thumbnail"])
+            return None
         cover = self._extra.get("coverURI")
         if cover:
             cover = str(cover)
@@ -232,9 +248,6 @@ class YahomeSpeaker(
             if "%%" in cover:
                 cover = cover.replace("%%", "1200x675")
             return cover
-        marker = self._local_video
-        if marker.get("thumbnail"):
-            return str(marker["thumbnail"])
         if self._video_provider == "youtube" and self._video_id:
             return f"https://i.ytimg.com/vi/{self._video_id}/mqdefault.jpg"
         return None
@@ -242,7 +255,7 @@ class YahomeSpeaker(
     @property
     def _video_url(self) -> str | None:
         """Return a browser URL for the current video when known."""
-        marker = self._local_video
+        marker = self._video_marker
         if marker.get("url"):
             return str(marker["url"])
         provider = self._video_provider
@@ -265,9 +278,18 @@ class YahomeSpeaker(
                 attrs["alice_state"] = alice
             attrs["can_stop"] = bool(state.get("canStop"))
             player = self._player
+            latch = self.coordinator.video_latch(self._speaker_id)
             if player:
-                attrs["player_engine"] = player.get("playerType") or ""
-                attrs["player_type"] = player.get("type") or ""
+                attrs["player_engine"] = (
+                    latch.get("engine")
+                    if latch and self._is_video
+                    else player.get("playerType")
+                ) or ""
+                attrs["player_type"] = (
+                    latch.get("player_type")
+                    if latch and self._is_video
+                    else player.get("type")
+                ) or ""
             live = player.get("liveStreamText")
             if not live and player.get("type") == "FmRadio":
                 live = "Прямой эфир"
@@ -375,10 +397,28 @@ class YahomeSpeaker(
     def state(self) -> MediaPlayerState:
         """Return the local or cloud speaker state."""
         if self._glagol_state:
+            latch = self.coordinator.video_latch(self._speaker_id)
+            if latch:
+                raw_title = str(self._player.get("title") or "").strip()
+                latch_title = str(latch.get("title") or "").strip()
+                if latch_title and raw_title and raw_title != latch_title:
+                    return (
+                        MediaPlayerState.PLAYING
+                        if latch.get("playing")
+                        else MediaPlayerState.PAUSED
+                    )
+                if latch.get("playing"):
+                    return MediaPlayerState.PLAYING
             if self._glagol_state.get("playing"):
                 return MediaPlayerState.PLAYING
             if self._player:
                 return MediaPlayerState.PAUSED
+            if latch:
+                return (
+                    MediaPlayerState.PLAYING
+                    if latch.get("playing")
+                    else MediaPlayerState.PAUSED
+                )
             return MediaPlayerState.IDLE
         iot_device = self._iot_device
         if iot_device and not is_online(iot_device):
@@ -426,15 +466,19 @@ class YahomeSpeaker(
 
     @property
     def media_title(self) -> str | None:
-        return self._player.get("title") or self.coordinator.track_meta(
-            self.media_content_id
-        ).get("title")
+        latch = self.coordinator.video_latch(self._speaker_id) or {}
+        title = latch.get("title") or self._player.get("title")
+        if title:
+            return title
+        return self.coordinator.track_meta(self.media_content_id).get("title")
 
     @property
     def media_artist(self) -> str | None:
-        return self._player.get("subtitle") or self.coordinator.track_meta(
-            self.media_content_id
-        ).get("artist")
+        latch = self.coordinator.video_latch(self._speaker_id) or {}
+        artist = latch.get("subtitle") or self._player.get("subtitle")
+        if artist:
+            return artist
+        return self.coordinator.track_meta(self.media_content_id).get("artist")
 
     @property
     def media_album_name(self) -> str | None:
@@ -488,7 +532,8 @@ class YahomeSpeaker(
 
     @property
     def media_duration(self) -> int | None:
-        value = self._player.get("duration")
+        latch = self.coordinator.video_latch(self._speaker_id) or {}
+        value = latch.get("duration") or self._player.get("duration")
         try:
             return int(value) if value else None
         except (TypeError, ValueError):
@@ -496,7 +541,10 @@ class YahomeSpeaker(
 
     @property
     def media_position(self) -> int | None:
-        value = self._player.get("progress")
+        latch = self.coordinator.video_latch(self._speaker_id) or {}
+        value = latch.get("position")
+        if value is None:
+            value = self._player.get("progress")
         if value is None:
             value = self._player.get("position")
         try:

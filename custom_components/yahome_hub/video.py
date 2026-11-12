@@ -7,6 +7,7 @@ import ipaddress
 import json
 import logging
 import re
+import socket
 from typing import Any
 from urllib.parse import urlparse
 
@@ -131,6 +132,44 @@ def is_public_http_url(value: str) -> bool:
         or address.is_reserved
         or address.is_multicast
     )
+
+
+async def async_is_public_http_url(
+    hass: HomeAssistant, value: str
+) -> bool:
+    """Validate a URL and every resolved address before yt-dlp fetches it."""
+    if not is_public_http_url(value):
+        return False
+    host = urlparse(value).hostname
+    if not host:
+        return False
+    try:
+        ipaddress.ip_address(host)
+    except ValueError:
+        pass
+    else:
+        return True
+    try:
+        infos = await hass.loop.getaddrinfo(
+            host, None, type=socket.SOCK_STREAM
+        )
+    except OSError:
+        return False
+    for info in infos:
+        address_value = info[4][0]
+        try:
+            address = ipaddress.ip_address(address_value)
+        except ValueError:
+            return False
+        if (
+            address.is_private
+            or address.is_loopback
+            or address.is_link_local
+            or address.is_reserved
+            or address.is_multicast
+        ):
+            return False
+    return True
 
 
 async def _async_rutube(
@@ -275,7 +314,7 @@ async def async_resolve_video(
             "url": value,
         }
 
-    if is_public_http_url(value):
+    if await async_is_public_http_url(hass, value):
         payload, info = await hass.async_add_executor_job(
             _extract_with_ytdlp, value
         )

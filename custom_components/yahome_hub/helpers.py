@@ -18,6 +18,9 @@ from .const import (
     COVER_TYPES,
     DEVICE_TYPE_ICONS,
     DEVICE_TYPE_LABELS,
+    DEVICE_TYPE_HUB,
+    DEVICE_TYPE_HUB_YANDEX,
+    DEVICE_TYPE_REMOTE_CAR,
     EVENT_MAP,
     FAN_TYPES,
     HUMIDIFIER_TYPES,
@@ -327,9 +330,69 @@ def device_type(device: dict[str, Any]) -> str:
     return device.get("type") or ""
 
 
+def device_vendor_text(device: dict[str, Any]) -> str:
+    """Return manufacturer, model and name as searchable lowercase text."""
+    info = device.get("device_info") or {}
+    return " ".join(
+        str(value or "")
+        for value in (
+            info.get("manufacturer"),
+            info.get("model"),
+            device.get("manufacturer"),
+            device.get("model"),
+            device.get("name"),
+        )
+    ).lower()
+
+
+def is_car_alarm_device(device: dict[str, Any]) -> bool:
+    """Return True for car alarm / remote car devices."""
+    value = device_type(device).lower()
+    text = device_vendor_text(device)
+    return (
+        value == DEVICE_TYPE_REMOTE_CAR
+        or "remote_car" in value
+        or "starline" in text
+        or ("car" in value and "remote" in value)
+    )
+
+
+def is_ir_remote_device(device: dict[str, Any]) -> bool:
+    """Return True for IR remotes (including Yandex hub-style remotes)."""
+    if is_car_alarm_device(device):
+        return False
+    value = device_type(device).lower()
+    name = str(device.get("name") or "").lower()
+    capabilities = device.get("capabilities") or []
+    if "пульт" in name or "remote" in name:
+        return True
+    if value == DEVICE_TYPE_HUB and capabilities:
+        return True
+    return ".remote" in value and "remote_car" not in value
+
+
+def is_hub_device(device: dict[str, Any]) -> bool:
+    """Return True for real hub devices, not speakers or car alarms."""
+    if is_car_alarm_device(device) or is_ir_remote_device(device):
+        return False
+    value = device_type(device).lower()
+    if value in (DEVICE_TYPE_HUB, DEVICE_TYPE_HUB_YANDEX):
+        return True
+    if "hub.yandex" in value or value.endswith(".hub"):
+        return True
+    text = device_vendor_text(device)
+    return "smart home hub" in text or "умный хаб" in text
+
+
 def device_type_label(device: dict[str, Any]) -> str:
     """Return a Russian device type label."""
     device_type_value = device_type(device)
+    if is_car_alarm_device(device):
+        return "Автосигнализация"
+    if is_ir_remote_device(device):
+        return "ИК-пульт"
+    if is_hub_device(device):
+        return "Хаб"
     if device_type_value in DEVICE_TYPE_LABELS:
         return DEVICE_TYPE_LABELS[device_type_value]
     if "smart_speaker" in device_type_value or "speaker" in device_type_value:
@@ -357,6 +420,12 @@ def device_type_label(device: dict[str, Any]) -> str:
 def device_icon(device: dict[str, Any]) -> str:
     """Return an MDI icon for a device."""
     device_type_value = device_type(device)
+    if is_car_alarm_device(device):
+        return "mdi:car-connected"
+    if is_ir_remote_device(device):
+        return "mdi:remote"
+    if is_hub_device(device):
+        return "mdi:home-assistant"
     if device_type_value in DEVICE_TYPE_ICONS:
         return DEVICE_TYPE_ICONS[device_type_value]
     if "smart_speaker" in device_type_value or "speaker" in device_type_value:

@@ -82,6 +82,9 @@ class YahomeDataUpdateCoordinator(DataUpdateCoordinator[YahomeData]):
         self._station_cache_until = 0.0
         self._speaker_cache: dict[str, dict[str, Any]] = {}
         self._speaker_cache_until = 0.0
+        self._speaker_rate_limited_until = 0.0
+        self._quasar_auth_error_until = 0.0
+        self._last_success_ts = 0.0
         self._excluded_speaker_ids: set[str] = set()
         self._local_speakers: dict[str, dict[str, Any]] = {}
         self._glagols: dict[str, YahomeGlagol] = {}
@@ -89,6 +92,8 @@ class YahomeDataUpdateCoordinator(DataUpdateCoordinator[YahomeData]):
         self._glagol_state_ts: dict[str, Any] = {}
         self._track_meta: dict[str, dict[str, Any]] = {}
         self._local_video: dict[str, dict[str, Any]] = {}
+        self._video_latch: dict[str, dict[str, Any]] = {}
+        self._glagol_nonempty_ts: dict[str, float] = {}
         self._music_quality: dict[str, str] = {}
         self._lyrics_offset = 0.0
         self._suppress_panel_event = False
@@ -138,9 +143,14 @@ class YahomeDataUpdateCoordinator(DataUpdateCoordinator[YahomeData]):
                 registry.async_remove(entry.entity_id)
 
     def _remove_non_music_speaker_entities(
-        self, speakers: dict[str, dict[str, Any]]
+        self, speakers: dict[str, dict[str, Any]], fresh: bool = True
     ) -> None:
         """Remove music-only entities from speakers that do not support music."""
+        if not fresh:
+            # A cached or rate-limited speaker list is incomplete. Removing
+            # entities here would make them disappear and reappear with new
+            # entity_ids, breaking automations.
+            return
         registry = er.async_get(self.hass)
         valid_media = {
             f"speaker_{speaker_id}_media_player"
@@ -245,17 +255,85 @@ class YahomeDataUpdateCoordinator(DataUpdateCoordinator[YahomeData]):
     def _async_glagol_state(
         self, speaker_id: str, state: dict[str, Any]
     ) -> None:
+        now = time.time()
+        player = state.get("playerState") or {}
+        previous = self._glagol_states.get(speaker_id) or {}
+        prev_player = previous.get("playerState") or {}
+        if (not player or not player.get("title")) and prev_player:
+            last_nonempty = self._glagol_nonempty_ts.get(speaker_id, 0.0)
+            if now - last_nonempty < 6:
+                state = dict(state)
+                state["playerState"] = prev_player
+                if previous.get("playing"):
+                    state["playing"] = True
+                player = prev_player
+            else:
+                latch = self._video_latch.get(speaker_id)
+                if latch and isinstance(latch.get("info"), dict):
+                    latch["info"]["playing"] = False
+        if player.get("title"):
+            self._glagol_nonempty_ts[speaker_id] = now
+        video_player = self._is_video_player(player)
+        if video_player:
+            extra = player.get("extra")
+            extra = extra if isinstance(extra, dict) else {}
+            marker = self._local_video.get(speaker_id)
+            info = dict(marker) if marker else {}
+            info["provider"] = info.get("provider") or "video"
+            info["video_id"] = info.get("video_id") or ""
+            info["title"] = (
+                info.get("title") or player.get("title") or ""
+            )
+            info["subtitle"] = (
+                info.get("subtitle") or player.get("subtitle") or ""
+            )
+            info["thumbnail"] = (
+                info.get("thumbnail") or extra.get("coverURI") or ""
+            )
+            info["url"] = info.get("url") or ""
+            info["engine"] = "video"
+            info["player_type"] = player.get("type") or "video"
+            info["playing"] = bool(state.get("playing"))
+            info["duration"] = player.get("duration") or 0
+            info["position"] = player.get("progress") or 0
+            self._video_latch[speaker_id] = {
+                "info": info,
+                "until": now + 1800,
+                "set_at": now,
+                "mismatch_since": None,
+            }
+        else:
+            latch = self._video_latch.get(speaker_id)
+            if latch:
+                raw_title = str(player.get("title") or "").strip()
+                latch_title = str(
+                    (latch.get("info") or {}).get("title") or ""
+                ).strip()
+                if raw_title and latch_title and raw_title != latch_title:
+                    if latch.get("mismatch_since") is None:
+                        latch["mismatch_since"] = now
+                    else:
+                        elapsed = now - float(latch["mismatch_since"])
+                        info = latch.get("info")
+                        if elapsed > 8 and isinstance(info, dict):
+                            info["playing"] = False
+                        # A long, actively playing non-video state means the
+                        # user really switched to music/radio. Exit video mode
+                        # instead of keeping a paused video for 30 minutes.
+                        if (
+                            elapsed > 12
+                            and speaker_id not in self._local_video
+                            and (
+                                state.get("playing")
+                                or str(player.get("id") or "").isdigit()
+                            )
+                        ):
+                            self._video_latch.pop(speaker_id, None)
+                else:
+                    latch["mismatch_since"] = None
         self._glagol_states[speaker_id] = state
         self._glagol_state_ts[speaker_id] = dt_util.utcnow()
-        player = state.get("playerState") or {}
         track_id = player.get("id")
-        if track_id and str(track_id).isdigit():
-            marker = self._local_video.get(speaker_id)
-            if marker:
-                marker_title = str(marker.get("title") or "").strip().lower()
-                player_title = str(player.get("title") or "").strip().lower()
-                if marker_title and player_title and marker_title != player_title:
-                    self._local_video.pop(speaker_id, None)
         if track_id and str(track_id) not in self._track_meta:
             self.hass.async_create_task(
                 self._async_enrich_track(str(track_id))
@@ -303,9 +381,114 @@ class YahomeDataUpdateCoordinator(DataUpdateCoordinator[YahomeData]):
         """Return local metadata for a video started by this integration."""
         return self._local_video.get(speaker_id)
 
+    @staticmethod
+    def _is_video_player(player: dict[str, Any]) -> bool:
+        """Return True for a transient video player state."""
+        if not player:
+            return False
+        kind = str(player.get("type") or "").strip().lower()
+        if kind in {
+            "video",
+            "youtube",
+            "episode",
+            "movie",
+            "tvshow",
+            "tv_show",
+            "clip",
+            "trailer",
+            "film",
+        }:
+            return True
+        player_type = str(player.get("playerType") or "").strip().lower()
+        if player_type in {"video", "ru.yandex.quasar.app"}:
+            return True
+        extra = player.get("extra")
+        if isinstance(extra, dict):
+            item = extra.get("item")
+            if isinstance(item, dict) and str(
+                item.get("type") or ""
+            ).strip().lower() in {
+                "video",
+                "youtube",
+                "episode",
+                "movie",
+                "tvshow",
+                "tv_show",
+                "clip",
+                "trailer",
+                "film",
+            }:
+                return True
+            descriptor = extra.get("videoDescriptor")
+            if isinstance(descriptor, dict) and descriptor:
+                return True
+        return False
+
+    def video_latch(self, speaker_id: str) -> dict[str, Any] | None:
+        """Return stable video metadata for the speaker, if any."""
+        marker = self._local_video.get(speaker_id)
+        if marker:
+            return marker
+        latch = self._video_latch.get(speaker_id)
+        if latch and float(latch.get("until") or 0) > time.time():
+            return latch.get("info") or {"provider": "video"}
+        if latch:
+            self._video_latch.pop(speaker_id, None)
+        return None
+
+    def health(self) -> dict[str, Any]:
+        """Return a compact health snapshot for the panel."""
+        now = time.time()
+        speakers = []
+        for speaker_id, speaker in (self.data.speakers.items() if self.data else []):
+            if str(speaker.get("platform") or "").lower() == "saturn":
+                continue
+            glagol = self._glagols.get(speaker_id)
+            last_state = self._glagol_state_ts.get(speaker_id)
+            age = (
+                round((dt_util.utcnow() - last_state).total_seconds(), 1)
+                if last_state is not None
+                else None
+            )
+            speakers.append(
+                {
+                    "id": speaker_id,
+                    "name": speaker.get("name") or "Колонка",
+                    "platform": speaker.get("platform"),
+                    "local_connected": bool(
+                        glagol is not None and glagol.connected
+                    ),
+                    "last_state_age": age,
+                    "entity_id": speaker.get("entity_id"),
+                }
+            )
+        return {
+            "updated": dt_util.utcnow().isoformat(),
+            "last_success_age": (
+                round(now - self._last_success_ts, 1)
+                if self._last_success_ts
+                else None
+            ),
+            "cloud": {
+                "configured": bool(self._quasar),
+                "rate_limited_for": max(
+                    0, round(self._speaker_rate_limited_until - now)
+                ),
+                "auth_error_for": max(
+                    0, round(self._quasar_auth_error_until - now)
+                ),
+            },
+            "speakers": speakers,
+        }
+
+    def _clear_video(self, speaker_id: str) -> None:
+        """Forget local and detected video state for a speaker."""
+        self._local_video.pop(speaker_id, None)
+        self._video_latch.pop(speaker_id, None)
+
     async def async_close_video(self, speaker_id: str) -> None:
         """Stop video playback and leave video mode."""
-        self._local_video.pop(speaker_id, None)
+        self._clear_video(speaker_id)
         glagol = self._glagols.get(speaker_id)
         if glagol is not None and glagol.connected:
             await glagol.send({"command": "stop"}, wait=False)
@@ -358,6 +541,7 @@ class YahomeDataUpdateCoordinator(DataUpdateCoordinator[YahomeData]):
         except YahomeApiError as err:
             raise UpdateFailed(str(err)) from err
 
+        self._last_success_ts = time.time()
         devices = {
             device["id"]: device
             for device in payload.get("devices") or []
@@ -384,6 +568,7 @@ class YahomeDataUpdateCoordinator(DataUpdateCoordinator[YahomeData]):
         speakers: dict[str, dict[str, Any]] = {}
         stations: dict[str, dict[str, Any]] = {}
         child_to_station: dict[str, str] = {}
+        speakers_fresh = False
 
         if self._quasar:
             if time.time() >= self._speaker_cache_until:
@@ -395,6 +580,7 @@ class YahomeDataUpdateCoordinator(DataUpdateCoordinator[YahomeData]):
                     )
                     speaker_list = []
                     self._speaker_cache_until = time.time() + 300
+                    self._quasar_auth_error_until = time.time() + 300
                 except YahomeApiError as err:
                     message = str(err).lower()
                     if "429" in message or "limited" in message:
@@ -402,6 +588,7 @@ class YahomeDataUpdateCoordinator(DataUpdateCoordinator[YahomeData]):
                             "Quasar rate limit; speaker refresh postponed"
                         )
                         self._speaker_cache_until = time.time() + 300
+                        self._speaker_rate_limited_until = time.time() + 300
                     else:
                         _LOGGER.warning(
                             "Unable to fetch Yandex speakers: %s", err
@@ -415,6 +602,9 @@ class YahomeDataUpdateCoordinator(DataUpdateCoordinator[YahomeData]):
                         if speaker.get("id")
                     }
                     self._speaker_cache_until = time.time() + 600
+                    self._speaker_rate_limited_until = 0.0
+                    self._quasar_auth_error_until = 0.0
+                    speakers_fresh = bool(speaker_list)
             else:
                 speaker_list = list(self._speaker_cache.values())
 
@@ -530,7 +720,9 @@ class YahomeDataUpdateCoordinator(DataUpdateCoordinator[YahomeData]):
                     speaker["screen_entity"] = screen_entity
 
             self._remove_excluded_speaker_entities()
-            self._remove_non_music_speaker_entities(speakers)
+            self._remove_non_music_speaker_entities(
+                speakers, fresh=speakers_fresh
+            )
 
             if (
                 self._quasar.can_read_configuration
@@ -953,6 +1145,8 @@ class YahomeDataUpdateCoordinator(DataUpdateCoordinator[YahomeData]):
             "speaker_id": speaker_id,
             "speaker": safe_speaker,
             "state": self.glagol_state(speaker_id),
+            "video": self._local_video.get(speaker_id),
+            "latch": self.video_latch(speaker_id),
             "config": config,
             "local": self._local_speakers.get(speaker_id, {}),
             "updated": self.glagol_state_updated_at(speaker_id),
@@ -1116,14 +1310,14 @@ class YahomeDataUpdateCoordinator(DataUpdateCoordinator[YahomeData]):
             return
         payload: dict[str, Any] | None = None
         if value.isdigit():
-            self._local_video.pop(speaker_id, None)
+            self._clear_video(speaker_id)
             await self.async_play_track(entity_id, value)
             return
         if "music.yandex" in value:
             match = re.search(r"(track|album|artist|playlist)/(\d+)", value)
             if match:
                 if match.group(1) == "track":
-                    self._local_video.pop(speaker_id, None)
+                    self._clear_video(speaker_id)
                     await self.async_play_track(entity_id, match.group(2))
                     return
                 payload = {
@@ -1220,13 +1414,13 @@ class YahomeDataUpdateCoordinator(DataUpdateCoordinator[YahomeData]):
                 1,
             )
             if tracks:
-                self._local_video.pop(speaker_id, None)
+                self._clear_video(speaker_id)
                 await self.async_play_track(entity_id, tracks[0]["id"])
                 return
         if payload is None:
             raise HomeAssistantError("Could not resolve media")
         if payload.get("command") == "playMusic":
-            self._local_video.pop(speaker_id, None)
+            self._clear_video(speaker_id)
         await glagol.send(payload, wait=False)
         if payload.get("command") == "playMusic":
             await asyncio.sleep(0.5)
@@ -1293,7 +1487,7 @@ class YahomeDataUpdateCoordinator(DataUpdateCoordinator[YahomeData]):
         glagol = self._glagols.get(speaker_id)
         if glagol is None or not glagol.connected:
             raise HomeAssistantError("Local speaker connection is not ready")
-        self._local_video.pop(speaker_id, None)
+        self._clear_video(speaker_id)
         await glagol.send(
             {"command": "playMusic", "id": str(track_id), "type": "track"},
             wait=False,
@@ -1310,7 +1504,7 @@ class YahomeDataUpdateCoordinator(DataUpdateCoordinator[YahomeData]):
         speaker_id = self.speaker_id_for_entity(entity_id)
         if not speaker_id:
             raise HomeAssistantError("Speaker not found")
-        self._local_video.pop(speaker_id, None)
+        self._clear_video(speaker_id)
         if queue is not None:
             index = max(0, min(len(queue) - 1, int(index))) if queue else -1
             self._music_queues[speaker_id] = {

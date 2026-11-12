@@ -26,6 +26,9 @@ from .helpers import (
     device_type_label,
     get_capability_instance,
     get_capability_state,
+    is_car_alarm_device,
+    is_hub_device,
+    is_ir_remote_device,
     mode_options,
     primary_domain,
     range_bounds,
@@ -148,6 +151,7 @@ def device_view(
 ) -> dict[str, Any]:
     """Return a normalized device view."""
     room_id = device.get("room")
+    info = device.get("device_info") or {}
     return {
         "id": device.get("id"),
         "name": device_name(device),
@@ -162,6 +166,14 @@ def device_view(
         "station_id": child_to_station.get(device.get("id")),
         "household_id": device.get("household_id") or device.get("household"),
         "groups": device.get("groups") or [],
+        "manufacturer": info.get("manufacturer")
+        or device.get("manufacturer"),
+        "model": info.get("model") or device.get("model"),
+        "sw_version": info.get("sw_version"),
+        "hw_version": info.get("hw_version"),
+        "is_hub": is_hub_device(device),
+        "is_car_alarm": is_car_alarm_device(device),
+        "is_ir_remote": is_ir_remote_device(device),
         "capabilities": [
             capability_view(capability)
             for capability in device.get("capabilities") or []
@@ -177,6 +189,11 @@ def device_view(
             if (prop.get("state") or {}).get("instance")
         ],
     }
+
+
+def _is_hub_speaker(speaker: dict[str, Any]) -> bool:
+    """Return True for Quasar hub entries that are not media speakers."""
+    return str(speaker.get("platform") or "").lower() in {"saturn"}
 
 
 def _speaker_view(
@@ -231,7 +248,9 @@ def _speaker_view(
     }
 
 
-def serialize_data(data: YahomeData) -> dict[str, Any]:
+def serialize_data(
+    data: YahomeData, health: dict[str, Any] | None = None
+) -> dict[str, Any]:
     """Serialize coordinator data for the panel, database and WebSocket."""
     devices = [
         device_view(device, data.rooms, data.child_to_station)
@@ -248,6 +267,30 @@ def serialize_data(data: YahomeData) -> dict[str, Any]:
     )
     type_counts = Counter(item.get("type_label") or "Устройство" for item in devices)
     online_count = sum(1 for item in devices if item.get("online"))
+    speakers = [
+        speaker
+        for speaker in data.speakers.values()
+        if not _is_hub_speaker(speaker)
+    ]
+    hubs = [
+        {
+            "id": item.get("id"),
+            "name": item.get("name"),
+            "room_name": item.get("room_name"),
+            "manufacturer": item.get("manufacturer"),
+            "model": item.get("model"),
+            "sw_version": item.get("sw_version"),
+            "hw_version": item.get("hw_version"),
+            "online": item.get("online"),
+            "child_count": sum(
+                1
+                for child in devices
+                if child.get("station_id") == item.get("id")
+            ),
+        }
+        for item in devices
+        if item.get("is_hub")
+    ]
     return {
         "updated": datetime.now().isoformat(timespec="seconds"),
         "counts": {
@@ -255,7 +298,8 @@ def serialize_data(data: YahomeData) -> dict[str, Any]:
             "online": online_count,
             "offline": len(devices) - online_count,
             "scenarios": len(data.scenarios),
-            "speakers": len(data.speakers),
+            "speakers": len(speakers),
+            "hubs": len(hubs),
             "stations": len(data.stations),
             "rooms": len(data.rooms),
         },
@@ -280,8 +324,10 @@ def serialize_data(data: YahomeData) -> dict[str, Any]:
         ],
         "speakers": [
             _speaker_view(data, speaker)
-            for speaker in data.speakers.values()
+            for speaker in speakers
         ],
+        "hubs": hubs,
+        "health": health,
         "stations": [
             {
                 "id": station_id,

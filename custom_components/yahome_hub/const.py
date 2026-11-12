@@ -141,6 +141,9 @@ DEVICE_TYPE_IRON = "devices.types.iron"
 DEVICE_TYPE_WASHING_MACHINE = "devices.types.washing_machine"
 DEVICE_TYPE_DISHWASHER = "devices.types.dishwasher"
 DEVICE_TYPE_REFRIGERATOR = "devices.types.refrigerator"
+DEVICE_TYPE_REMOTE_CAR = "devices.types.remote_car"
+DEVICE_TYPE_HUB = "devices.types.hub"
+DEVICE_TYPE_HUB_YANDEX = "devices.types.hub.yandex.saturn"
 
 COVER_TYPES = {
     DEVICE_TYPE_CURTAIN,
@@ -222,6 +225,9 @@ DEVICE_TYPE_LABELS: dict[str, str] = {
     DEVICE_TYPE_WASHING_MACHINE: "Стиральная машина",
     DEVICE_TYPE_DISHWASHER: "Посудомоечная машина",
     DEVICE_TYPE_REFRIGERATOR: "Холодильник",
+    DEVICE_TYPE_REMOTE_CAR: "Автосигнализация",
+    DEVICE_TYPE_HUB: "Хаб",
+    DEVICE_TYPE_HUB_YANDEX: "Хаб",
 }
 
 DEVICE_TYPE_ICONS: dict[str, str] = {
@@ -270,6 +276,9 @@ DEVICE_TYPE_ICONS: dict[str, str] = {
     DEVICE_TYPE_WASHING_MACHINE: "mdi:washing-machine",
     DEVICE_TYPE_DISHWASHER: "mdi:dishwasher",
     DEVICE_TYPE_REFRIGERATOR: "mdi:fridge",
+    DEVICE_TYPE_REMOTE_CAR: "mdi:car-connected",
+    DEVICE_TYPE_HUB: "mdi:home-assistant",
+    DEVICE_TYPE_HUB_YANDEX: "mdi:home-assistant",
 }
 
 CAPABILITY_NAMES: dict[str, str] = {

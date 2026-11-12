@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import logging
 from pathlib import Path
 
@@ -15,6 +16,15 @@ _LOGGER = logging.getLogger(__name__)
 PANEL_KEY = f"{DOMAIN}_panel_registered"
 FRONTEND_PATH = Path(__file__).parent / "frontend"
 FRONTEND_URL = f"/{DOMAIN}"
+
+
+def _asset_version() -> str:
+    """Return a content hash so the browser never keeps stale panel code."""
+    try:
+        data = (FRONTEND_PATH / "yahome-hub-panel.js").read_bytes()
+    except OSError:
+        return "dev"
+    return hashlib.sha256(data).hexdigest()[:10]
 
 
 async def async_register_panel(hass: HomeAssistant) -> None:
@@ -31,7 +41,7 @@ async def async_register_panel(hass: HomeAssistant) -> None:
             frontend_url_path="yahome-hub",
             sidebar_title="YaHome Hub",
             sidebar_icon="mdi:home-automation",
-            module_url=f"{FRONTEND_URL}/yahome-hub-panel.js?v=0.5.1-29",
+            module_url=f"{FRONTEND_URL}/yahome-hub-panel.js?v={_asset_version()}",
             embed_iframe=False,
             require_admin=True,
         )

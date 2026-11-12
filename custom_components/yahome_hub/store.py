@@ -41,9 +41,15 @@ class YahomeDeviceStore:
         self, data: YahomeData, path: str
     ) -> dict[str, str]:
         """Export the device database to JSON and SQLite."""
+        base = Path(self._hass.config.path("yahome_hub")).resolve()
         target = Path(path)
         if not target.is_absolute():
-            target = Path(self._hass.config.path(path))
+            target = base / target
+        target = target.resolve()
+        if target != base and base not in target.parents:
+            raise ValueError(
+                "Путь экспорта должен находиться внутри папки yahome_hub"
+            )
         target.parent.mkdir(parents=True, exist_ok=True)
         serialized = serialize_data(data)
         payload = {
