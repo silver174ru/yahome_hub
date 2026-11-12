@@ -318,6 +318,7 @@ class MusicStreamManager:
             if session.last_source_state != STATE_PAUSED:
                 await self._async_pause_targets(session)
             session.last_source_state = source_state
+            await self._async_sync_volume(session, state)
             return
 
         if source_state in STOP_STATES:
@@ -326,6 +327,7 @@ class MusicStreamManager:
             session.last_source_state = source_state
             session.last_track_key = None
             session.last_play_url = None
+            await self._async_sync_volume(session, state)
             return
 
         session.last_source_state = source_state
