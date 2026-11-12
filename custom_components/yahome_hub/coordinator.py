@@ -12,7 +12,7 @@ from typing import Any
 import aiohttp
 
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.core import HomeAssistant, callback
+from homeassistant.core import Context, HomeAssistant, callback
 from homeassistant.exceptions import ConfigEntryAuthFailed, HomeAssistantError
 from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
@@ -47,6 +47,7 @@ from .store import YahomeDeviceStore, default_export_path
 from .models import YahomeData
 from .video import async_resolve_video
 from .music import async_search_tracks
+from .stream import MusicStreamManager
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -119,6 +120,7 @@ class YahomeDataUpdateCoordinator(DataUpdateCoordinator[YahomeData]):
             update_interval=timedelta(seconds=scan_interval),
         )
         self.async_add_listener(self._async_data_updated)
+        self._stream_manager = MusicStreamManager(self)
 
     def _remove_excluded_speaker_entities(self) -> None:
         """Remove media_player entities for Yandex app pseudo-speakers."""
@@ -216,6 +218,7 @@ class YahomeDataUpdateCoordinator(DataUpdateCoordinator[YahomeData]):
             self._sensor_unsub()
             self._sensor_unsub = None
         self._discovery.stop()
+        await self._stream_manager.async_shutdown()
         for glagol in list(self._glagols.values()):
             await glagol.stop()
         self._glagols.clear()
@@ -1472,6 +1475,48 @@ class YahomeDataUpdateCoordinator(DataUpdateCoordinator[YahomeData]):
             self.entry.data.get(CONF_MUSIC_TOKEN),
             limit,
         )
+
+    async def async_start_music_stream(
+        self,
+        source_entity_id: str,
+        target_entity_ids: list[str],
+        *,
+        sync_volume: Any = True,
+        use_proxy: bool = True,
+        start: bool = True,
+        stop_targets: bool = True,
+        context: Context | None = None,
+    ) -> dict[str, Any]:
+        """Start mirroring a Yandex Station to other media players."""
+        return await self._stream_manager.async_start(
+            source_entity_id,
+            target_entity_ids,
+            sync_volume=sync_volume,
+            use_proxy=use_proxy,
+            start=start,
+            stop_targets=stop_targets,
+            context=context,
+        )
+
+    async def async_stop_music_stream(
+        self,
+        *,
+        session_id: str | None = None,
+        source_entity_id: str | None = None,
+        target_entity_ids: list[str] | None = None,
+        stop_playback: bool = True,
+    ) -> int:
+        """Stop one or more music mirroring sessions."""
+        return await self._stream_manager.async_stop(
+            session_id=session_id,
+            source_entity_id=source_entity_id,
+            target_entity_ids=target_entity_ids,
+            stop_playback=stop_playback,
+        )
+
+    def music_streams(self) -> list[dict[str, Any]]:
+        """Return active music stream sessions."""
+        return self._stream_manager.snapshot()
 
     def music_queue(self, speaker_id: str) -> dict[str, Any]:
         """Return a copy of the local music queue for a speaker."""

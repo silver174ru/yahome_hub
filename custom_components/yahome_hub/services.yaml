@@ -131,3 +131,81 @@ set_speaker_config:
       required: true
       selector:
         object:
+
+stream_music:
+  name: Транслировать музыку
+  description: Повторяет музыку с колонки Яндекс на другие медиаплееры и синхронизирует громкость.
+  fields:
+    source_entity_id:
+      name: Источник
+      description: Колонка Яндекс Станции.
+      required: true
+      selector:
+        entity:
+          domain: media_player
+    target_entity_ids:
+      name: Получатели
+      description: Колонки и медиаплееры, на которые нужно транслировать музыку.
+      required: true
+      selector:
+        entity:
+          domain: media_player
+          multiple: true
+    sync_volume:
+      name: Синхронизация громкости
+      description: 'true/false или Jinja2-шаблон, например "{{ volume_level / 2 }}".'
+      required: false
+      default: true
+      selector:
+        object:
+    use_proxy:
+      name: Использовать прокси
+      description: Стабильная ссылка через Home Assistant вместо короткоживущей ссылки Яндекса.
+      required: false
+      default: true
+      selector:
+        boolean:
+    start:
+      name: Запустить сразу
+      description: Если выключено, трансляция начнётся при следующем воспроизведении.
+      required: false
+      default: true
+      selector:
+        boolean:
+    stop_targets:
+      name: Останавливать получателей
+      description: Останавливать получатели при завершении сессии.
+      required: false
+      default: true
+      selector:
+        boolean:
+
+stop_stream_music:
+  name: Остановить трансляцию музыки
+  description: Отключает синхронизацию и при необходимости останавливает получатели.
+  fields:
+    session_id:
+      name: ID сессии
+      description: Если не указан, останавливаются все подходящие сессии.
+      required: false
+      selector:
+        text:
+    source_entity_id:
+      name: Источник
+      required: false
+      selector:
+        entity:
+          domain: media_player
+    target_entity_ids:
+      name: Получатели
+      required: false
+      selector:
+        entity:
+          domain: media_player
+          multiple: true
+    stop_playback:
+      name: Останавливать воспроизведение
+      required: false
+      default: true
+      selector:
+        boolean:

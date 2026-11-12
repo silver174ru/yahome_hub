@@ -32,6 +32,7 @@ async def async_register_panel(hass: HomeAssistant) -> None:
     if hass.data.get(PANEL_KEY):
         return
     try:
+        version = await hass.async_add_executor_job(_asset_version)
         await hass.http.async_register_static_paths(
             [StaticPathConfig(FRONTEND_URL, str(FRONTEND_PATH), False)]
         )
@@ -41,7 +42,7 @@ async def async_register_panel(hass: HomeAssistant) -> None:
             frontend_url_path="yahome-hub",
             sidebar_title="YaHome Hub",
             sidebar_icon="mdi:home-automation",
-            module_url=f"{FRONTEND_URL}/yahome-hub-panel.js?v={_asset_version()}",
+            module_url=f"{FRONTEND_URL}/yahome-hub-panel.js?v={version}",
             embed_iframe=False,
             require_admin=True,
         )

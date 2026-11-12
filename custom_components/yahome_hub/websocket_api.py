@@ -169,6 +169,28 @@ async def websocket_speaker_config_set(
 
 @websocket_api.websocket_command(
     {
+        vol.Required("type"): f"{DOMAIN}/streams",
+    }
+)
+@websocket_api.require_admin
+@websocket_api.async_response
+async def websocket_streams(
+    hass: HomeAssistant,
+    connection: websocket_api.ActiveConnection,
+    msg: dict[str, Any],
+) -> None:
+    """Return active music mirroring sessions."""
+    coordinator = get_coordinator(hass)
+    if coordinator is None:
+        connection.send_error(msg["id"], "not_configured", NOT_CONFIGURED)
+        return
+    connection.send_result(
+        msg["id"], {"streams": coordinator.music_streams()}
+    )
+
+
+@websocket_api.websocket_command(
+    {
         vol.Required("type"): f"{DOMAIN}/player_state",
         vol.Required("speaker_id"): str,
     }
@@ -711,6 +733,7 @@ def async_register_websocket_commands(hass: HomeAssistant) -> None:
     websocket_api.async_register_command(hass, websocket_speaker_command)
     websocket_api.async_register_command(hass, websocket_video_close)
     websocket_api.async_register_command(hass, websocket_player_state)
+    websocket_api.async_register_command(hass, websocket_streams)
     websocket_api.async_register_command(hass, websocket_action)
     websocket_api.async_register_command(hass, websocket_scenario)
     websocket_api.async_register_command(hass, websocket_refresh)

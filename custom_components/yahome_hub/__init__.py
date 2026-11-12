@@ -12,6 +12,7 @@ from .const import CONF_COOKIES, CONF_MUSIC_TOKEN, CONF_X_TOKEN, DOMAIN
 from .cookies import async_find_cookies
 from .panel import async_register_panel
 from .services import async_setup_services
+from .stream_proxy import StreamProxyView, async_get_registry
 from .websocket_api import async_register_websocket_commands
 
 CONFIG_SCHEMA = cv.empty_config_schema(DOMAIN)
@@ -41,6 +42,10 @@ PLATFORMS: list[Platform] = [
 async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
     """Set up the integration-wide services and panel."""
     await async_setup_services(hass)
+    async_get_registry(hass)
+    if not hass.data.get(DOMAIN, {}).get("stream_view_registered"):
+        hass.http.register_view(StreamProxyView(hass))
+        hass.data.setdefault(DOMAIN, {})["stream_view_registered"] = True
     async_register_websocket_commands(hass)
     await async_register_panel(hass)
     return True

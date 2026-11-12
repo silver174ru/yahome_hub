@@ -5,8 +5,10 @@ from __future__ import annotations
 from typing import Any
 
 import voluptuous as vol
+from homeassistant.const import ATTR_ENTITY_ID
 from homeassistant.core import HomeAssistant, ServiceCall, SupportsResponse
 from homeassistant.exceptions import Unauthorized
+from homeassistant.helpers import config_validation as cv
 
 from .const import DOMAIN
 from .websocket_api import get_coordinator
@@ -18,6 +20,8 @@ SERVICE_EXPORT = "export"
 SERVICE_SAY = "say"
 SERVICE_SET_LED = "set_led"
 SERVICE_SET_SPEAKER_CONFIG = "set_speaker_config"
+SERVICE_STREAM_MUSIC = "stream_music"
+SERVICE_STOP_STREAM = "stop_stream_music"
 
 SEND_ACTION_SCHEMA = vol.Schema(
     {
@@ -51,6 +55,33 @@ SPEAKER_CONFIG_SCHEMA = vol.Schema(
         vol.Required("config"): dict,
     }
 )
+STREAM_MUSIC_SCHEMA = vol.Schema(
+    {
+        vol.Required("source_entity_id"): cv.entity_id,
+        vol.Optional("target_entity_ids"): vol.All(
+            cv.ensure_list, [cv.entity_id]
+        ),
+        vol.Optional(ATTR_ENTITY_ID): vol.All(
+            cv.ensure_list, [cv.entity_id]
+        ),
+        vol.Optional("sync_volume", default=True): vol.Any(
+            cv.boolean, cv.template
+        ),
+        vol.Optional("use_proxy", default=True): cv.boolean,
+        vol.Optional("start", default=True): cv.boolean,
+        vol.Optional("stop_targets", default=True): cv.boolean,
+    }
+)
+STOP_STREAM_SCHEMA = vol.Schema(
+    {
+        vol.Optional("session_id"): str,
+        vol.Optional("source_entity_id"): cv.entity_id,
+        vol.Optional("target_entity_ids"): vol.All(
+            cv.ensure_list, [cv.entity_id]
+        ),
+        vol.Optional("stop_playback", default=True): cv.boolean,
+    }
+)
 
 
 async def _require_admin(hass: HomeAssistant, call: ServiceCall) -> None:
@@ -68,6 +99,61 @@ async def _require_admin(hass: HomeAssistant, call: ServiceCall) -> None:
 
 async def async_setup_services(hass: HomeAssistant) -> None:
     """Register integration services."""
+    async def handle_stream_music(call: ServiceCall) -> dict[str, Any]:
+        await _require_admin(hass, call)
+        coordinator = get_coordinator(hass)
+        if coordinator is None:
+            raise ValueError("YaHome Hub не настроен")
+        targets = call.data.get("target_entity_ids") or call.data.get(
+            ATTR_ENTITY_ID
+        ) or []
+        if isinstance(targets, str):
+            targets = [targets]
+        if not targets:
+            raise ValueError("Укажите хотя бы одну колонку-получатель")
+        return await coordinator.async_start_music_stream(
+            call.data["source_entity_id"],
+            list(targets),
+            sync_volume=call.data.get("sync_volume", True),
+            use_proxy=call.data.get("use_proxy", True),
+            start=call.data.get("start", True),
+            stop_targets=call.data.get("stop_targets", True),
+            context=call.context,
+        )
+
+    async def handle_stop_stream(call: ServiceCall) -> dict[str, int]:
+        await _require_admin(hass, call)
+        coordinator = get_coordinator(hass)
+        if coordinator is None:
+            raise ValueError("YaHome Hub не настроен")
+        targets = call.data.get("target_entity_ids") or []
+        if isinstance(targets, str):
+            targets = [targets]
+        stopped = await coordinator.async_stop_music_stream(
+            session_id=call.data.get("session_id"),
+            source_entity_id=call.data.get("source_entity_id"),
+            target_entity_ids=list(targets) if targets else None,
+            stop_playback=call.data.get("stop_playback", True),
+        )
+        return {"stopped": stopped}
+
+    if not hass.services.has_service(DOMAIN, SERVICE_STREAM_MUSIC):
+        hass.services.async_register(
+            DOMAIN,
+            SERVICE_STREAM_MUSIC,
+            handle_stream_music,
+            schema=STREAM_MUSIC_SCHEMA,
+            supports_response=SupportsResponse.OPTIONAL,
+        )
+    if not hass.services.has_service(DOMAIN, SERVICE_STOP_STREAM):
+        hass.services.async_register(
+            DOMAIN,
+            SERVICE_STOP_STREAM,
+            handle_stop_stream,
+            schema=STOP_STREAM_SCHEMA,
+            supports_response=SupportsResponse.OPTIONAL,
+        )
+
     if hass.services.has_service(DOMAIN, SERVICE_SEND_ACTION):
         return
 

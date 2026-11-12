@@ -6,13 +6,36 @@ import base64
 import hashlib
 import hmac
 import time
+import xml.etree.ElementTree as ET
+from dataclasses import dataclass
 from typing import Any
 
-from aiohttp import ClientError, ClientSession
+from aiohttp import ClientError, ClientSession, ClientTimeout
 
 MUSIC_API = "https://api.music.yandex.net"
 MUSIC_HEADERS = {"X-Yandex-Music-Client": "YandexMusicAndroid/24023621"}
 SIGN_KEY = b"p93jhgh689SBReK6ghtw62"
+STREAM_SALT = "XGRlBW9FXlekgbPrRHuSiA"
+
+
+class MusicStreamError(Exception):
+    """Raised when a Yandex Music track cannot be resolved to audio."""
+
+    def __init__(self, message: str, status: int | None = None) -> None:
+        super().__init__(message)
+        self.status = status
+
+
+@dataclass(frozen=True)
+class MusicStreamInfo:
+    """A short-lived direct audio URL for a Yandex Music track."""
+
+    url: str
+    codec: str
+    bitrate: int
+    content_type: str
+    expires_at: float
+    track_id: str
 
 
 def _sign(*parts: Any) -> str:
@@ -222,6 +245,104 @@ async def async_search_tracks(
         for track in tracks[: max(1, int(limit))]
         if track.get("id")
     ]
+
+
+async def async_get_track_stream(
+    session: ClientSession,
+    track_id: str,
+    music_token: str | None,
+    *,
+    timeout: float = 12.0,
+) -> MusicStreamInfo:
+    """Resolve a Yandex Music track ID to a direct MP3 URL.
+
+    The returned URL is a short-lived bearer URL. Never log it.
+    """
+    value = str(track_id or "").strip().split(":", 1)[0]
+    if not value.isdigit():
+        raise MusicStreamError("Track ID is not numeric")
+    if not music_token:
+        raise MusicStreamError("Yandex Music token is not configured")
+
+    headers = _headers(music_token)
+    client_timeout = ClientTimeout(total=timeout)
+    try:
+        async with session.get(
+            f"{MUSIC_API}/tracks/{value}/download-info",
+            headers=headers,
+            timeout=client_timeout,
+        ) as response:
+            if response.status != 200:
+                raise MusicStreamError(
+                    f"download-info HTTP {response.status}",
+                    response.status,
+                )
+            payload = await response.json(content_type=None)
+    except (ClientError, ValueError) as err:
+        raise MusicStreamError("download-info request failed") from err
+
+    variants = payload.get("result") if isinstance(payload, dict) else None
+    if not isinstance(variants, list):
+        raise MusicStreamError("download-info returned no variants")
+    mp3_variants = [
+        item
+        for item in variants
+        if isinstance(item, dict)
+        and str(item.get("codec") or "").lower() == "mp3"
+        and not item.get("preview")
+        and item.get("downloadInfoUrl")
+    ]
+    if not mp3_variants:
+        raise MusicStreamError("No full MP3 variant for this track")
+    best = max(
+        mp3_variants,
+        key=lambda item: int(item.get("bitrateInKbps") or 0),
+    )
+
+    try:
+        async with session.get(
+            str(best["downloadInfoUrl"]),
+            headers={"User-Agent": "Yandex-Music-API"},
+            timeout=client_timeout,
+        ) as response:
+            if response.status != 200:
+                raise MusicStreamError(
+                    f"download-info XML HTTP {response.status}",
+                    response.status,
+                )
+            xml_bytes = (await response.read()).lstrip(b"\xef\xbb\xbf")
+    except (ClientError, ValueError) as err:
+        raise MusicStreamError("download-info XML request failed") from err
+
+    try:
+        root = ET.fromstring(xml_bytes)
+    except ET.ParseError as err:
+        raise MusicStreamError("download-info XML is invalid") from err
+
+    host = (root.findtext("host") or "").strip()
+    path = (root.findtext("path") or "").strip()
+    timestamp = (root.findtext("ts") or "").strip()
+    signature = (root.findtext("s") or "").strip()
+    for prefix in ("https://", "http://"):
+        if host.startswith(prefix):
+            host = host[len(prefix) :]
+    host = host.strip("/")
+    if not host or not path.startswith("/") or not timestamp or not signature:
+        raise MusicStreamError("download-info XML is incomplete")
+
+    digest = hashlib.md5(
+        (STREAM_SALT + path[1:] + signature).encode("utf-8"),
+        usedforsecurity=False,
+    ).hexdigest()
+    url = f"https://{host}/get-mp3/{digest}/{timestamp}{path}"
+    return MusicStreamInfo(
+        url=url,
+        codec="mp3",
+        bitrate=int(best.get("bitrateInKbps") or 0),
+        content_type="audio/mpeg",
+        expires_at=time.time() + 50,
+        track_id=value,
+    )
 
 
 async def async_get_lyrics(
