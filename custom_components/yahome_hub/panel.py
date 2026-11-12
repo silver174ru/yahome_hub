@@ -1,4 +1,4 @@
-﻿"""Sidebar panel registration for YaHome Hub."""
+"""Sidebar panel registration for YaHome Hub."""
 
 from __future__ import annotations
 
