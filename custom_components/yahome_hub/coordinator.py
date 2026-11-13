@@ -11,6 +11,7 @@ from typing import Any
 
 import aiohttp
 
+from homeassistant.components.media_player import MediaPlayerEntityFeature
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import Context, HomeAssistant, callback
 from homeassistant.exceptions import ConfigEntryAuthFailed, HomeAssistantError
@@ -1485,6 +1486,11 @@ class YahomeDataUpdateCoordinator(DataUpdateCoordinator[YahomeData]):
         use_proxy: bool = True,
         start: bool = True,
         stop_targets: bool = True,
+        quality: str = "high",
+        codecs: str = "mp3",
+        media_content_type: str | None = None,
+        mute_source: bool = True,
+        bidirectional: bool = True,
         context: Context | None = None,
     ) -> dict[str, Any]:
         """Start mirroring a Yandex Station to other media players."""
@@ -1495,6 +1501,11 @@ class YahomeDataUpdateCoordinator(DataUpdateCoordinator[YahomeData]):
             use_proxy=use_proxy,
             start=start,
             stop_targets=stop_targets,
+            quality=quality,
+            codecs=codecs,
+            media_content_type=media_content_type,
+            mute_source=mute_source,
+            bidirectional=bidirectional,
             context=context,
         )
 
@@ -1517,6 +1528,43 @@ class YahomeDataUpdateCoordinator(DataUpdateCoordinator[YahomeData]):
     def music_streams(self) -> list[dict[str, Any]]:
         """Return active music stream sessions."""
         return self._stream_manager.snapshot()
+
+    def stream_targets(
+        self, exclude_entity_id: str | None = None
+    ) -> list[dict[str, str]]:
+        """Return external media players that can receive a stream."""
+        registry = er.async_get(self.hass)
+        targets: list[dict[str, str]] = []
+        used_names: set[str] = set()
+        for state in self.hass.states.async_all("media_player"):
+            entity_id = state.entity_id
+            if entity_id == exclude_entity_id:
+                continue
+            if state.state in ("unavailable", "unknown"):
+                continue
+            features = int(state.attributes.get("supported_features") or 0)
+            if not features & MediaPlayerEntityFeature.PLAY_MEDIA:
+                continue
+            entry = registry.async_get(entity_id)
+            platform = entry.platform if entry else ""
+            name = str(
+                state.attributes.get("friendly_name") or entity_id
+            )
+            if platform == "cast":
+                name = f"{name} · Cast"
+            elif platform in {"androidtv_remote", "androidtv", "firetv"}:
+                name = f"{name} · TV"
+            if name in used_names:
+                name = f"{name} ({entity_id})"
+            used_names.add(name)
+            targets.append(
+                {
+                    "entity_id": entity_id,
+                    "name": name,
+                    "platform": platform,
+                }
+            )
+        return targets
 
     def music_queue(self, speaker_id: str) -> dict[str, Any]:
         """Return a copy of the local music queue for a speaker."""

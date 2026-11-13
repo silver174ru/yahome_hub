@@ -70,6 +70,15 @@ STREAM_MUSIC_SCHEMA = vol.Schema(
         vol.Optional("use_proxy", default=True): cv.boolean,
         vol.Optional("start", default=True): cv.boolean,
         vol.Optional("stop_targets", default=True): cv.boolean,
+        vol.Optional("quality", default="high"): vol.In(
+            ["high", "medium", "low"]
+        ),
+        vol.Optional("codecs", default="mp3"): vol.In(
+            ["mp3", "aac", "flac"]
+        ),
+        vol.Optional("media_content_type"): str,
+        vol.Optional("mute_source", default=True): cv.boolean,
+        vol.Optional("bidirectional", default=True): cv.boolean,
     }
 )
 STOP_STREAM_SCHEMA = vol.Schema(
@@ -118,6 +127,11 @@ async def async_setup_services(hass: HomeAssistant) -> None:
             use_proxy=call.data.get("use_proxy", True),
             start=call.data.get("start", True),
             stop_targets=call.data.get("stop_targets", True),
+            quality=call.data.get("quality", "high"),
+            codecs=call.data.get("codecs", "mp3"),
+            media_content_type=call.data.get("media_content_type"),
+            mute_source=call.data.get("mute_source", True),
+            bidirectional=call.data.get("bidirectional", True),
             context=call.context,
         )
 

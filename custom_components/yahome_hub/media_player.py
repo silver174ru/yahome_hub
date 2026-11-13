@@ -17,6 +17,7 @@ from homeassistant.components.media_player import (
 )
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
+from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
@@ -83,6 +84,8 @@ class YahomeSpeaker(
 ):
     """A Yandex Station with local playback control."""
 
+    STREAM_SOURCE_PREFIX = "Трансляция: "
+
     _attr_has_entity_name = True
     _attr_name = None
 
@@ -95,6 +98,7 @@ class YahomeSpeaker(
         super().__init__(coordinator)
         self._speaker_id = speaker_id
         self._speaker = speaker
+        self._stream_source_name: str | None = None
         self._attr_unique_id = f"speaker_{speaker_id}_media_player"
         if speaker.get("platform") in HDMI_SPEAKER_PLATFORMS:
             self._attr_device_class = MediaPlayerDeviceClass.TV
@@ -371,14 +375,34 @@ class YahomeSpeaker(
 
     @property
     def source_list(self) -> list[str] | None:
-        """Return the available Station audio sources."""
-        if self._speaker.get("platform") not in HDMI_SPEAKER_PLATFORMS:
-            return None
-        return [SPEAKER_SOURCE_STATION, SPEAKER_SOURCE_HDMI]
+        """Return Station, HDMI and external streaming targets."""
+        sources: list[str] = [SPEAKER_SOURCE_STATION]
+        if self._speaker.get("platform") in HDMI_SPEAKER_PLATFORMS:
+            sources.append(SPEAKER_SOURCE_HDMI)
+        for target in self.coordinator.stream_targets(self.entity_id):
+            sources.append(f"{self.STREAM_SOURCE_PREFIX}{target['name']}")
+        return sources or None
 
     @property
     def source(self) -> str | None:
-        """Return the active audio source (Station speakers or HDMI)."""
+        """Return the active audio source, including a stream target."""
+        if self._stream_source_name:
+            return self._stream_source_name
+        for session in self.coordinator.music_streams():
+            if session.get("source_entity_id") not in {
+                self.entity_id,
+                self._speaker.get("entity_id"),
+            }:
+                continue
+            targets = session.get("target_entity_ids") or []
+            if targets:
+                name = self.hass.states.get(targets[0])
+                display = (
+                    name.attributes.get("friendly_name")
+                    if name is not None
+                    else targets[0]
+                )
+                return f"{self.STREAM_SOURCE_PREFIX}{display}"
         if not self.source_list:
             return None
         known = self.coordinator.hdmi_audio_known(self._speaker_id)
@@ -581,12 +605,46 @@ class YahomeSpeaker(
         await self.async_media_pause()
 
     async def async_select_source(self, source: str) -> None:
-        """Switch audio between the Station speakers and HDMI."""
-        if source not in (self.source_list or []):
+        """Switch audio source, including external stream targets."""
+        if source.startswith(self.STREAM_SOURCE_PREFIX):
+            name = source[len(self.STREAM_SOURCE_PREFIX) :]
+            target = next(
+                (
+                    item
+                    for item in self.coordinator.stream_targets(self.entity_id)
+                    if item["name"] == name
+                ),
+                None,
+            )
+            if target is None:
+                raise HomeAssistantError("Stream target not found")
+            await self.coordinator.async_stop_music_stream(
+                source_entity_id=self.entity_id
+            )
+            await self.coordinator.async_start_music_stream(
+                self.entity_id,
+                [target["entity_id"]],
+                sync_volume=True,
+                mute_source=True,
+            )
+            self._stream_source_name = source
+            self._attr_source = source
+            self.async_write_ha_state()
             return
-        await self.coordinator.async_set_speaker_hdmi(
-            self._speaker_id, source == SPEAKER_SOURCE_HDMI
+
+        self._stream_source_name = None
+        self._attr_source = source
+        await self.coordinator.async_stop_music_stream(
+            source_entity_id=self.entity_id
         )
+        if source == SPEAKER_SOURCE_HDMI:
+            await self.coordinator.async_set_speaker_hdmi(
+                self._speaker_id, True
+            )
+        elif source == SPEAKER_SOURCE_STATION:
+            await self.coordinator.async_set_speaker_hdmi(
+                self._speaker_id, False
+            )
         self.async_write_ha_state()
 
     async def async_set_volume_level(self, volume: float) -> None:

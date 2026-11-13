@@ -1,6 +1,6 @@
-import { PANEL_STYLES } from "./yahome-hub-styles.js?v=0.5.1-34";
+import { PANEL_STYLES } from "./yahome-hub-styles.js?v=0.5.2";
 
-const PANEL_BUILD = "0.5.1-34";
+const PANEL_BUILD = "0.5.2";
 
 class YaHomeHubPanel extends HTMLElement {
   constructor() {
@@ -55,6 +55,21 @@ class YaHomeHubPanel extends HTMLElement {
     this._showLyrics = true;
     this._haVideo = null;
     this._settingsOpen = {};
+    this._streamSource = null;
+    this._streamTargets = [];
+    this._streamQuery = "";
+    this._streamSyncMode = "on";
+    this._streamTemplate = "{{ volume_level / 2 }}";
+    this._streamUseProxy = true;
+    this._streamQuality = "high";
+    this._streamCodecs = "mp3";
+    this._streamMuteSource = true;
+    this._streamBidirectional = true;
+    this._panelSource = {};
+    this._streamSessions = [];
+    this._streamSessionsLoaded = false;
+    this._streamSessionsLoading = false;
+    this._streamSessionsError = null;
     this._miniPlayerClosed = false;
     this._miniVideoKey = "";
     this._videoModeKey = "";
@@ -793,34 +808,83 @@ class YaHomeHubPanel extends HTMLElement {
     }
   }
 
+  _panelStreamTargets(excludeEntityId) {
+    return Object.values(this._hass?.states || {})
+      .filter((state) => {
+        if (!state.entity_id.startsWith("media_player.")) return false;
+        if (state.entity_id === excludeEntityId) return false;
+        if (["unavailable", "unknown"].includes(state.state)) return false;
+        return (
+          (Number(state.attributes.supported_features || 0) & 512) === 512
+        );
+      })
+      .map((state) => {
+        const platform = this._hass?.entities?.[state.entity_id]?.platform || "";
+        let name = state.attributes.friendly_name || state.entity_id;
+        if (platform === "cast") {
+          name = `${name} · Cast`;
+        } else if (
+          ["androidtv_remote", "androidtv", "firetv"].includes(platform)
+        ) {
+          name = `${name} · TV`;
+        }
+        return { entity_id: state.entity_id, name };
+      })
+      .sort((left, right) => left.name.localeCompare(right.name, "ru"));
+  }
+
+  _renderPanelSource(speaker, entity) {
+    const attrs = entity.attributes || {};
+    const targets = this._panelStreamTargets(entity.entity_id);
+    if (!targets.length && !(attrs.source_list || []).length) return "";
+    const options = [];
+    for (const item of attrs.source_list || ["Станция"]) {
+      if (!options.includes(item)) options.push(item);
+    }
+    for (const target of targets) {
+      const value = `Трансляция: ${target.name}`;
+      if (!options.includes(value)) options.push(value);
+    }
+    const selected =
+      this._panelSource[entity.entity_id] || attrs.source || options[0];
+    if (selected && !options.includes(selected)) options.push(selected);
+    return `<div class="source-switch wide panel-source" title="Источник звука">
+      <span><ha-icon icon="mdi:cast"></ha-icon> Источник</span>
+      ${options
+        .map((value) => {
+          const stream = value.startsWith("Трансляция: ");
+          const label = stream ? value.slice("Трансляция: ".length) : value;
+          const icon = value === "HDMI"
+            ? "mdi:television-speaker"
+            : stream
+            ? "mdi:cast"
+            : "mdi:speaker";
+          return `<button class="${
+            value === selected ? "active" : ""
+          }" data-source-select="${this._esc(
+            speaker.id
+          )}" data-entity="${this._esc(entity.entity_id)}" data-source="${this._esc(
+            value
+          )}" title="${this._esc(value)}">
+            <ha-icon icon="${icon}"></ha-icon> ${this._esc(label)}
+          </button>`;
+        })
+        .join("")}
+    </div>`;
+  }
+
   _renderSpeakerExtras(speaker, entity) {
     const attrs = entity.attributes || {};
     const hdmiSupported = Boolean(speaker.hdmi_supported);
     const ledSupported = Boolean(speaker.led_supported);
-    if (!hdmiSupported && !ledSupported) return "";
-    const source = attrs.source || "Станция";
+    const panelSource = this._renderPanelSource(speaker, entity);
+    if (!hdmiSupported && !ledSupported && !panelSource) return "";
     const autoEntity = speaker.led_auto_entity
       ? this._hass.states[speaker.led_auto_entity]
       : null;
     const ledAuto = autoEntity ? autoEntity.state === "on" : true;
     return `<div class="speaker-extras">
-      ${
-        hdmiSupported
-          ? `<div class="source-switch" title="Звук колонки">
-              <span>Звук</span>
-              <button class="${source !== "HDMI" ? "active" : ""}" data-source-select="${
-              speaker.id
-            }" data-entity="${this._esc(entity.entity_id)}" data-source="Станция">
-                <ha-icon icon="mdi:speaker"></ha-icon> Станция
-              </button>
-              <button class="${source === "HDMI" ? "active" : ""}" data-source-select="${
-              speaker.id
-            }" data-entity="${this._esc(entity.entity_id)}" data-source="HDMI">
-                <ha-icon icon="mdi:television-speaker"></ha-icon> HDMI
-              </button>
-            </div>`
-          : ""
-      }
+      ${panelSource}
       ${
         ledSupported
           ? `<button class="extra-pill ${ledAuto ? "active" : ""}" data-led-auto="${
@@ -1215,6 +1279,7 @@ class YaHomeHubPanel extends HTMLElement {
     const tabs = [
       ["devices", "Устройства", "mdi:home-automation", data.counts.devices],
       ["speakers", "Колонки", "mdi:speaker", data.counts.speakers],
+      ["stream", "Трансляция", "mdi:cast", null],
       ["hub", "Яндекс хаб", "mdi:home-assistant", null],
     ];
     return `<nav class="tabs">${tabs
@@ -1241,6 +1306,9 @@ class YaHomeHubPanel extends HTMLElement {
     }
     if (this._tab === "hub") {
       return this._renderHub(data);
+    }
+    if (this._tab === "stream") {
+      return this._renderStreamTab(data);
     }
     return `${this._renderMediaOverview()}${this._renderDashboard(devices)}`;
   }
@@ -1510,6 +1578,686 @@ class YaHomeHubPanel extends HTMLElement {
     );
   }
 
+  _streamPlayers() {
+    return Object.values(this._hass?.states || {})
+      .filter((state) => state.entity_id.startsWith("media_player."))
+      .sort((left, right) =>
+        this._streamEntityName(left.entity_id).localeCompare(
+          this._streamEntityName(right.entity_id),
+          "ru"
+        )
+      );
+  }
+
+  _streamSourceEntity() {
+    const players = this._streamPlayers();
+    if (this._streamSource) {
+      const selected = players.find(
+        (state) => state.entity_id === this._streamSource
+      );
+      if (selected) return selected.entity_id;
+    }
+    const speaker = (this._data?.speakers || []).find(
+      (item) => item.entity_id && this._hass.states[item.entity_id]
+    );
+    if (speaker) return speaker.entity_id;
+    return (
+      players.find((state) => state.state !== "unavailable")?.entity_id ||
+      players[0]?.entity_id ||
+      null
+    );
+  }
+
+  _streamTargetEntities() {
+    const source = this._streamSourceEntity();
+    return this._streamPlayers().filter(
+      (state) => state.entity_id !== source
+    );
+  }
+
+  _streamEntityName(entityId) {
+    const state = this._hass?.states?.[entityId];
+    const name =
+      state?.attributes?.friendly_name ||
+      entityId.split(".").slice(1).join(".") ||
+      entityId;
+    const platform = this._hass?.entities?.[entityId]?.platform || "";
+    if (platform === "cast") return `${name} · Cast`;
+    if (["androidtv_remote", "androidtv", "firetv"].includes(platform)) {
+      return `${name} · TV`;
+    }
+    return name;
+  }
+
+  _streamStateLabel(value) {
+    const labels = {
+      playing: "играет",
+      paused: "пауза",
+      idle: "ожидает",
+      off: "выкл",
+      unavailable: "недоступно",
+      unknown: "неизвестно",
+      buffering: "буферизация",
+    };
+    return labels[value] || value;
+  }
+
+  _streamFeatures(state) {
+    return Number(state?.attributes?.supported_features || 0);
+  }
+
+  _streamHas(state, feature) {
+    return (this._streamFeatures(state) & feature) === feature;
+  }
+
+  _renderStreamTab(data) {
+    const source = this._streamSourceEntity();
+    const sourceState = source ? this._hass.states[source] : null;
+    const targets = this._streamTargetEntities();
+    if (!this._streamSessionsLoaded && !this._streamSessionsLoading) {
+      window.setTimeout(() => this._loadStreamSessions(), 0);
+    }
+    const sourceOptions = targets.length || source
+      ? this._streamPlayers()
+          .map(
+            (player) =>
+              `<option value="${this._esc(player.entity_id)}" ${
+                player.entity_id === source ? "selected" : ""
+              }>${this._esc(this._streamEntityName(player.entity_id))} · ${this._esc(
+                this._streamStateLabel(player.state)
+              )}</option>`
+          )
+          .join("")
+      : `<option value="">Нет медиаплееров</option>`;
+    const volume =
+      sourceState && typeof sourceState.attributes.volume_level === "number"
+        ? Math.round(Number(sourceState.attributes.volume_level) * 100)
+        : null;
+    const mediaTitle = sourceState?.attributes?.media_title || "";
+    const mediaArtist = sourceState?.attributes?.media_artist || "";
+    const noMedia =
+      sourceState?.state === "playing" &&
+      !sourceState?.attributes?.media_content_id;
+    const sessionCount = this._streamSessions.length;
+    return `<div class="stream-tab">
+      <div class="stream-hero">
+        <div class="stream-hero-icon"><ha-icon icon="mdi:cast-audio"></ha-icon></div>
+        <div class="stream-hero-copy">
+          <h2>Трансляция музыки</h2>
+          <p>Выберите колонку-источник и устройства, на которые нужно передать текущий трек. Громкость можно синхронизировать или задать шаблоном.</p>
+        </div>
+        <span class="stream-status ${sessionCount ? "active" : ""}" data-stream-status>${sessionCount ? `${sessionCount} активно` : "Готово"}</span>
+      </div>
+      <div class="stream-grid">
+        <div class="section stream-card">
+          <div class="stream-card-head">
+            <h3><ha-icon icon="mdi:speaker-wireless"></ha-icon> Источник</h3>
+            <span class="stream-kicker">Яндекс Станция</span>
+          </div>
+          <label class="stream-field">
+            <span>Колонка</span>
+            <select data-stream-source>${sourceOptions}</select>
+          </label>
+          <div class="stream-source-meta">
+            ${
+              sourceState
+                ? `<span class="stream-state">${this._esc(
+                    this._streamStateLabel(sourceState.state)
+                  )}</span>${
+                    volume !== null
+                      ? `<span class="stream-volume">${volume}%</span>`
+                      : ""
+                  }${
+                    noMedia
+                      ? `<span class="stream-now">Источник не отдаёт текущий трек</span>`
+                      : mediaTitle
+                      ? `<span class="stream-now">${this._esc(
+                          mediaTitle
+                        )}${mediaArtist ? ` · ${this._esc(mediaArtist)}` : ""}</span>`
+                      : `<span class="stream-now">нет активного трека</span>`
+                  }`
+                : `<span class="stream-now">Выберите источник</span>`
+            }
+          </div>
+
+          <div class="stream-param-line">
+            <span>Синхронизация громкости</span>
+            <div class="stream-segmented">
+              <button type="button" data-stream-sync="off" class="${
+                this._streamSyncMode === "off" ? "active" : ""
+              }">Выкл</button>
+              <button type="button" data-stream-sync="on" class="${
+                this._streamSyncMode === "on" ? "active" : ""
+              }">Вкл</button>
+              <button type="button" data-stream-sync="template" class="${
+                this._streamSyncMode === "template" ? "active" : ""
+              }">Шаблон</button>
+            </div>
+          </div>
+          <div class="stream-template-wrap ${
+            this._streamSyncMode === "template" ? "" : "hidden"
+          }" data-stream-template-wrap>
+            <input type="text" data-stream-template value="${this._esc(
+              this._streamTemplate
+            )}" placeholder="{{ volume_level / 2 }}" />
+            <div class="stream-presets">
+              <button type="button" data-stream-template-preset="{{ volume_level }}">100%</button>
+              <button type="button" data-stream-template-preset="{{ volume_level * 0.75 }}">75%</button>
+              <button type="button" data-stream-template-preset="{{ volume_level / 2 }}">50%</button>
+              <button type="button" data-stream-template-preset="{{ volume_level / 3 }}">33%</button>
+            </div>
+            <small>Доступно: volume_level, target_volume, entity_id, media_title.</small>
+          </div>
+
+          <div class="stream-param-line stream-clickable" data-stream-proxy>
+            <span>Прокси Home Assistant</span>
+            <b data-stream-proxy-label>${this._streamUseProxy ? "включён" : "выключен"}</b>
+          </div>
+          <label class="stream-param-line">
+            <span>Качество</span>
+            <select class="stream-quality" data-stream-quality>
+              <option value="high|mp3" ${
+                this._streamQuality === "high" && this._streamCodecs === "mp3"
+                  ? "selected"
+                  : ""
+              }>MP3 320</option>
+              <option value="medium|mp3" ${
+                this._streamQuality === "medium" && this._streamCodecs === "mp3"
+                  ? "selected"
+                  : ""
+              }>MP3 192</option>
+              <option value="low|mp3" ${
+                this._streamQuality === "low" && this._streamCodecs === "mp3"
+                  ? "selected"
+                  : ""
+              }>MP3 128</option>
+              <option value="high|aac" ${
+                this._streamCodecs === "aac" ? "selected" : ""
+              }>AAC 256</option>
+              <option value="high|flac" ${
+                this._streamCodecs === "flac" ? "selected" : ""
+              }>FLAC</option>
+            </select>
+          </label>
+          <div class="stream-param-line stream-clickable" data-stream-mute>
+            <span>Заглушить Станцию</span>
+            <b data-stream-mute-label>${this._streamMuteSource ? "включено" : "выключено"}</b>
+          </div>
+          <div class="stream-param-line stream-clickable" data-stream-bidirectional>
+            <span>Двустороннее управление</span>
+            <b data-stream-bidirectional-label>${this._streamBidirectional ? "включено" : "выключено"}</b>
+          </div>
+          <div class="stream-param-line">
+            <span>Выбрано устройств</span>
+            <b data-stream-count>${this._streamTargets.length}</b>
+          </div>
+        </div>
+
+        <div class="section stream-card">
+          <div class="stream-card-head">
+            <h3><ha-icon icon="mdi:speaker-multiple"></ha-icon> Устройства</h3>
+            <span class="stream-kicker" data-stream-count-label>${this._streamTargets.length} выбрано</span>
+          </div>
+          <div class="stream-search">
+            <ha-icon icon="mdi:magnify"></ha-icon>
+            <input type="search" data-stream-search value="${this._esc(
+              this._streamQuery
+            )}" placeholder="Поиск устройств по имени или entity_id" />
+          </div>
+          <div class="stream-selected" data-stream-selected>${this._renderStreamSelected()}</div>
+          <div class="stream-target-list" data-stream-list>${this._renderStreamTargets()}</div>
+        </div>
+      </div>
+
+      ${this._renderStreamHint()}
+      <div class="stream-actions">
+        <button class="action-btn" data-stream-start>Запустить трансляцию</button>
+        <button class="ghost-btn" data-stream-stop-all>Остановить все</button>
+        <button class="ghost-btn" data-stream-refresh>Обновить сессии</button>
+      </div>
+
+      <div class="section stream-card">
+        <div class="stream-card-head">
+          <h3><ha-icon icon="mdi:playlist-play"></ha-icon> Активные сессии</h3>
+          <span class="stream-kicker">${sessionCount} шт.</span>
+        </div>
+        <div data-stream-sessions>${this._renderStreamSessions()}</div>
+      </div>
+    </div>`;
+  }
+
+  _renderStreamHint() {
+    const hasCast = this._streamTargetEntities().some(
+      (state) => this._hass.entities?.[state.entity_id]?.platform === "cast"
+    );
+    if (hasCast) return "";
+    return `<div class="stream-hint">
+      <ha-icon icon="mdi:cellphone-link"></ha-icon>
+      <div>
+        <b>Карточка управления на телефоне</b>
+        <span>Она появляется автоматически только у Cast-устройств. Добавьте
+        Google Cast в Home Assistant и выберите Cast-колонку. Android TV
+        Remote открывает браузер, а не системную медиа-карточку.</span>
+      </div>
+    </div>`;
+  }
+
+  _renderStreamTargets() {
+    const source = this._streamSourceEntity();
+    const query = this._streamQuery.trim().toLowerCase();
+    const players = this._streamTargetEntities().filter((state) => {
+      if (!query) return true;
+      return `${this._streamEntityName(state.entity_id)} ${state.entity_id}`
+        .toLowerCase()
+        .includes(query);
+    });
+    if (!source) {
+      return `<div class="stream-empty">Сначала выберите источник.</div>`;
+    }
+    if (!players.length) {
+      return `<div class="stream-empty">Устройства не найдены. Измените запрос.</div>`;
+    }
+    return players
+      .map((state) => {
+        const id = state.entity_id;
+        const selected = this._streamTargets.includes(id);
+        const supportsUrl = this._streamHas(state, 512);
+        const supportsVolume = this._streamHas(state, 4);
+        const unavailable = ["unavailable", "unknown"].includes(state.state);
+        const disabled = unavailable || !supportsUrl;
+        const name = this._streamEntityName(id);
+        const platform = this._hass.entities?.[id]?.platform || "";
+        const tvTarget = ["androidtv_remote", "androidtv", "firetv"].includes(
+          platform
+        );
+        const castTarget = platform === "cast";
+        const lower = `${id} ${name}`.toLowerCase();
+        const icon = /tv|телевиз|пристав/.test(lower)
+          ? "mdi:television"
+          : /sonos|speaker|колон|акуст/.test(lower)
+          ? "mdi:speaker"
+          : "mdi:cast";
+        const volume =
+          typeof state.attributes.volume_level === "number"
+            ? `${Math.round(Number(state.attributes.volume_level) * 100)}%`
+            : "";
+        return `<button type="button" class="stream-target ${
+          selected ? "selected" : ""
+        } ${disabled ? "disabled" : ""}" data-stream-target="${this._esc(
+          id
+        )}" data-stream-disabled="${disabled ? "1" : "0"}" aria-pressed="${selected}" title="${
+          tvTarget
+            ? "Android TV откроет ссылку в приложении; фоновое аудио не гарантируется"
+            : ""
+        }">
+          <span class="stream-device-icon"><ha-icon icon="${icon}"></ha-icon></span>
+          <span class="stream-device-copy">
+            <b>${this._esc(name)}</b>
+            <small>${this._esc(id)} · ${this._esc(
+              this._streamStateLabel(state.state)
+            )}${volume ? ` · ${volume}` : ""}</small>
+          </span>
+          <span class="stream-device-badges">
+            ${
+              supportsUrl
+                ? `<i>${tvTarget ? "TV" : castTarget ? "CAST" : "URL"}</i>`
+                : `<i class="off">NO URL</i>`
+            }
+            ${supportsVolume ? `<i>VOL</i>` : ""}
+          </span>
+          <span class="stream-check"><ha-icon icon="${
+            selected ? "mdi:check-circle" : "mdi:circle-outline"
+          }"></ha-icon></span>
+        </button>`;
+      })
+      .join("");
+  }
+
+  _renderStreamSelected() {
+    if (!this._streamTargets.length) {
+      return `<span class="stream-muted">Получатели не выбраны</span>`;
+    }
+    return this._streamTargets
+      .map(
+        (id) => `<button type="button" class="stream-chip" data-stream-unselect="${this._esc(
+          id
+        )}">${this._esc(this._streamEntityName(id))}<ha-icon icon="mdi:close"></ha-icon></button>`
+      )
+      .join("");
+  }
+
+  _renderStreamSessions() {
+    if (this._streamSessionsError) {
+      return `<div class="stream-empty error">${this._esc(
+        this._streamSessionsError
+      )}</div>`;
+    }
+    if (this._streamSessionsLoading && !this._streamSessions.length) {
+      return `<div class="stream-empty">Загружаю сессии…</div>`;
+    }
+    if (!this._streamSessions.length) {
+      return `<div class="stream-empty">Активных сессий нет. Выберите устройства и запустите трансляцию.</div>`;
+    }
+    return this._streamSessions
+      .map((session) => {
+        const sourceName = this._streamEntityName(
+          session.source_entity_id
+        );
+        const targets = (session.target_entity_ids || []).map((id) =>
+          this._streamEntityName(id)
+        );
+        const sync =
+          session.sync_volume === false
+            ? "выкл"
+            : session.sync_volume === true
+            ? "вкл"
+            : `шаблон: ${session.sync_volume}`;
+        return `<div class="stream-session">
+          <div class="stream-session-head">
+            <div><b>${this._esc(sourceName)}</b><small>${this._esc(
+              session.session_id
+            )}</small></div>
+            <button class="ghost-btn danger" data-stream-stop="${this._esc(
+              session.session_id
+            )}">Стоп</button>
+          </div>
+          <div class="stream-session-targets">${targets
+            .map((name) => `<span>${this._esc(name)}</span>`)
+            .join("")}</div>
+          <div class="stream-session-meta">Громкость: ${this._esc(
+            sync
+          )} · Прокси: ${session.use_proxy ? "вкл" : "выкл"} · ${
+            session.codecs || "mp3"
+          }</div>
+        </div>`;
+      })
+      .join("");
+  }
+
+  async _loadStreamSessions() {
+    if (!this._hass || this._streamSessionsLoading) return;
+    this._streamSessionsLoading = true;
+    try {
+      const result = await this._hass.callWS({
+        type: "yahome_hub/streams",
+      });
+      this._streamSessions = result.streams || [];
+      this._streamSessionsLoaded = true;
+      this._streamSessionsError = null;
+    } catch (err) {
+      this._streamSessionsLoaded = true;
+      this._streamSessionsError = this._message(err);
+    } finally {
+      this._streamSessionsLoading = false;
+      this._renderStreamSessions();
+      this._updateStreamStatus();
+    }
+  }
+
+  _updateStreamStatus() {
+    const root = this.shadowRoot;
+    if (!root) return;
+    const status = root.querySelector("[data-stream-status]");
+    if (status) {
+      const count = this._streamSessions.length;
+      status.textContent = count ? `${count} активно` : "Готово";
+      status.classList.toggle("active", count > 0);
+    }
+    const count = root.querySelector("[data-stream-count]");
+    if (count) count.textContent = String(this._streamTargets.length);
+    const label = root.querySelector("[data-stream-count-label]");
+    if (label) label.textContent = `${this._streamTargets.length} выбрано`;
+    const start = root.querySelector("[data-stream-start]");
+    if (start) {
+      const sourceState = this._hass.states[this._streamSourceEntity()];
+      const noMedia =
+        sourceState?.state === "playing" &&
+        !sourceState?.attributes?.media_content_id;
+      start.disabled =
+        !this._streamSourceEntity() ||
+        !this._streamTargets.length ||
+        Boolean(noMedia);
+    }
+  }
+
+  _applyStreamParamsDom() {
+    const root = this.shadowRoot;
+    if (!root) return;
+    root.querySelectorAll("[data-stream-sync]").forEach((button) => {
+      button.classList.toggle(
+        "active",
+        button.getAttribute("data-stream-sync") === this._streamSyncMode
+      );
+    });
+    const wrap = root.querySelector("[data-stream-template-wrap]");
+    if (wrap) wrap.classList.toggle("hidden", this._streamSyncMode !== "template");
+    const proxy = root.querySelector("[data-stream-proxy-label]");
+    if (proxy) proxy.textContent = this._streamUseProxy ? "включён" : "выключен";
+    const mute = root.querySelector("[data-stream-mute-label]");
+    if (mute) mute.textContent = this._streamMuteSource ? "включено" : "выключено";
+    const bidirectional = root.querySelector(
+      "[data-stream-bidirectional-label]"
+    );
+    if (bidirectional) {
+      bidirectional.textContent = this._streamBidirectional
+        ? "включено"
+        : "выключено";
+    }
+    const quality = root.querySelector("[data-stream-quality]");
+    if (quality) {
+      const value = `${this._streamQuality}|${this._streamCodecs}`;
+      if (quality.value !== value) quality.value = value;
+    }
+    const input = root.querySelector("[data-stream-template]");
+    if (input && input.value !== this._streamTemplate) {
+      input.value = this._streamTemplate;
+    }
+  }
+
+  async _startStream() {
+    if (!this._hass) return;
+    const source = this._streamSourceEntity();
+    if (!source) {
+      this._showToast("Выберите источник");
+      return;
+    }
+    if (!this._streamTargets.length) {
+      this._showToast("Выберите хотя бы одно устройство");
+      return;
+    }
+    const sync =
+      this._streamSyncMode === "off"
+        ? false
+        : this._streamSyncMode === "on"
+        ? true
+        : this._streamTemplate.trim() || "{{ volume_level }}";
+    const button = this.shadowRoot?.querySelector("[data-stream-start]");
+    if (button) {
+      button.disabled = true;
+      button.textContent = "Запускаю…";
+    }
+    try {
+      await this._hass.callService("yahome_hub", "stream_music", {
+        source_entity_id: source,
+        target_entity_ids: [...this._streamTargets],
+        sync_volume: sync,
+        use_proxy: this._streamUseProxy,
+        quality: this._streamQuality,
+        codecs: this._streamCodecs,
+        mute_source: this._streamMuteSource,
+        bidirectional: this._streamBidirectional,
+      });
+      this._showToast("Трансляция запущена");
+      await this._loadStreamSessions(true);
+    } catch (err) {
+      this._showToast("Ошибка трансляции: " + this._message(err));
+    } finally {
+      if (button) {
+        button.disabled = false;
+        button.textContent = "Запустить трансляцию";
+      }
+      this._updateStreamStatus();
+    }
+  }
+
+  async _stopStream(sessionId) {
+    if (!this._hass) return;
+    try {
+      await this._hass.callService("yahome_hub", "stop_stream_music", {
+        session_id: sessionId,
+      });
+      this._showToast("Трансляция остановлена");
+      await this._loadStreamSessions(true);
+    } catch (err) {
+      this._showToast("Ошибка: " + this._message(err));
+    }
+  }
+
+  async _stopAllStreams() {
+    if (!this._hass) return;
+    try {
+      await this._hass.callService("yahome_hub", "stop_stream_music", {});
+      this._showToast("Все трансляции остановлены");
+      await this._loadStreamSessions(true);
+    } catch (err) {
+      this._showToast("Ошибка: " + this._message(err));
+    }
+  }
+
+  _attachStreamEvents() {
+    const root = this.shadowRoot;
+    if (!root) return;
+    const source = root.querySelector("[data-stream-source]");
+    if (source) {
+      source.addEventListener("change", () => {
+        this._streamSource = source.value;
+        this._streamTargets = this._streamTargets.filter(
+          (id) => id !== source.value
+        );
+        const list = root.querySelector("[data-stream-list]");
+        if (list) list.innerHTML = this._renderStreamTargets();
+        const selected = root.querySelector("[data-stream-selected]");
+        if (selected) selected.innerHTML = this._renderStreamSelected();
+        this._updateStreamStatus();
+      });
+    }
+    const search = root.querySelector("[data-stream-search]");
+    if (search) {
+      search.addEventListener("input", () => {
+        this._streamQuery = search.value;
+        const list = root.querySelector("[data-stream-list]");
+        if (list) list.innerHTML = this._renderStreamTargets();
+      });
+    }
+    const list = root.querySelector("[data-stream-list]");
+    if (list) {
+      list.addEventListener("click", (event) => {
+        const card = event.target.closest("[data-stream-target]");
+        if (!card) return;
+        if (card.getAttribute("data-stream-disabled") === "1") {
+          this._showToast("Устройство недоступно или не принимает URL");
+          return;
+        }
+        const id = card.getAttribute("data-stream-target");
+        if (this._streamTargets.includes(id)) {
+          this._streamTargets = this._streamTargets.filter(
+            (item) => item !== id
+          );
+        } else {
+          this._streamTargets.push(id);
+        }
+        list.innerHTML = this._renderStreamTargets();
+        const selected = root.querySelector("[data-stream-selected]");
+        if (selected) selected.innerHTML = this._renderStreamSelected();
+        this._updateStreamStatus();
+      });
+    }
+    const selected = root.querySelector("[data-stream-selected]");
+    if (selected) {
+      selected.addEventListener("click", (event) => {
+        const chip = event.target.closest("[data-stream-unselect]");
+        if (!chip) return;
+        const id = chip.getAttribute("data-stream-unselect");
+        this._streamTargets = this._streamTargets.filter(
+          (item) => item !== id
+        );
+        const list = root.querySelector("[data-stream-list]");
+        if (list) list.innerHTML = this._renderStreamTargets();
+        selected.innerHTML = this._renderStreamSelected();
+        this._updateStreamStatus();
+      });
+    }
+    const sessions = root.querySelector("[data-stream-sessions]");
+    if (sessions) {
+      sessions.addEventListener("click", (event) => {
+        const stop = event.target.closest("[data-stream-stop]");
+        if (stop) this._stopStream(stop.getAttribute("data-stream-stop"));
+      });
+    }
+    root.querySelectorAll("[data-stream-sync]").forEach((button) => {
+      button.addEventListener("click", () => {
+        this._streamSyncMode = button.getAttribute("data-stream-sync");
+        this._applyStreamParamsDom();
+      });
+    });
+    root.querySelectorAll("[data-stream-template-preset]").forEach((button) => {
+      button.addEventListener("click", () => {
+        this._streamTemplate = button.getAttribute(
+          "data-stream-template-preset"
+        );
+        this._streamSyncMode = "template";
+        this._applyStreamParamsDom();
+      });
+    });
+    const template = root.querySelector("[data-stream-template]");
+    if (template) {
+      template.addEventListener("input", () => {
+        this._streamTemplate = template.value;
+      });
+    }
+    const proxy = root.querySelector("[data-stream-proxy]");
+    if (proxy) {
+      proxy.addEventListener("click", () => {
+        this._streamUseProxy = !this._streamUseProxy;
+        this._applyStreamParamsDom();
+      });
+    }
+    const mute = root.querySelector("[data-stream-mute]");
+    if (mute) {
+      mute.addEventListener("click", () => {
+        this._streamMuteSource = !this._streamMuteSource;
+        this._applyStreamParamsDom();
+      });
+    }
+    const bidirectional = root.querySelector("[data-stream-bidirectional]");
+    if (bidirectional) {
+      bidirectional.addEventListener("click", () => {
+        this._streamBidirectional = !this._streamBidirectional;
+        this._applyStreamParamsDom();
+      });
+    }
+    const quality = root.querySelector("[data-stream-quality]");
+    if (quality) {
+      quality.addEventListener("change", () => {
+        const [q, c] = quality.value.split("|");
+        this._streamQuality = q;
+        this._streamCodecs = c;
+        this._applyStreamParamsDom();
+      });
+    }
+    const start = root.querySelector("[data-stream-start]");
+    if (start) start.addEventListener("click", () => this._startStream());
+    const stopAll = root.querySelector("[data-stream-stop-all]");
+    if (stopAll) {
+      stopAll.addEventListener("click", () => this._stopAllStreams());
+    }
+    const refresh = root.querySelector("[data-stream-refresh]");
+    if (refresh) {
+      refresh.addEventListener("click", () => this._loadStreamSessions(true));
+    }
+    this._updateStreamStatus();
+  }
+
   _renderHeader(counts) {
     return `
       <header class="top">
@@ -1519,7 +2267,7 @@ class YaHomeHubPanel extends HTMLElement {
           </div>
           <div>
             <h1>YaHome Hub</h1>
-            <p>Все устройства и датчики Яндекса в одном месте <span class="build-badge" title="Тестовая сборка">v${PANEL_BUILD} · тест</span></p>
+            <p>Все устройства и датчики Яндекса в одном месте <span class="build-badge">v${PANEL_BUILD}</span></p>
           </div>
         </div>
         <div class="top-actions">
@@ -3482,20 +4230,10 @@ class YaHomeHubPanel extends HTMLElement {
   }
 
   _renderSourceButtons(speaker, entityId) {
-    const entity = this._hass.states[entityId];
-    const source = entity?.attributes?.source || "Станция";
-    return `<div class="source-switch wide">
-      <button class="${source !== "HDMI" ? "active" : ""}" data-source-select="${
-      speaker.id
-    }" data-entity="${this._esc(entityId)}" data-source="Станция">
-        <ha-icon icon="mdi:speaker"></ha-icon> Станция
-      </button>
-      <button class="${source === "HDMI" ? "active" : ""}" data-source-select="${
-      speaker.id
-    }" data-entity="${this._esc(entityId)}" data-source="HDMI">
-        <ha-icon icon="mdi:television-speaker"></ha-icon> HDMI
-      </button>
-    </div>`;
+    return this._renderPanelSource(
+      speaker,
+      this._hass.states[entityId] || { entity_id: entityId, attributes: {} }
+    );
   }
 
   _renderSpeakerControlsCard(speaker) {
@@ -3581,15 +4319,6 @@ class YaHomeHubPanel extends HTMLElement {
                 <button class="action-btn" data-led-apply="${this._esc(
                   speaker.id
                 )}" data-entity="${this._esc(entityId)}">Применить</button>
-              </div>`
-            : ""
-        }
-        ${
-          speaker.hdmi_supported
-            ? `<div class="control-block">
-                <h4>Звук HDMI</h4>
-                <p class="muted">Выведите звук видео на телевизор. Музыка и голос Алисы останутся на колонке.</p>
-                ${this._renderSourceButtons(speaker, entityId)}
               </div>`
             : ""
         }
@@ -5801,6 +6530,7 @@ class YaHomeHubPanel extends HTMLElement {
   _attachEvents() {
     const root = this.shadowRoot;
     if (!root) return;
+    this._attachStreamEvents();
     root.addEventListener("click", (event) => this._onVideoAction(event));
     root.addEventListener("keydown", (event) => {
       if (event.key !== "Enter") return;
@@ -6307,7 +7037,11 @@ class YaHomeHubPanel extends HTMLElement {
               item.classList.toggle("active", item === el)
             );
           this._showToast(
-            source === "HDMI" ? "Звук переключён на HDMI" : "Звук на колонке"
+            source.startsWith("Трансляция:")
+              ? "Трансляция запущена"
+              : source === "HDMI"
+              ? "Звук переключён на HDMI"
+              : "Звук на колонке"
           );
         } catch (err) {
           this._showToast("Ошибка HDMI: " + this._message(err));

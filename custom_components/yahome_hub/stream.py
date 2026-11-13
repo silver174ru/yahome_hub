@@ -26,7 +26,7 @@ from homeassistant.helpers.template import Template, TemplateError
 
 from .const import CONF_MUSIC_TOKEN
 from .music import MusicStreamError, async_get_track_stream
-from .stream_proxy import async_get_registry
+from .stream_proxy import async_get_registry, get_ext
 
 if TYPE_CHECKING:
     from .coordinator import YahomeDataUpdateCoordinator
@@ -46,6 +46,15 @@ class StreamSession:
     sync_volume: bool | Template
     use_proxy: bool
     stop_targets: bool
+    quality: str = "high"
+    codecs: str = "mp3"
+    media_content_type: str | None = None
+    mute_source: bool = True
+    bidirectional: bool = True
+    source_volume: float | None = None
+    hass: HomeAssistant | None = None
+    source_muted: bool = False
+    alice_unmuted: bool = False
     context: Context | None = None
     unsub: Callable[[], None] | None = None
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
@@ -76,13 +85,46 @@ class StreamSession:
             "target_entity_ids": list(self.target_entity_ids),
             "sync_volume": sync,
             "use_proxy": self.use_proxy,
+            "quality": self.quality,
+            "codecs": self.codecs,
+            "media_content_type": self.media_content_type,
+            "mute_source": self.mute_source,
+            "bidirectional": self.bidirectional,
             "last_track": self.last_track_key[0] if self.last_track_key else None,
             "last_state": self.last_source_state,
+            "title": self.last_play_title,
+            "artist": self.last_play_artist,
+            "cover": self.last_play_cover,
+            "position": self.last_play_position,
+            "targets": [
+                {
+                    "entity_id": target,
+                    "state": (
+                        self.hass.states.get(target).state
+                        if self.hass and self.hass.states.get(target)
+                        else None
+                    ),
+                }
+                for target in self.target_entity_ids
+            ],
         }
 
 
 class MusicStreamManager:
     """Manage persistent source-to-target playback sessions."""
+
+    BIDIRECTIONAL_SERVICES = {
+        "media_play",
+        "media_pause",
+        "media_stop",
+        "media_next_track",
+        "media_previous_track",
+        "media_seek",
+        "volume_set",
+        "volume_mute",
+        "turn_on",
+        "turn_off",
+    }
 
     def __init__(self, coordinator: "YahomeDataUpdateCoordinator") -> None:
         self.coordinator = coordinator
@@ -90,6 +132,9 @@ class MusicStreamManager:
         self.sessions: dict[str, StreamSession] = {}
         self.target_owner: dict[str, str] = {}
         self.proxy = async_get_registry(self.hass)
+        self._bus_unsub = self.hass.bus.async_listen(
+            "call_service", self._async_service_event
+        )
 
     async def async_start(
         self,
@@ -100,6 +145,11 @@ class MusicStreamManager:
         use_proxy: bool = True,
         start: bool = True,
         stop_targets: bool = True,
+        quality: str = "high",
+        codecs: str = "mp3",
+        media_content_type: str | None = None,
+        mute_source: bool = True,
+        bidirectional: bool = True,
         context: Context | None = None,
     ) -> dict[str, Any]:
         """Create or replace a mirroring session."""
@@ -110,6 +160,16 @@ class MusicStreamManager:
         if not targets:
             raise ServiceValidationError(
                 "At least one target different from the source is required"
+            )
+        source_state = self.hass.states.get(source_entity_id)
+        if (
+            source_state is not None
+            and source_state.state == STATE_PLAYING
+            and not source_state.attributes.get("media_content_id")
+        ):
+            raise ServiceValidationError(
+                "Источник не отдаёт текущий трек (media_content_id). "
+                "Выберите Яндекс Станцию или другой источник с метаданными."
             )
 
         if isinstance(sync_volume, str):
@@ -145,12 +205,28 @@ class MusicStreamManager:
             sync_volume=sync_volume,
             use_proxy=use_proxy,
             stop_targets=stop_targets,
-            context=context,
+            quality=quality,
+            codecs=codecs,
+            media_content_type=media_content_type,
+            mute_source=mute_source,
+            bidirectional=bidirectional,
+            source_volume=(
+                source_state.attributes.get("volume_level")
+                if source_state is not None
+                and isinstance(source_state.attributes.get("volume_level"), (int, float))
+                else None
+            ),
+            hass=self.hass,
+            context=Context(),
         )
+        @callback
+        def _source_listener(event: Event) -> None:
+            self._async_source_event(session, event)
+
         session.unsub = async_track_state_change_event(
             self.hass,
             [source_entity_id],
-            lambda event: self._async_source_event(session, event),
+            _source_listener,
         )
         self.sessions[session.session_id] = session
         for target in targets:
@@ -206,6 +282,7 @@ class MusicStreamManager:
             self.sessions.pop(session.session_id, None)
             if stop_playback:
                 await self._async_stop_targets(session)
+            await self._async_unmute_source(session)
             _LOGGER.info("Music stream %s stopped", session.session_id)
         return len(matched)
 
@@ -217,10 +294,79 @@ class MusicStreamManager:
             )
         except (asyncio.TimeoutError, HomeAssistantError):
             _LOGGER.debug("Music stream shutdown timed out", exc_info=True)
+        if self._bus_unsub is not None:
+            self._bus_unsub()
+            self._bus_unsub = None
 
     def snapshot(self) -> list[dict[str, Any]]:
         """Return active sessions for diagnostics."""
         return [session.snapshot() for session in self.sessions.values()]
+
+    @callback
+    def _async_service_event(self, event: Event) -> None:
+        """Forward user controls from an external target back to the source."""
+        data = event.data or {}
+        if data.get("domain") != "media_player":
+            return
+        service = str(data.get("service") or "")
+        if service not in self.BIDIRECTIONAL_SERVICES:
+            return
+        service_data = data.get("service_data") or {}
+        raw_targets = service_data.get("entity_id") or []
+        if isinstance(raw_targets, str):
+            raw_targets = [raw_targets]
+        if not isinstance(raw_targets, list):
+            return
+        for target in raw_targets:
+            session_id = self.target_owner.get(str(target))
+            if not session_id:
+                continue
+            session = self.sessions.get(session_id)
+            if session is None or session.closed or not session.bidirectional:
+                continue
+            if event.context and session.context:
+                if event.context.id == session.context.id:
+                    continue
+                if event.context.parent_id == session.context.id:
+                    continue
+            self.hass.async_create_task(
+                self._async_forward_control(
+                    session, service, dict(service_data), event.context
+                )
+            )
+
+    async def _async_forward_control(
+        self,
+        session: StreamSession,
+        service: str,
+        data: dict[str, Any],
+        context: Context | None,
+    ) -> None:
+        """Send one external control command to the source."""
+        data.pop("entity_id", None)
+        data["entity_id"] = session.source_entity_id
+        try:
+            await self.hass.services.async_call(
+                "media_player",
+                service,
+                data,
+                blocking=False,
+                context=Context(
+                    parent_id=context.id if context else None
+                ),
+            )
+            _LOGGER.debug(
+                "Music stream %s: forwarded %s from target",
+                session.session_id,
+                service,
+            )
+        except Exception as err:  # noqa: BLE001
+            _LOGGER.debug(
+                "Music stream %s: control %s failed: %s",
+                session.session_id,
+                service,
+                err,
+            )
 
     @callback
     def _async_source_event(
@@ -277,6 +423,15 @@ class MusicStreamManager:
             return
         attrs = state.attributes
         source_state = state.state
+
+        if session.mute_source and session.source_muted:
+            alice = str(attrs.get("alice_state") or "").upper()
+            if alice and alice != "IDLE" and not session.alice_unmuted:
+                session.alice_unmuted = True
+                await self._async_unmute_source(session)
+            elif alice == "IDLE" and session.alice_unmuted:
+                session.alice_unmuted = False
+                await self._async_mute_source(session, state)
 
         if source_state == STATE_PLAYING:
             content_id = str(attrs.get("media_content_id") or "")
@@ -399,6 +554,11 @@ class MusicStreamManager:
                     target,
                     result,
                 )
+        if any(
+            result is True and self._is_audio_target(target)
+            for target, result in zip(session.target_entity_ids, results)
+        ):
+            await self._async_mute_source(session, state)
         return True
 
     async def _async_stream_url(
@@ -410,7 +570,12 @@ class MusicStreamManager:
     ) -> str:
         """Return a stable proxy URL or the original direct URL."""
         if content_id.startswith(("http://", "https://")):
-            return content_id
+            if not session.use_proxy:
+                return content_id
+            ext = get_ext(content_id) or "mp3"
+            token = self.proxy.create_url(content_id, ext, title)
+            session.proxy_tokens.add(token)
+            return self.proxy.url(token)
         if track_id is None:
             raise MusicStreamError("Unsupported Yandex Music content")
         music_token = self.coordinator.entry.data.get(CONF_MUSIC_TOKEN)
@@ -418,14 +583,38 @@ class MusicStreamManager:
             raise MusicStreamError("Yandex Music token is not configured")
         if not session.use_proxy:
             info = await async_get_track_stream(
-                self.coordinator._session, track_id, music_token
+                self.coordinator._session,
+                track_id,
+                music_token,
+                quality=session.quality,
+                codecs=session.codecs,
             )
             return info.url
 
         for token in session.proxy_tokens:
             self.proxy.remove(token)
         session.proxy_tokens.clear()
-        token = self.proxy.create(track_id, music_token, title)
+        ext = {"aac": "aac", "flac": "flac"}.get(session.codecs, "mp3")
+        if session.codecs != "mp3":
+            try:
+                info = await async_get_track_stream(
+                    self.coordinator._session,
+                    track_id,
+                    music_token,
+                    quality=session.quality,
+                    codecs=session.codecs,
+                )
+                ext = info.ext
+            except MusicStreamError:
+                ext = "mp3"
+        token = self.proxy.create(
+            track_id,
+            music_token,
+            title,
+            ext=ext,
+            quality=session.quality,
+            codecs=session.codecs,
+        )
         session.proxy_tokens.add(token)
         return self.proxy.url(token)
 
@@ -439,11 +628,11 @@ class MusicStreamManager:
         artist: str,
         cover: str,
         position: float,
-    ) -> None:
+    ) -> bool:
         """Send one play_media command."""
         state = self.hass.states.get(target)
         if state is None or state.state in (STATE_UNAVAILABLE, STATE_UNKNOWN):
-            return
+            return False
         features = self._features(state)
         if not features & MediaPlayerEntityFeature.PLAY_MEDIA:
             if target not in session.warned_targets:
@@ -453,15 +642,27 @@ class MusicStreamManager:
                     session.session_id,
                     target,
                 )
-            return
+            return False
 
+        platform = self._platform(target)
         yandex_target = self._is_yandex_target(target)
         if yandex_target and track_id is not None:
             media_id = track_id.split(":", 1)[0]
             media_type = "music"
         else:
             media_id = url
-            media_type = self._media_content_type(target)
+            if session.media_content_type:
+                media_type = session.media_content_type
+            elif platform == "cast":
+                media_type = (
+                    "application/vnd.apple.mpegurl"
+                    if str(url).endswith(".m3u8")
+                    else "audio/mpeg"
+                )
+            elif platform in {"heos", "androidtv_remote", "androidtv", "firetv"}:
+                media_type = "url"
+            else:
+                media_type = "music"
 
         extra: dict[str, Any] = {}
         if title:
@@ -479,6 +680,22 @@ class MusicStreamManager:
             if cover:
                 metadata["images"] = [{"url": cover}]
             extra["metadata"] = metadata
+        if platform == "cast":
+            extra["stream_type"] = "BUFFERED"
+
+        if platform in {"apple_tv", "airplay"}:
+            try:
+                await self.hass.services.async_call(
+                    "media_player",
+                    "media_stop",
+                    {},
+                    target={"entity_id": target},
+                    blocking=True,
+                    context=session.context,
+                )
+                await asyncio.sleep(1)
+            except Exception:  # noqa: BLE001
+                pass
 
         await self.hass.services.async_call(
             "media_player",
@@ -496,6 +713,7 @@ class MusicStreamManager:
             self.hass.async_create_task(
                 self._async_align_target(session, target, position)
             )
+        return True
 
     async def _async_resume_targets(self, session: StreamSession) -> None:
         """Resume targets that are paused; replay idle targets."""
@@ -555,6 +773,68 @@ class MusicStreamManager:
                     session, target, "media_pause", {}
                 )
 
+    async def _async_mute_source(
+        self, session: StreamSession, state: State
+    ) -> None:
+        """Mute the source speaker while external targets are playing."""
+        if not session.mute_source or session.source_muted:
+            return
+        volume = state.attributes.get("volume_level")
+        if isinstance(volume, (int, float)) and volume > 0:
+            session.source_volume = float(volume)
+        try:
+            await self.hass.services.async_call(
+                "media_player",
+                "volume_mute",
+                {"is_volume_muted": True},
+                target={"entity_id": session.source_entity_id},
+                blocking=True,
+                context=session.context,
+            )
+            session.source_muted = True
+        except Exception as err:  # noqa: BLE001
+            _LOGGER.debug(
+                "Music stream %s: cannot mute source: %s",
+                session.session_id,
+                err,
+            )
+
+    async def _async_unmute_source(self, session: StreamSession) -> None:
+        """Restore the source speaker volume."""
+        if not session.source_muted:
+            return
+        volume = session.source_volume
+        if volume is None:
+            volume = 0.5
+        try:
+            if volume <= 0:
+                await self.hass.services.async_call(
+                    "media_player",
+                    "volume_mute",
+                    {"is_volume_muted": False},
+                    target={"entity_id": session.source_entity_id},
+                    blocking=True,
+                    context=session.context,
+                )
+            else:
+                await self.hass.services.async_call(
+                    "media_player",
+                    "volume_set",
+                    {"volume_level": max(0.0, min(1.0, float(volume)))},
+                    target={"entity_id": session.source_entity_id},
+                    blocking=True,
+                    context=session.context,
+                )
+        except Exception as err:  # noqa: BLE001
+            _LOGGER.debug(
+                "Music stream %s: cannot unmute source: %s",
+                session.session_id,
+                err,
+            )
+        finally:
+            session.source_muted = False
+            session.alice_unmuted = False
+
     async def _async_sync_volume(
         self,
         session: StreamSession,
@@ -565,7 +845,17 @@ class MusicStreamManager:
         """Apply sync_volume true or a Jinja mapping to every target."""
         if session.sync_volume is False:
             return
-        source_volume = state.attributes.get("volume_level")
+        raw_volume = state.attributes.get("volume_level")
+        if session.source_muted:
+            source_volume = session.source_volume
+        else:
+            if isinstance(raw_volume, (int, float)) and raw_volume > 0:
+                session.source_volume = float(raw_volume)
+            source_volume = (
+                float(raw_volume)
+                if isinstance(raw_volume, (int, float))
+                else session.source_volume
+            )
         if not isinstance(source_volume, (int, float)):
             return
         source_volume = max(0.0, min(1.0, float(source_volume)))
@@ -733,14 +1023,28 @@ class MusicStreamManager:
         entry = registry.async_get(target)
         return bool(entry and entry.platform in YANDEX_TARGET_PLATFORMS)
 
-    def _media_content_type(self, target: str) -> str:
-        """Pick the most compatible type for the target platform."""
+    def _platform(self, target: str) -> str:
+        """Return the integration platform for a target."""
         registry = er.async_get(self.hass)
         entry = registry.async_get(target)
-        platform = entry.platform if entry else ""
+        return entry.platform if entry else ""
+
+    def _is_audio_target(self, target: str) -> bool:
+        """Return False for TV-box targets that only launch a URL."""
+        return self._platform(target) not in {
+            "androidtv_remote",
+            "androidtv",
+            "firetv",
+        }
+
+    def _media_content_type(self, target: str) -> str:
+        """Pick the most compatible type for the target platform."""
+        platform = self._platform(target)
         if platform == "cast":
             return "audio/mpeg"
         if platform == "heos":
+            return "url"
+        if platform in {"androidtv_remote", "androidtv", "firetv"}:
             return "url"
         return "music"
 

@@ -179,6 +179,48 @@ stream_music:
       default: true
       selector:
         boolean:
+    quality:
+      name: Качество
+      description: high (lossless), medium (nq) или low (lq).
+      required: false
+      default: high
+      selector:
+        select:
+          options:
+            - high
+            - medium
+            - low
+    codecs:
+      name: Кодек
+      description: MP3, AAC или FLAC.
+      required: false
+      default: mp3
+      selector:
+        select:
+          options:
+            - mp3
+            - aac
+            - flac
+    media_content_type:
+      name: Тип media_content_type
+      description: Переопределить тип для нестандартного получателя.
+      required: false
+      selector:
+        text:
+    mute_source:
+      name: Заглушить Станцию
+      description: Выключать звук источника, пока играет внешняя колонка.
+      required: false
+      default: true
+      selector:
+        boolean:
+    bidirectional:
+      name: Двустороннее управление
+      description: Передавать play/pause/next/volume с внешней колонки обратно на источник.
+      required: false
+      default: true
+      selector:
+        boolean:
 
 stop_stream_music:
   name: Остановить трансляцию музыки

@@ -36,6 +36,7 @@ class MusicStreamInfo:
     content_type: str
     expires_at: float
     track_id: str
+    ext: str = "mp3"
 
 
 def _sign(*parts: Any) -> str:
@@ -247,14 +248,90 @@ async def async_search_tracks(
     ]
 
 
+def _file_sign(*parts: Any) -> str:
+    """Build the signature required by /get-file-info (no base64 padding)."""
+    message = "".join(str(part) for part in parts).replace(",", "").encode()
+    digest = hmac.new(SIGN_KEY, message, hashlib.sha256).digest()
+    return base64.b64encode(digest).decode().rstrip("=")
+
+
+async def _async_file_info(
+    session: ClientSession,
+    track_id: str,
+    music_token: str,
+    quality: str,
+    codecs: str,
+    timeout: float,
+) -> MusicStreamInfo:
+    """Resolve a track through the signed /get-file-info endpoint."""
+    timestamp = int(time.time())
+    params = {
+        "ts": timestamp,
+        "trackId": track_id,
+        "quality": quality,
+        "codecs": codecs,
+        "transports": "raw",
+    }
+    params["sign"] = _file_sign(*params.values())
+    try:
+        async with session.get(
+            f"{MUSIC_API}/get-file-info",
+            params=params,
+            headers=_headers(music_token),
+            timeout=ClientTimeout(total=timeout),
+        ) as response:
+            if response.status != 200:
+                raise MusicStreamError(
+                    f"file-info HTTP {response.status}", response.status
+                )
+            payload = await response.json(content_type=None)
+    except (ClientError, ValueError) as err:
+        raise MusicStreamError("file-info request failed") from err
+
+    info = (
+        ((payload or {}).get("result") or {}).get("downloadInfo")
+        if isinstance(payload, dict)
+        else None
+    )
+    if not isinstance(info, dict) or not info.get("url"):
+        raise MusicStreamError("file-info returned no URL")
+    if str(info.get("transport") or "raw") != "raw":
+        raise MusicStreamError("file-info returned an encrypted transport")
+
+    codec = str(info.get("codec") or "mp3").lower()
+    if codec in ("aac", "he-aac", "he.aac"):
+        ext = "aac"
+        content_type = "audio/aac"
+    elif codec in ("aac-mp4", "he-aac-mp4", "flac-mp4"):
+        ext = "mp4"
+        content_type = "audio/mp4"
+    elif codec == "flac":
+        ext = "flac"
+        content_type = "audio/x-flac"
+    else:
+        ext = "mp3"
+        content_type = "audio/mpeg"
+    return MusicStreamInfo(
+        url=str(info["url"]),
+        codec=codec,
+        bitrate=int(info.get("bitrate") or 0),
+        content_type=content_type,
+        expires_at=time.time() + 50,
+        track_id=track_id,
+        ext=ext,
+    )
+
+
 async def async_get_track_stream(
     session: ClientSession,
     track_id: str,
     music_token: str | None,
     *,
+    quality: str = "high",
+    codecs: str = "mp3",
     timeout: float = 12.0,
 ) -> MusicStreamInfo:
-    """Resolve a Yandex Music track ID to a direct MP3 URL.
+    """Resolve a Yandex Music track ID to a direct audio URL.
 
     The returned URL is a short-lived bearer URL. Never log it.
     """
@@ -263,6 +340,15 @@ async def async_get_track_stream(
         raise MusicStreamError("Track ID is not numeric")
     if not music_token:
         raise MusicStreamError("Yandex Music token is not configured")
+
+    if quality != "high" or codecs != "mp3":
+        try:
+            return await _async_file_info(
+                session, value, music_token, quality, codecs, timeout
+            )
+        except MusicStreamError:
+            # Fall back to the universal MP3 stream.
+            pass
 
     headers = _headers(music_token)
     client_timeout = ClientTimeout(total=timeout)
@@ -342,6 +428,7 @@ async def async_get_track_stream(
         content_type="audio/mpeg",
         expires_at=time.time() + 50,
         track_id=value,
+        ext="mp3",
     )
 
 
